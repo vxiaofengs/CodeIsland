@@ -3,8 +3,11 @@ import CodeIslandCore
 
 /// Shared bounds for the collapsed-width scale setting — keeps the settings
 /// slider and the width math in lockstep. Percent of the (simulated) notch width.
+/// 0 is safe: the scale only sizes the simulated center zone — wings, status
+/// text, and badges are additive, so the bar never shrinks below its content.
+/// Physical notches are floored at their hardware width regardless (#268).
 enum NotchWidthScale {
-    static let min = 50
+    static let min = 0
     static let max = 150
     static let step = 1
 }
@@ -166,20 +169,23 @@ struct NotchPanelView: View {
         VStack(spacing: 0) {
             VStack(spacing: 0) {
                 if showBar {
-                    // Active: compact bar — wider version when expanded
+                    // Active: compact bar — wider version when expanded.
+                    // Wings hold identity (mascot) and alerts (badges); on
+                    // notch-free screens the narrative (project + status) sits
+                    // dead-center so the pill stays visually balanced and the
+                    // ever-changing status text grows symmetrically.
                     HStack(spacing: 0) {
                         CompactLeftWing(appState: appState, expanded: shouldShowExpanded, mascotSize: mascotSize, hasNotch: hasNotch, showToolStatus: showToolStatus)
-                        if hasNotch && !shouldShowExpanded {
-                            Spacer(minLength: effectiveNotchW)
-                        } else if !shouldShowExpanded && showToolStatus {
-                            CompactToolStatus(appState: appState)
-                            Spacer(minLength: 0)
-                        } else {
-                            Spacer(minLength: 0)
-                        }
+                        Spacer(minLength: hasNotch && !shouldShowExpanded ? effectiveNotchW : 0)
                         CompactRightWing(appState: appState, expanded: shouldShowExpanded, hasNotch: hasNotch)
                     }
                     .frame(height: notchHeight)
+                    .overlay {
+                        if !hasNotch && !shouldShowExpanded && showToolStatus {
+                            CompactToolStatus(appState: appState)
+                                .padding(.horizontal, compactWingWidth + 6)
+                        }
+                    }
                 } else if showIdleIndicator {
                     IdleIndicatorBar(
                         mascotSize: mascotSize,
@@ -431,6 +437,7 @@ private struct CompactLeftWing: View {
     let hasNotch: Bool
     let showToolStatus: Bool
     @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
+    @AppStorage(SettingsKey.sessionListLimit) private var sessionListLimit = SettingsDefaults.sessionListLimit
     // Bound via @AppStorage so flipping the default mascot in Settings rerenders this view
     // even when AppState.primarySource wasn't recomputed (no session mutations in flight).
     @AppStorage(SettingsKey.defaultSource) private var settingsDefaultSource = SettingsDefaults.defaultSource
@@ -457,7 +464,8 @@ private struct CompactLeftWing: View {
         HStack(spacing: 6) {
             if expanded {
                 AppLogoView(size: 36, showBackground: false)
-                if appState.sessions.count > 1 {
+                // Grouping is meaningless when the list is pinned to one session.
+                if appState.sessions.count > 1, sessionListLimit != 1 {
                     HStack(spacing: 1) {
                         ForEach([("all", "ALL"), ("status", "STA"), ("cli", "CLI")], id: \.0) { tag, label in
                             let selected = groupingMode == tag
@@ -534,6 +542,7 @@ private struct CompactRightWing: View {
     @AppStorage(SettingsKey.quietHoursEnabled) private var quietHoursEnabled = SettingsDefaults.quietHoursEnabled
     @AppStorage(SettingsKey.quietHoursStart) private var quietHoursStart = SettingsDefaults.quietHoursStart
     @AppStorage(SettingsKey.quietHoursEnd) private var quietHoursEnd = SettingsDefaults.quietHoursEnd
+    @AppStorage(SettingsKey.sessionListLimit) private var sessionListLimit = SettingsDefaults.sessionListLimit
 
     /// Re-evaluated on every re-render; the compact bar redraws often enough
     /// that the moon appears/disappears close to the window edges.
@@ -593,36 +602,40 @@ private struct CompactRightWing: View {
                         .symbolEffect(.pulse, options: .repeating)
                 }
 
-                if showToolStatus {
-                    // Detailed mode: session count (project name is shown in center on non-notch)
-                    HStack(spacing: 1) {
-                        let active = appState.activeSessionCount
-                        let total = appState.totalSessionCount
-                        if active > 0 {
-                            Text("\(active)")
-                                .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
-                            Text("/")
-                                .foregroundStyle(.white.opacity(0.4))
+                // The count is a fleet gauge — pointless (and confusing, it
+                // still counts hidden sessions) when the list is pinned to one.
+                if sessionListLimit != 1 {
+                    if showToolStatus {
+                        // Detailed mode: session count (project name is shown in center on non-notch)
+                        HStack(spacing: 1) {
+                            let active = appState.activeSessionCount
+                            let total = appState.totalSessionCount
+                            if active > 0 {
+                                Text("\(active)")
+                                    .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
+                                Text("/")
+                                    .foregroundStyle(.white.opacity(0.4))
+                            }
+                            Text("\(total)")
+                                .foregroundStyle(.white.opacity(0.9))
                         }
-                        Text("\(total)")
-                            .foregroundStyle(.white.opacity(0.9))
-                    }
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                } else {
-                    // Simple mode: original session count only
-                    HStack(spacing: 1) {
-                        let active = appState.activeSessionCount
-                        let total = appState.totalSessionCount
-                        if active > 0 {
-                            Text("\(active)")
-                                .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
-                            Text("/")
-                                .foregroundStyle(.white.opacity(0.4))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    } else {
+                        // Simple mode: original session count only
+                        HStack(spacing: 1) {
+                            let active = appState.activeSessionCount
+                            let total = appState.totalSessionCount
+                            if active > 0 {
+                                Text("\(active)")
+                                    .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
+                                Text("/")
+                                    .foregroundStyle(.white.opacity(0.4))
+                            }
+                            Text("\(total)")
+                                .foregroundStyle(.white.opacity(0.9))
                         }
-                        Text("\(total)")
-                            .foregroundStyle(.white.opacity(0.9))
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
                     }
-                    .font(.system(size: 13, weight: .bold, design: .monospaced))
                 }
             }
         }
@@ -713,7 +726,6 @@ private struct CompactToolStatus: View {
         }
         .font(.system(size: 11, weight: .medium, design: .monospaced))
         .lineLimit(1)
-        .padding(.leading, 6)
         .animation(.easeInOut(duration: 0.25), value: shownTool)
         .animation(.easeInOut(duration: 0.15), value: shownDesc)
         .animation(.easeInOut(duration: 0.3), value: appState.rotatingSessionId)
@@ -1699,12 +1711,29 @@ private struct PixelButton: View {
 
 // MARK: - Session List
 
+/// Keeps the expanded list to the N most recently active sessions.
+enum SessionListLimit {
+    /// `limit <= 0` means unlimited. When the limit bites, the survivors come
+    /// back newest-first; equal timestamps fall back to the id so the order
+    /// stays stable across renders.
+    static func apply(ids: [String], limit: Int, lastActivity: (String) -> Date) -> [String] {
+        guard limit > 0, ids.count > limit else { return ids }
+        return ids.sorted { lhs, rhs in
+            let l = lastActivity(lhs), r = lastActivity(rhs)
+            return l == r ? lhs < rhs : l > r
+        }
+        .prefix(limit)
+        .map { $0 }
+    }
+}
+
 private struct SessionListView: View {
     var appState: AppState
     /// When set, only show this session (auto-expand on completion)
     var onlySessionId: String? = nil
     @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
+    @AppStorage(SettingsKey.sessionListLimit) private var sessionListLimit = SettingsDefaults.sessionListLimit
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
 
     private var groupedSessions: [(header: String, source: String?, ids: [String])] {
@@ -1712,7 +1741,17 @@ private struct SessionListView: View {
             return [("", nil, [only])]
         }
 
-        let sorted = appState.sessions.keys.sorted()
+        let sorted = SessionListLimit.apply(
+            ids: appState.sessions.keys.sorted(),
+            limit: sessionListLimit,
+            lastActivity: { appState.sessions[$0]?.lastActivity ?? .distantPast }
+        )
+
+        // Pinned to one session — a group header over a single row is noise,
+        // and the grouping tabs are hidden in this mode anyway.
+        if sessionListLimit == 1 {
+            return [("", nil, sorted)]
+        }
 
         switch groupingMode {
         case "status":
@@ -1827,8 +1866,16 @@ private struct SessionListView: View {
                 }
             }
 
-            // "Show all sessions" — hover with delay to expand
-            if onlySessionId != nil && appState.sessions.count > 1 {
+            // Sessions the "most recent N" limit dropped — say so instead of
+            // letting them look lost. "Latest only" mode skips the hint: the
+            // user explicitly chose to ignore everything else.
+            if onlySessionId == nil, sessionListLimit != 1, appState.sessions.count > totalSessionCount {
+                HiddenSessionsFooter(count: appState.sessions.count - totalSessionCount)
+            }
+
+            // "Show all sessions" — hover with delay to expand. Pointless in
+            // "latest only" mode: the full list holds one session too.
+            if onlySessionId != nil && appState.sessions.count > 1 && sessionListLimit != 1 {
                 SessionsExpandLink(count: appState.sessions.count) {
                     withAnimation(NotchAnimation.open) {
                         appState.surface = .sessionList
@@ -2037,6 +2084,24 @@ private struct ProjectNameLink: View {
                 }
             }
             .help(isInteractive && cwd != nil ? "\(L10n.shared["open_path"]) \(cwd ?? "")" : "")
+    }
+}
+
+/// Tail line for the session list when `sessionListLimit` hides older sessions.
+private struct HiddenSessionsFooter: View {
+    let count: Int
+    @ObservedObject private var l10n = L10n.shared
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Rectangle().fill(.white.opacity(0.12)).frame(height: 1)
+            Text(String(format: l10n["n_sessions_hidden"], count))
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.35))
+            Rectangle().fill(.white.opacity(0.12)).frame(height: 1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
     }
 }
 
@@ -2377,7 +2442,12 @@ private struct SessionCard: View {
                     let visibleMessages = session.status != .idle
                         ? Array(session.recentMessages.suffix(2))
                         : session.recentMessages
-                    ForEach(visibleMessages) { msg in
+                    // Focus split: the current turn starts at the last user
+                    // prompt — everything before it is history and recedes so
+                    // the live task reads first. No user prompt in the window
+                    // (mid-turn streaming) → treat everything as current.
+                    let focusStart = visibleMessages.lastIndex(where: \.isUser) ?? 0
+                    ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { idx, msg in
                         // Extracted to separate view so SwiftUI skips re-rendering
                         // when only the parent's hover state changes (#52 perf).
                         ChatMessageRow(
@@ -2386,7 +2456,9 @@ private struct SessionCard: View {
                             fontSize: fontSize,
                             aiLineLimit: aiLineLimit
                         )
+                        .opacity(idx < focusStart ? 0.55 : 1)
                     }
+                    .animation(.easeInOut(duration: 0.25), value: focusStart)
 
                     // Working indicator: show what AI is doing right now.
                     // Suppressed while a Cursor-side question is pending — the

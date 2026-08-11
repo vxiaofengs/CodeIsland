@@ -838,6 +838,7 @@ private struct CLIStatusRow: View {
 private struct AppearancePage: View {
     @ObservedObject private var l10n = L10n.shared
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
+    @AppStorage(SettingsKey.sessionListLimit) private var sessionListLimit = SettingsDefaults.sessionListLimit
     @AppStorage(SettingsKey.contentFontSize) private var contentFontSize = SettingsDefaults.contentFontSize
     @AppStorage(SettingsKey.aiMessageLines) private var aiMessageLines = SettingsDefaults.aiMessageLines
     @AppStorage(SettingsKey.showAgentDetails) private var showAgentDetails = SettingsDefaults.showAgentDetails
@@ -866,6 +867,15 @@ private struct AppearancePage: View {
             }
 
             Section(l10n["panel"]) {
+                Picker(selection: $sessionListLimit) {
+                    Text(l10n["all_sessions"]).tag(0)
+                    Text(l10n["latest_1_session"]).tag(1)
+                    Text("3").tag(3)
+                    Text("5").tag(5)
+                } label: {
+                    Text(l10n["session_list_limit"])
+                    Text(l10n["session_list_limit_desc"])
+                }
                 Picker(selection: $maxVisibleSessions) {
                     Text("3").tag(3)
                     Text("5").tag(5)

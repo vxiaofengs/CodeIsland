@@ -38,13 +38,27 @@ final class NotchPanelViewTests: XCTestCase {
 
     func testEffectiveNotchWidthClampsOutOfRangeScale() {
         XCTAssertEqual(
-            NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 10, hasNotch: false),
-            100,
+            NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: -5, hasNotch: false),
+            0,
             accuracy: 0.001
         )
         XCTAssertEqual(
             NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 250, hasNotch: false),
             300,
+            accuracy: 0.001
+        )
+    }
+
+    func testEffectiveNotchWidthAllowsZeroScaleOnNonNotchScreens() {
+        XCTAssertEqual(
+            NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 0, hasNotch: false),
+            0,
+            accuracy: 0.001
+        )
+        // Physical notch stays floored at hardware width even at 0%.
+        XCTAssertEqual(
+            NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 0, hasNotch: true),
+            200,
             accuracy: 0.001
         )
     }
@@ -220,7 +234,7 @@ final class NotchHoverInteractionTests: XCTestCase {
     }
 
     func testWidthScaleSliderUsesOnePercentSteps() {
-        XCTAssertEqual(NotchWidthScale.min, 50)
+        XCTAssertEqual(NotchWidthScale.min, 0)
         XCTAssertEqual(NotchWidthScale.max, 150)
         XCTAssertEqual(NotchWidthScale.step, 1)
     }
@@ -230,7 +244,44 @@ final class NotchHoverInteractionTests: XCTestCase {
         XCTAssertEqual(NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 80, hasNotch: true), 200)
         // Simulated notch scales and clamps to NotchWidthScale bounds.
         XCTAssertEqual(NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 75, hasNotch: false), 150)
-        XCTAssertEqual(NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 10, hasNotch: false), 100)
+        XCTAssertEqual(NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 10, hasNotch: false), 20)
         XCTAssertEqual(NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 900, hasNotch: false), 300)
+    }
+
+    func testSessionListLimitKeepsEveryIdWhenUnlimited() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let activity = ["a": base, "b": base.addingTimeInterval(10), "c": base.addingTimeInterval(20)]
+
+        XCTAssertEqual(
+            SessionListLimit.apply(ids: ["a", "b", "c"], limit: 0) { activity[$0] ?? .distantPast },
+            ["a", "b", "c"]
+        )
+    }
+
+    func testSessionListLimitKeepsMostRecentSessionsNewestFirst() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let activity = [
+            "old": base,
+            "mid": base.addingTimeInterval(60),
+            "new": base.addingTimeInterval(120),
+        ]
+
+        XCTAssertEqual(
+            SessionListLimit.apply(ids: ["old", "mid", "new"], limit: 1) { activity[$0] ?? .distantPast },
+            ["new"]
+        )
+        XCTAssertEqual(
+            SessionListLimit.apply(ids: ["old", "mid", "new"], limit: 2) { activity[$0] ?? .distantPast },
+            ["new", "mid"]
+        )
+    }
+
+    func testSessionListLimitBreaksTimestampTiesByIdForStableOrder() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+
+        XCTAssertEqual(
+            SessionListLimit.apply(ids: ["b", "a", "c"], limit: 2) { _ in base },
+            ["a", "b"]
+        )
     }
 }
