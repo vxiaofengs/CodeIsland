@@ -1012,6 +1012,16 @@ final class AppState {
     private(set) var activeSessionCount: Int = 0
     private(set) var totalSessionCount: Int = 0
 
+    /// Bumped by the panel controller to force one committed frame while nothing
+    /// in the island is animating — a fully static window loses its content and
+    /// only redraws on input. The panel reads it as an imperceptible opacity
+    /// change, which is what makes SwiftUI actually commit a new frame.
+    private(set) var repaintNonce: Int = 0
+
+    func bumpRepaintNonce() {
+        repaintNonce &+= 1
+    }
+
     var currentTool: String? {
         // When approvals/questions are pending, always reflect the *front of the queue*.
         // Otherwise a second incoming request can overwrite session.currentTool and make

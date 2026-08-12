@@ -145,6 +145,8 @@ class PanelWindowController: NSObject, NSWindowDelegate {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var wasOcclusionVisible = true
     private var repaintScheduled = false
+    private var repaintNudgeTimer: Timer?
+    private var drawKeepAlive: NSObjectProtocol?
     private var globalClickMonitor: Any?
     private var lastChosenScreenSignature = ""
     private var isAnimatingScreenHop = false
@@ -194,6 +196,7 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         panel.orderFrontRegardless()
         MascotAnimationGate.shared.setPanelVisible(true)
 
+        log.notice("panel created on screen \(ScreenDetector.signature(for: screen), privacy: .public)")
         setupStaleDrawRecovery(for: panel)
 
         // Screen change observer
@@ -291,20 +294,30 @@ class PanelWindowController: NSObject, NSWindowDelegate {
 
     // MARK: - Stale-draw recovery
 
-    /// A borderless panel living above the menu bar does not always come back
-    /// fully painted: after a wake or an occlusion round-trip AppKit restores
-    /// the window without re-displaying every SwiftUI layer, so the island body
-    /// is missing while the card's controls still show. Any state change (hover,
-    /// a new event) repaints it, which is why it looks intermittent — so nudge a
-    /// repaint on exactly the events that can strand it.
+    /// A borderless panel living above the menu bar does not always stay painted.
+    /// Two observed failures, same cause — nobody asks it to draw:
+    ///   * after a wake or an occlusion round-trip AppKit restores the window
+    ///     with part of its layer tree missing (the island body vanishes while a
+    ///     card's controls stay);
+    ///   * with the pointer resting still on the panel and no session events,
+    ///     the whole content goes blank until any input — or a screenshot, which
+    ///     forces the window server to re-composite — brings it back.
+    /// So: keep the app off App Nap while the panel is on screen, nudge a repaint
+    /// on the events that can strand it, and keep a slow heartbeat as a backstop
+    /// for the quiescent case, where no notification ever fires.
     private func setupStaleDrawRecovery(for panel: NSPanel) {
         wasOcclusionVisible = panel.occlusionState.contains(.visible)
+        beginDrawKeepAlive()
+        startRepaintNudgeTimer()
 
         let wsCenter = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
             workspaceObservers.append(
                 wsCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                    Task { @MainActor in self?.scheduleContentRepaint() }
+                    Task { @MainActor in
+                        log.notice("wake notification — repainting panel")
+                        self?.scheduleContentRepaint()
+                    }
                 }
             )
         }
@@ -321,10 +334,45 @@ class PanelWindowController: NSObject, NSWindowDelegate {
                     defer { self.wasOcclusionVisible = visible }
                     // Only the occluded → visible edge can leave stale content.
                     guard visible, !self.wasOcclusionVisible else { return }
+                    log.notice("panel became unoccluded — repainting")
                     self.scheduleContentRepaint()
                 }
             }
         )
+    }
+
+    /// App Nap throttles timers and drawing for an accessory app, which is
+    /// exactly when the panel goes blank. Idle *system* sleep stays allowed —
+    /// this only asks not to be napped, same pattern as the Buddy bridge.
+    private func beginDrawKeepAlive() {
+        guard drawKeepAlive == nil else { return }
+        drawKeepAlive = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Keep the island painted while it is on screen"
+        )
+    }
+
+    /// Backstop for the quiescent case: no events, no pointer movement, nothing
+    /// to invalidate the view. Cheap — one small window redraw.
+    private func startRepaintNudgeTimer() {
+        repaintNudgeTimer?.invalidate()
+        repaintNudgeTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.nudgeRepaint() }
+        }
+    }
+
+    private func nudgeRepaint() {
+        guard let panel = panel, panel.isVisible, !isAnimatingScreenHop else { return }
+        // Only while nothing is animating: a working session keeps the mascot and
+        // the typing indicator committing frames on their own, and those sessions
+        // never showed the blank-out.
+        guard appState.activeSessionCount == 0 else { return }
+        // Only the nonce: it changes the rendered output by a hair, so SwiftUI
+        // commits a real frame. `needsDisplay` + `display()` are worse than
+        // useless here — AppKit sees SwiftUI's layers as already drawn, so the
+        // pass just clears this non-opaque window and leaves it blank until the
+        // next SwiftUI commit, which is what made the island flicker.
+        appState.bumpRepaintNonce()
     }
 
     /// Coalesce bursts (wake emits several notifications) into one repaint.
@@ -334,6 +382,11 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         Task { @MainActor [weak self] in
             self?.repaintScheduled = false
             self?.repaintPanelContents()
+            // NSScreen.screens can still be mid-update on a wake, so the frame
+            // computed above may be wrong — same reason the screen-parameter
+            // observer runs twice. Re-settle shortly after.
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            self?.repaintPanelContents()
         }
     }
 
@@ -341,7 +394,10 @@ class PanelWindowController: NSObject, NSWindowDelegate {
     /// content view dirty leaves SwiftUI's own layers untouched.
     private func repaintPanelContents() {
         guard let panel = panel, panel.isVisible, !isAnimatingScreenHop, !isDraggingPanel else { return }
+        log.notice("rebuilding panel content view")
         rebuildForCurrentScreen(chosenScreen())
+        panel.orderFrontRegardless()
+        panel.alphaValue = 1
     }
 
     private func makeHostingView(for screen: NSScreen) -> NotchHostingView<NotchPanelView> {
@@ -630,18 +686,21 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         guard let panel = panel else { return }
         let settings = SettingsManager.shared
         if settings.hideInFullscreen && fullscreenLatch {
+            log.notice("hiding panel: fullscreen space")
             panel.orderOut(nil)
             MascotAnimationGate.shared.setPanelVisible(false)
             return
         }
 
         if settings.hideWhenNoSession && appState.activeSessionCount == 0 {
+            log.notice("hiding panel: no active session")
             panel.orderOut(nil)
             MascotAnimationGate.shared.setPanelVisible(false)
             return
         }
 
         if !panel.isVisible {
+            log.notice("showing panel")
             panel.orderFrontRegardless()
         }
         MascotAnimationGate.shared.setPanelVisible(true)
@@ -699,6 +758,10 @@ class PanelWindowController: NSObject, NSWindowDelegate {
     deinit {
         autoScreenPoller?.invalidate()
         fullscreenPoller?.invalidate()
+        repaintNudgeTimer?.invalidate()
+        if let drawKeepAlive {
+            ProcessInfo.processInfo.endActivity(drawKeepAlive)
+        }
         for observer in settingsObservers {
             NotificationCenter.default.removeObserver(observer)
         }

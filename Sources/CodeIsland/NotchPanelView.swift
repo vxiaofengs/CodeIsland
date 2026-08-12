@@ -429,6 +429,10 @@ struct NotchPanelView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .animation(NotchAnimation.open, value: appState.surface)
+        // Forced heartbeat frame while the island is static (see
+        // AppState.repaintNonce). The difference has to be real for SwiftUI to
+        // commit it, and 1/1000 of alpha is the smallest one that cannot be seen.
+        .opacity(appState.repaintNonce.isMultiple(of: 2) ? 1 : 0.999)
     }
 }
 
@@ -1754,6 +1758,7 @@ private struct SessionListView: View {
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
     @AppStorage(SettingsKey.panelIdleGraceMinutes) private var idleGraceMinutes = SettingsDefaults.panelIdleGraceMinutes
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
+    @AppStorage(SettingsKey.defaultSource) private var defaultSource = SettingsDefaults.defaultSource
     @ObservedObject private var l10n = L10n.shared
     /// Grace expiry is a wall-clock deadline, not a state change — without a tick
     /// a finished card would sit there until the next session event.
@@ -1911,12 +1916,20 @@ private struct SessionListView: View {
             }
 
             // Every session aged out of the panel — don't leave a blank sheet.
+            // The mascot is not decoration: every other state of the panel has
+            // one, and its animation is what keeps the window committing frames.
+            // A text-only state left the window fully static, and macOS drops a
+            // static window's content until something redraws it.
             if onlySessionId == nil, totalSessionCount == 0 {
-                Text(l10n["no_active_sessions"])
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.35))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
+                HStack(spacing: 8) {
+                    MascotView(source: defaultSource, status: .idle, size: 24)
+                        .opacity(0.55)
+                    Text(l10n["no_active_sessions"])
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.35))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
             }
 
             // "Show all sessions" — hover with delay to expand. Counts what the
