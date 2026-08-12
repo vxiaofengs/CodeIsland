@@ -894,10 +894,12 @@ private struct AppearancePage: View {
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                     }
+                    // No `step:` — AppKit turns a stepped slider into 150 tick
+                    // marks under the track. Quantize in the setter instead.
                     Slider(value: Binding(
                         get: { Double(collapsedWidthScale) },
-                        set: { collapsedWidthScale = Int($0) }
-                    ), in: Double(NotchWidthScale.min)...Double(NotchWidthScale.max), step: Double(NotchWidthScale.step))
+                        set: { collapsedWidthScale = NotchWidthScale.quantized($0) }
+                    ), in: Double(NotchWidthScale.min)...Double(NotchWidthScale.max))
                     Text(l10n["collapsed_width_scale_desc"])
                         .font(.caption)
                         .foregroundStyle(.secondary)

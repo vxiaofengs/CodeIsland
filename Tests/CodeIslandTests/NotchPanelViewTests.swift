@@ -233,6 +233,13 @@ final class NotchHoverInteractionTests: XCTestCase {
         XCTAssertEqual(NotchHoverInteraction.nextPhase(from: .prehover, event: .collapseDelayElapsed), .prehover)
     }
 
+    func testWidthScaleQuantizesAndClampsSliderValues() {
+        XCTAssertEqual(NotchWidthScale.quantized(72.4), 72)
+        XCTAssertEqual(NotchWidthScale.quantized(72.6), 73)
+        XCTAssertEqual(NotchWidthScale.quantized(-10), NotchWidthScale.min)
+        XCTAssertEqual(NotchWidthScale.quantized(999), NotchWidthScale.max)
+    }
+
     func testWidthScaleSliderUsesOnePercentSteps() {
         XCTAssertEqual(NotchWidthScale.min, 0)
         XCTAssertEqual(NotchWidthScale.max, 150)

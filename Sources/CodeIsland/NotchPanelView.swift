@@ -10,6 +10,12 @@ enum NotchWidthScale {
     static let min = 0
     static let max = 150
     static let step = 1
+
+    /// Snap a slider value to whole steps and keep it inside the bounds.
+    static func quantized(_ value: Double) -> Int {
+        let stepped = (value / Double(step)).rounded() * Double(step)
+        return Swift.max(min, Swift.min(max, Int(stepped)))
+    }
 }
 
 enum NotchWidthMetrics {
@@ -571,6 +577,11 @@ private struct CompactRightWing: View {
                     soundEnabled.toggle()
                 }
                 NotchIconButton(icon: "gearshape", tooltip: l10n["settings"]) {
+                    // Attention moves to the settings window — fold the panel
+                    // instead of leaving it hanging open behind it, and drop any
+                    // queued completion card that would pop it back open.
+                    appState.cancelCompletionQueue()
+                    withAnimation(NotchAnimation.close) { appState.surface = .collapsed }
                     SettingsWindowController.shared.show()
                 }
                 NotchIconButton(icon: "power", tint: Color(red: 1.0, green: 0.4, blue: 0.4), tooltip: l10n["quit"]) {
@@ -809,23 +820,18 @@ private struct IdleIndicatorBar: View {
 
             Spacer(minLength: hasNotch ? notchW : 0)
 
-            // Right: expanded shows text + buttons, collapsed shows nothing
+            // Right: hover reveals the controls; this bar only ever shows with
+            // zero sessions, so a session count here could only read "0".
             if hovered {
-                HStack(spacing: 8) {
-                    Text("0")
-                        .font(.system(size: 13, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.4))
-
-                    HStack(spacing: 4) {
-                        NotchIconButton(icon: soundEnabled ? "speaker.wave.2" : "speaker.slash", tooltip: soundEnabled ? l10n["mute"] : l10n["enable_sound_tooltip"]) {
-                            soundEnabled.toggle()
-                        }
-                        NotchIconButton(icon: "gearshape", tooltip: l10n["settings"]) {
-                            SettingsWindowController.shared.show()
-                        }
-                        NotchIconButton(icon: "power", tint: Color(red: 1.0, green: 0.4, blue: 0.4), tooltip: l10n["quit"]) {
-                            NSApplication.shared.terminate(nil)
-                        }
+                HStack(spacing: 4) {
+                    NotchIconButton(icon: soundEnabled ? "speaker.wave.2" : "speaker.slash", tooltip: soundEnabled ? l10n["mute"] : l10n["enable_sound_tooltip"]) {
+                        soundEnabled.toggle()
+                    }
+                    NotchIconButton(icon: "gearshape", tooltip: l10n["settings"]) {
+                        SettingsWindowController.shared.show()
+                    }
+                    NotchIconButton(icon: "power", tint: Color(red: 1.0, green: 0.4, blue: 0.4), tooltip: l10n["quit"]) {
+                        NSApplication.shared.terminate(nil)
                     }
                 }
                 .padding(.trailing, 6)
@@ -1696,11 +1702,11 @@ private struct PixelButton: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 7)
             .background(
-                RoundedRectangle(cornerRadius: 4)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .fill(hovering ? bg.opacity(1.5) : bg)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 4)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .strokeBorder(hovering ? border : border.opacity(0.4), lineWidth: 1)
             )
         }

@@ -23,6 +23,41 @@ final class DerivedSessionStateTests: XCTestCase {
         XCTAssertEqual(summary.totalSessionCount, 2)
     }
 
+    func testStopHookDoesNotDuplicateReplyAlreadyTailedFromTranscript() throws {
+        let sessionId = "dedup-race"
+        var session = SessionSnapshot()
+        session.source = "claude"
+        session.status = .processing
+        // Transcript tailer won the race and appended the reply first.
+        session.addRecentMessage(ChatMessage(isUser: true, text: "真的吗"))
+        session.addRecentMessage(ChatMessage(isUser: false, text: "真的。刚验证了一下"))
+        var sessions: [String: SessionSnapshot] = [sessionId: session]
+
+        let payload: [String: Any] = [
+            "hook_event_name": "Stop",
+            "session_id": sessionId,
+            "last_assistant_message": "真的。刚验证了一下",
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        let event = try XCTUnwrap(HookEvent(from: data))
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 20)
+
+        let messages = try XCTUnwrap(sessions[sessionId]?.recentMessages)
+        XCTAssertEqual(messages.filter { !$0.isUser }.count, 1, "hook must not re-append the tailed reply")
+
+        // A genuinely new reply still lands.
+        let payload2: [String: Any] = [
+            "hook_event_name": "Stop",
+            "session_id": sessionId,
+            "last_assistant_message": "另一条新回复",
+        ]
+        let data2 = try JSONSerialization.data(withJSONObject: payload2)
+        let event2 = try XCTUnwrap(HookEvent(from: data2))
+        _ = reduceEvent(sessions: &sessions, event: event2, maxHistory: 20)
+
+        XCTAssertEqual(sessions[sessionId]?.recentMessages.last?.text, "另一条新回复")
+    }
+
     func testNormalizesTraecliAliases() {
         XCTAssertEqual(SessionSnapshot.normalizedSupportedSource("traecli"), "traecli")
     }

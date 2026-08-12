@@ -913,7 +913,11 @@ public func reduceEvent(
         )
         if let text = responseText, !text.isEmpty {
             sessions[sessionId]?.lastAssistantMessage = text
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: text))
+            // The transcript tailer may have appended this reply already —
+            // hook vs tailer arrival order is a race (#dedup).
+            if sessions[sessionId]?.recentMessages.last(where: { !$0.isUser })?.text != text {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: text))
+            }
         }
         let hasActiveSubagents = sessions[sessionId]?.subagents.values.contains {
             $0.status != .idle
@@ -950,7 +954,11 @@ public func reduceEvent(
         )
         if let msg = assistantMsg {
             sessions[sessionId]?.lastAssistantMessage = msg
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            // The transcript tailer may have appended this reply already —
+            // hook vs tailer arrival order is a race (#dedup).
+            if sessions[sessionId]?.recentMessages.last(where: { !$0.isUser })?.text != msg {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            }
         } else if sessions[sessionId]?.lastAssistantMessage == nil,
                   sessions[sessionId]?.recentMessages.last?.isUser == true {
             sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: "[回复完成]"))
@@ -995,7 +1003,11 @@ public func reduceEvent(
         )
         if let msg = assistantMsg {
             sessions[sessionId]?.lastAssistantMessage = msg
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            // The transcript tailer may have appended this reply already —
+            // hook vs tailer arrival order is a race (#dedup).
+            if sessions[sessionId]?.recentMessages.last(where: { !$0.isUser })?.text != msg {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            }
         } else if sessions[sessionId]?.lastAssistantMessage == nil,
                   sessions[sessionId]?.recentMessages.last?.isUser == true {
             // No reply content from hook (e.g. CodeBuddy) -- add placeholder

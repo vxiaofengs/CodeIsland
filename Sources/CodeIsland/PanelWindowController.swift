@@ -142,6 +142,9 @@ class PanelWindowController: NSObject, NSWindowDelegate {
     private var sessionObservationTask: Task<Void, Never>?
     private var fullscreenLatch = false
     private var settingsObservers: [NSObjectProtocol] = []
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var wasOcclusionVisible = true
+    private var repaintScheduled = false
     private var globalClickMonitor: Any?
     private var lastChosenScreenSignature = ""
     private var isAnimatingScreenHop = false
@@ -190,6 +193,8 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         updatePosition()
         panel.orderFrontRegardless()
         MascotAnimationGate.shared.setPanelVisible(true)
+
+        setupStaleDrawRecovery(for: panel)
 
         // Screen change observer
         NotificationCenter.default.addObserver(
@@ -282,6 +287,61 @@ class PanelWindowController: NSObject, NSWindowDelegate {
                 }
             }
         }
+    }
+
+    // MARK: - Stale-draw recovery
+
+    /// A borderless panel living above the menu bar does not always come back
+    /// fully painted: after a wake or an occlusion round-trip AppKit restores
+    /// the window without re-displaying every SwiftUI layer, so the island body
+    /// is missing while the card's controls still show. Any state change (hover,
+    /// a new event) repaints it, which is why it looks intermittent — so nudge a
+    /// repaint on exactly the events that can strand it.
+    private func setupStaleDrawRecovery(for panel: NSPanel) {
+        wasOcclusionVisible = panel.occlusionState.contains(.visible)
+
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            workspaceObservers.append(
+                wsCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in self?.scheduleContentRepaint() }
+                }
+            )
+        }
+
+        settingsObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: panel,
+                queue: .main
+            ) { [weak self] note in
+                Task { @MainActor in
+                    guard let self, let window = note.object as? NSWindow else { return }
+                    let visible = window.occlusionState.contains(.visible)
+                    defer { self.wasOcclusionVisible = visible }
+                    // Only the occluded → visible edge can leave stale content.
+                    guard visible, !self.wasOcclusionVisible else { return }
+                    self.scheduleContentRepaint()
+                }
+            }
+        )
+    }
+
+    /// Coalesce bursts (wake emits several notifications) into one repaint.
+    private func scheduleContentRepaint() {
+        guard !repaintScheduled else { return }
+        repaintScheduled = true
+        Task { @MainActor [weak self] in
+            self?.repaintScheduled = false
+            self?.repaintPanelContents()
+        }
+    }
+
+    /// Rebuilding the hosting view is the only reliable repaint — marking the
+    /// content view dirty leaves SwiftUI's own layers untouched.
+    private func repaintPanelContents() {
+        guard let panel = panel, panel.isVisible, !isAnimatingScreenHop, !isDraggingPanel else { return }
+        rebuildForCurrentScreen(chosenScreen())
     }
 
     private func makeHostingView(for screen: NSScreen) -> NotchHostingView<NotchPanelView> {
@@ -641,6 +701,9 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         fullscreenPoller?.invalidate()
         for observer in settingsObservers {
             NotificationCenter.default.removeObserver(observer)
+        }
+        for observer in workspaceObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         if let monitor = globalClickMonitor {
             NSEvent.removeMonitor(monitor)
