@@ -255,40 +255,125 @@ final class NotchHoverInteractionTests: XCTestCase {
         XCTAssertEqual(NotchWidthMetrics.effectiveNotchWidth(notchW: 200, collapsedWidthScale: 900, hasNotch: false), 300)
     }
 
-    func testSessionListLimitKeepsEveryIdWhenUnlimited() {
-        let base = Date(timeIntervalSince1970: 1_700_000_000)
-        let activity = ["a": base, "b": base.addingTimeInterval(10), "c": base.addingTimeInterval(20)]
+    func testFocusRampKeepsTheBottomBlockOpaque() {
+        XCTAssertEqual(SessionMessageFocus.opacity(indexFromBottom: 0), 1.0)
+        // Defensive: a negative index can only come from a layout mistake.
+        XCTAssertEqual(SessionMessageFocus.opacity(indexFromBottom: -1), 1.0)
+    }
 
-        XCTAssertEqual(
-            SessionListLimit.apply(ids: ["a", "b", "c"], limit: 0) { activity[$0] ?? .distantPast },
-            ["a", "b", "c"]
+    func testFocusRampFadesMonotonicallyUpwardToAReadableFloor() {
+        let steps = (0...4).map { SessionMessageFocus.opacity(indexFromBottom: $0) }
+        for (upper, lower) in zip(steps.dropFirst(), steps) {
+            XCTAssertLessThanOrEqual(upper, lower, "opacity must not grow going up the card")
+        }
+        // Beyond the ramp everything shares one floor, never invisible.
+        XCTAssertEqual(steps[3], steps[4])
+        XCTAssertGreaterThan(steps[4], 0.25)
+    }
+
+    // MARK: - Session list contents
+
+    private static let listBase = Date(timeIntervalSince1970: 1_700_000_000)
+
+    private func visibleIds(
+        _ ids: [String],
+        active: Set<String>,
+        activity: [String: Date],
+        graceMinutes: Int = 3,
+        now: Date? = nil,
+        neverRan: Set<String> = []
+    ) -> [String] {
+        SessionListOrder.visibleIds(
+            ids: ids,
+            graceMinutes: graceMinutes,
+            now: now ?? Self.listBase.addingTimeInterval(600),
+            isActive: { active.contains($0) },
+            hasRunATurn: { !neverRan.contains($0) },
+            lastActivity: { activity[$0] ?? .distantPast }
         )
     }
 
-    func testSessionListLimitKeepsMostRecentSessionsNewestFirst() {
-        let base = Date(timeIntervalSince1970: 1_700_000_000)
+    func testSessionListSkipsSessionsThatNeverRanAnything() {
+        let now = Self.listBase.addingTimeInterval(600)
+        let activity = ["just-opened": now, "finished": now.addingTimeInterval(-30)]
+
+        // Opening a conversation in an IDE registers a session right away; it is
+        // idle with a fresh timestamp, but there is nothing to show yet.
+        XCTAssertEqual(
+            visibleIds(["just-opened", "finished"], active: [], activity: activity,
+                       now: now, neverRan: ["just-opened"]),
+            ["finished"]
+        )
+        // "Never clean up" does not resurrect empty placeholders either.
+        XCTAssertEqual(
+            visibleIds(["just-opened"], active: [], activity: activity,
+                       graceMinutes: 0, now: now, neverRan: ["just-opened"]),
+            []
+        )
+        // Once it starts working it shows regardless of having no history yet.
+        XCTAssertEqual(
+            visibleIds(["just-opened"], active: ["just-opened"], activity: activity,
+                       now: now, neverRan: ["just-opened"]),
+            ["just-opened"]
+        )
+    }
+
+    func testSessionListKeepsActiveSessionsOldestFirst() {
+        let now = Self.listBase.addingTimeInterval(600)
         let activity = [
-            "old": base,
-            "mid": base.addingTimeInterval(60),
-            "new": base.addingTimeInterval(120),
+            "idle-stale": Self.listBase,                        // 10 min idle
+            "busy-old": Self.listBase.addingTimeInterval(60),
+            "busy-new": Self.listBase.addingTimeInterval(120),
         ]
 
+        // Working sessions stay however long they have been running, and the
+        // freshest lands last so it renders at the bottom.
         XCTAssertEqual(
-            SessionListLimit.apply(ids: ["old", "mid", "new"], limit: 1) { activity[$0] ?? .distantPast },
-            ["new"]
-        )
-        XCTAssertEqual(
-            SessionListLimit.apply(ids: ["old", "mid", "new"], limit: 2) { activity[$0] ?? .distantPast },
-            ["new", "mid"]
+            visibleIds(["idle-stale", "busy-new", "busy-old"],
+                       active: ["busy-old", "busy-new"],
+                       activity: activity,
+                       now: now),
+            ["busy-old", "busy-new"]
         )
     }
 
-    func testSessionListLimitBreaksTimestampTiesByIdForStableOrder() {
-        let base = Date(timeIntervalSince1970: 1_700_000_000)
+    func testSessionListKeepsFinishedSessionsUntilTheGraceExpires() {
+        let now = Self.listBase.addingTimeInterval(600)
+        let activity = [
+            "just-finished": now.addingTimeInterval(-100),   // idle 1m40s
+            "long-done": now.addingTimeInterval(-400),       // idle 6m40s
+        ]
+
+        // 3-minute grace: the fresh one lingers, the stale one is gone.
+        XCTAssertEqual(
+            visibleIds(["long-done", "just-finished"], active: [], activity: activity, now: now),
+            ["just-finished"]
+        )
+        // 10-minute grace covers both.
+        XCTAssertEqual(
+            visibleIds(["long-done", "just-finished"], active: [], activity: activity,
+                       graceMinutes: 10, now: now),
+            ["long-done", "just-finished"]
+        )
+    }
+
+    func testSessionListKeepsEverythingWhenGraceIsDisabled() {
+        let now = Self.listBase.addingTimeInterval(600)
+        let activity = ["ancient": Date(timeIntervalSince1970: 0), "recent": now]
 
         XCTAssertEqual(
-            SessionListLimit.apply(ids: ["b", "a", "c"], limit: 2) { _ in base },
-            ["a", "b"]
+            visibleIds(["recent", "ancient"], active: [], activity: activity,
+                       graceMinutes: 0, now: now),
+            ["ancient", "recent"]
+        )
+    }
+
+    func testSessionListBreaksTimestampTiesByIdForStableOrder() {
+        XCTAssertEqual(
+            visibleIds(["c", "a", "b"],
+                       active: ["a", "b", "c"],
+                       activity: ["a": Self.listBase, "b": Self.listBase, "c": Self.listBase]),
+            ["a", "b", "c"]
         )
     }
 }

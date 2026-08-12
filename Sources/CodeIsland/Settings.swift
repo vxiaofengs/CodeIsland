@@ -42,7 +42,7 @@ enum SettingsKey {
     // Display
     static let maxPanelHeight = "maxPanelHeight"
     static let maxVisibleSessions = "maxVisibleSessions"
-    static let sessionListLimit = "sessionListLimit"    // 0 = show every session
+    static let panelIdleGraceMinutes = "panelIdleGraceMinutes"   // 0 = keep finished sessions
     static let contentFontSize = "contentFontSize"
     static let aiMessageLines = "aiMessageLines"
     static let showAgentDetails = "showAgentDetails"
@@ -148,7 +148,7 @@ struct SettingsDefaults {
 
     static let maxPanelHeight = 560
     static let maxVisibleSessions = 5
-    static let sessionListLimit = 0
+    static let panelIdleGraceMinutes = 3
     static let contentFontSize = 11
     static let aiMessageLines = 1
     static let showAgentDetails = false
@@ -232,7 +232,7 @@ class SettingsManager {
             SettingsKey.sessionTimeout: SettingsDefaults.sessionTimeout,
             SettingsKey.maxPanelHeight: SettingsDefaults.maxPanelHeight,
             SettingsKey.maxVisibleSessions: SettingsDefaults.maxVisibleSessions,
-            SettingsKey.sessionListLimit: SettingsDefaults.sessionListLimit,
+            SettingsKey.panelIdleGraceMinutes: SettingsDefaults.panelIdleGraceMinutes,
             SettingsKey.contentFontSize: SettingsDefaults.contentFontSize,
             SettingsKey.aiMessageLines: SettingsDefaults.aiMessageLines,
             SettingsKey.showAgentDetails: SettingsDefaults.showAgentDetails,
@@ -383,11 +383,6 @@ class SettingsManager {
     var sessionGroupingMode: String {
         get { defaults.string(forKey: SettingsKey.sessionGroupingMode) ?? SettingsDefaults.sessionGroupingMode }
         set { defaults.set(newValue, forKey: SettingsKey.sessionGroupingMode) }
-    }
-
-    var sessionListLimit: Int {
-        get { defaults.integer(forKey: SettingsKey.sessionListLimit) }
-        set { defaults.set(newValue, forKey: SettingsKey.sessionListLimit) }
     }
 
     var defaultSource: String {

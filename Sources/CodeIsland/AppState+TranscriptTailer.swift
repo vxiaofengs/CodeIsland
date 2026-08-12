@@ -221,17 +221,30 @@ extension AppState {
             mutated = true
         }
 
+        // One scanned chunk can hold the tail of a turn plus the head of the
+        // next, so replay both in transcript order. Appending the prompt first
+        // unconditionally parked the next question above the previous answer.
+        var incoming: [(isUser: Bool, text: String)] = []
         if let prompt = delta.lastUserPrompt, session.lastUserPrompt != prompt {
-            session.lastUserPrompt = prompt
-            if session.recentMessages.last(where: { $0.isUser })?.text != prompt {
-                session.addRecentMessage(ChatMessage(isUser: true, text: prompt))
-            }
-            mutated = true
+            incoming.append((true, prompt))
         }
         if let reply = delta.lastAssistantMessage, session.lastAssistantMessage != reply {
-            session.lastAssistantMessage = reply
-            if session.recentMessages.last(where: { !$0.isUser })?.text != reply {
-                session.addRecentMessage(ChatMessage(isUser: false, text: reply))
+            incoming.append((false, reply))
+        }
+        if incoming.count == 2, delta.promptIsNewer {
+            incoming.reverse()
+        }
+        for message in incoming {
+            if message.isUser {
+                session.lastUserPrompt = message.text
+                if session.recentMessages.last(where: { $0.isUser })?.text != message.text {
+                    session.addRecentMessage(ChatMessage(isUser: true, text: message.text))
+                }
+            } else {
+                session.lastAssistantMessage = message.text
+                if session.recentMessages.last(where: { !$0.isUser })?.text != message.text {
+                    session.addRecentMessage(ChatMessage(isUser: false, text: message.text))
+                }
             }
             mutated = true
         }

@@ -677,10 +677,7 @@ final class AppState {
 
     private func startRotationIfNeeded() {
         refreshActiveIds()
-        // "Latest only" pins the whole island to one session — never rotate
-        // through sessions the list doesn't even show.
-        let pinnedToLatest = SettingsManager.shared.sessionListLimit == 1
-        if cachedActiveIds.count > 1 && !pinnedToLatest {
+        if cachedActiveIds.count > 1 {
             // If the most urgent session changed, snap to it immediately
             if let top = cachedActiveIds.first, top != rotatingSessionId {
                 let topStatus = sessions[top]?.status ?? .idle
@@ -705,22 +702,15 @@ final class AppState {
             rotationTimer = nil
             rotatingSessionId = nil
             // When rotation stops, ensure activeSessionId points to the remaining
-            // active session (if any) so the collapsed bar doesn't stick on an idle
-            // one. Pinned mode follows pure recency to match the single-row list.
-            let active = pinnedToLatest
-                ? cachedActiveIds.max { a, b in
-                    (sessions[a]?.lastActivity ?? .distantPast) < (sessions[b]?.lastActivity ?? .distantPast)
-                }
-                : cachedActiveIds.first
-            if let active, activeSessionId != active {
+            // active session (if any) so the collapsed bar doesn't stick on an idle one.
+            if let active = cachedActiveIds.first, activeSessionId != active {
                 activeSessionId = active
             }
         }
     }
 
     private func rotateToNextSession() {
-        // The setting can flip while the timer is live — self-heal on the next tick.
-        guard cachedActiveIds.count > 1, SettingsManager.shared.sessionListLimit != 1 else {
+        guard cachedActiveIds.count > 1 else {
             rotatingSessionId = nil
             return
         }

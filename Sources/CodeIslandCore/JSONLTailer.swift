@@ -31,6 +31,10 @@ public struct ConversationTailDelta: Equatable, Sendable {
     public let turnStatus: ConversationTurnStatus?
     public let hasActivity: Bool
     public let cursorQuestion: CursorQuestionSignal?
+    /// True when the prompt appeared *after* the assistant text in the scanned
+    /// bytes — one chunk often holds the tail of a turn plus the head of the
+    /// next, and the consumer must replay them in that order.
+    public let promptIsNewer: Bool
 
     public init(
         sessionId: String,
@@ -38,7 +42,8 @@ public struct ConversationTailDelta: Equatable, Sendable {
         lastAssistantMessage: String?,
         turnStatus: ConversationTurnStatus? = nil,
         hasActivity: Bool = false,
-        cursorQuestion: CursorQuestionSignal? = nil
+        cursorQuestion: CursorQuestionSignal? = nil,
+        promptIsNewer: Bool = false
     ) {
         self.sessionId = sessionId
         self.lastUserPrompt = lastUserPrompt
@@ -46,6 +51,7 @@ public struct ConversationTailDelta: Equatable, Sendable {
         self.turnStatus = turnStatus
         self.hasActivity = hasActivity
         self.cursorQuestion = cursorQuestion
+        self.promptIsNewer = promptIsNewer
     }
 
     /// A delta only carries signal when at least one field is non-nil.
@@ -233,7 +239,8 @@ public final class JSONLTailer: @unchecked Sendable {
                 lastAssistantMessage: scan.delta.lastAssistantMessage,
                 turnStatus: scan.delta.turnStatus,
                 hasActivity: scan.delta.hasActivity,
-                cursorQuestion: scan.delta.cursorQuestion
+                cursorQuestion: scan.delta.cursorQuestion,
+                promptIsNewer: scan.delta.lastRoleIsUser == true
             )
             onDelta(delta)
         }
@@ -269,6 +276,9 @@ public final class JSONLTailer: @unchecked Sendable {
             public var turnStatus: ConversationTurnStatus?
             public var hasActivity = false
             public var cursorQuestion: CursorQuestionSignal?
+            /// Role of the last message text seen in the blob — tells the
+            /// consumer which of the two fields is the newer one.
+            public var lastRoleIsUser: Bool?
             public var isEmpty: Bool {
                 lastUserPrompt == nil && lastAssistantMessage == nil && turnStatus == nil
                     && !hasActivity && cursorQuestion == nil
@@ -338,14 +348,17 @@ public final class JSONLTailer: @unchecked Sendable {
         case "user", "USER_INPUT":
             if let text = extractText(from: message["content"]) {
                 delta.lastUserPrompt = text
+                delta.lastRoleIsUser = true
             }
         case "assistant", "PLANNER_RESPONSE":
             if let text = extractText(from: message["content"]) {
                 delta.lastAssistantMessage = text
+                delta.lastRoleIsUser = false
             } else if let thinking = message["thinking"] as? String {
                 let trimmed = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
                     delta.lastAssistantMessage = trimmed
+                    delta.lastRoleIsUser = false
                 }
             }
         case "event_msg":

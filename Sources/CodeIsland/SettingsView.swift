@@ -838,7 +838,7 @@ private struct CLIStatusRow: View {
 private struct AppearancePage: View {
     @ObservedObject private var l10n = L10n.shared
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
-    @AppStorage(SettingsKey.sessionListLimit) private var sessionListLimit = SettingsDefaults.sessionListLimit
+    @AppStorage(SettingsKey.panelIdleGraceMinutes) private var panelIdleGraceMinutes = SettingsDefaults.panelIdleGraceMinutes
     @AppStorage(SettingsKey.contentFontSize) private var contentFontSize = SettingsDefaults.contentFontSize
     @AppStorage(SettingsKey.aiMessageLines) private var aiMessageLines = SettingsDefaults.aiMessageLines
     @AppStorage(SettingsKey.showAgentDetails) private var showAgentDetails = SettingsDefaults.showAgentDetails
@@ -867,14 +867,14 @@ private struct AppearancePage: View {
             }
 
             Section(l10n["panel"]) {
-                Picker(selection: $sessionListLimit) {
-                    Text(l10n["all_sessions"]).tag(0)
-                    Text(l10n["latest_1_session"]).tag(1)
-                    Text("3").tag(3)
-                    Text("5").tag(5)
+                Picker(selection: $panelIdleGraceMinutes) {
+                    Text(l10n["3_minutes"]).tag(3)
+                    Text(l10n["5_minutes"]).tag(5)
+                    Text(l10n["10_minutes"]).tag(10)
+                    Text(l10n["no_cleanup"]).tag(0)
                 } label: {
-                    Text(l10n["session_list_limit"])
-                    Text(l10n["session_list_limit_desc"])
+                    Text(l10n["panel_idle_grace"])
+                    Text(l10n["panel_idle_grace_desc"])
                 }
                 Picker(selection: $maxVisibleSessions) {
                     Text("3").tag(3)

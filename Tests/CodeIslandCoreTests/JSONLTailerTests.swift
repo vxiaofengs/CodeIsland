@@ -39,6 +39,25 @@ final class JSONLTailerTests: XCTestCase {
         XCTAssertEqual(result.delta.lastUserPrompt, "second question")
     }
 
+    func testScanLinesReportsWhichRoleCameLast() {
+        // Tail of one turn + head of the next: the prompt is the newer entry.
+        let promptLast = Data(([
+            assistantLine(text: "answer to the previous question"),
+            userLine(text: "the next question"),
+        ].joined(separator: "\n") + "\n").utf8)
+        XCTAssertEqual(JSONLTailer.scanLines(promptLast).delta.lastRoleIsUser, true)
+
+        // A full turn in one chunk: the reply is the newer entry.
+        let replyLast = Data(([
+            userLine(text: "the question"),
+            assistantLine(text: "its answer"),
+        ].joined(separator: "\n") + "\n").utf8)
+        XCTAssertEqual(JSONLTailer.scanLines(replyLast).delta.lastRoleIsUser, false)
+
+        // Nothing role-bearing in the blob.
+        XCTAssertNil(JSONLTailer.scanLines(Data()).delta.lastRoleIsUser)
+    }
+
     func testScanLinesTrailingPartialLineReturnsAsFragment() {
         let completeLine = assistantLine(text: "done") + "\n"
         let partial = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"half"

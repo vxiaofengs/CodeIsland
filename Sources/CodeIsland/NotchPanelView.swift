@@ -443,7 +443,6 @@ private struct CompactLeftWing: View {
     let hasNotch: Bool
     let showToolStatus: Bool
     @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
-    @AppStorage(SettingsKey.sessionListLimit) private var sessionListLimit = SettingsDefaults.sessionListLimit
     // Bound via @AppStorage so flipping the default mascot in Settings rerenders this view
     // even when AppState.primarySource wasn't recomputed (no session mutations in flight).
     @AppStorage(SettingsKey.defaultSource) private var settingsDefaultSource = SettingsDefaults.defaultSource
@@ -470,8 +469,7 @@ private struct CompactLeftWing: View {
         HStack(spacing: 6) {
             if expanded {
                 AppLogoView(size: 36, showBackground: false)
-                // Grouping is meaningless when the list is pinned to one session.
-                if appState.sessions.count > 1, sessionListLimit != 1 {
+                if appState.sessions.count > 1 {
                     HStack(spacing: 1) {
                         ForEach([("all", "ALL"), ("status", "STA"), ("cli", "CLI")], id: \.0) { tag, label in
                             let selected = groupingMode == tag
@@ -548,7 +546,6 @@ private struct CompactRightWing: View {
     @AppStorage(SettingsKey.quietHoursEnabled) private var quietHoursEnabled = SettingsDefaults.quietHoursEnabled
     @AppStorage(SettingsKey.quietHoursStart) private var quietHoursStart = SettingsDefaults.quietHoursStart
     @AppStorage(SettingsKey.quietHoursEnd) private var quietHoursEnd = SettingsDefaults.quietHoursEnd
-    @AppStorage(SettingsKey.sessionListLimit) private var sessionListLimit = SettingsDefaults.sessionListLimit
 
     /// Re-evaluated on every re-render; the compact bar redraws often enough
     /// that the moon appears/disappears close to the window edges.
@@ -613,40 +610,20 @@ private struct CompactRightWing: View {
                         .symbolEffect(.pulse, options: .repeating)
                 }
 
-                // The count is a fleet gauge — pointless (and confusing, it
-                // still counts hidden sessions) when the list is pinned to one.
-                if sessionListLimit != 1 {
-                    if showToolStatus {
-                        // Detailed mode: session count (project name is shown in center on non-notch)
-                        HStack(spacing: 1) {
-                            let active = appState.activeSessionCount
-                            let total = appState.totalSessionCount
-                            if active > 0 {
-                                Text("\(active)")
-                                    .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
-                                Text("/")
-                                    .foregroundStyle(.white.opacity(0.4))
-                            }
-                            Text("\(total)")
-                                .foregroundStyle(.white.opacity(0.9))
-                        }
-                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    } else {
-                        // Simple mode: original session count only
-                        HStack(spacing: 1) {
-                            let active = appState.activeSessionCount
-                            let total = appState.totalSessionCount
-                            if active > 0 {
-                                Text("\(active)")
-                                    .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
-                                Text("/")
-                                    .foregroundStyle(.white.opacity(0.4))
-                            }
-                            Text("\(total)")
-                                .foregroundStyle(.white.opacity(0.9))
-                        }
-                        .font(.system(size: 13, weight: .bold, design: .monospaced))
-                    }
+                // Active sessions only — the old active/total pair also counted
+                // sessions the panel no longer lists, so the total just raised
+                // questions. Nothing working, nothing to report.
+                if appState.activeSessionCount > 0 {
+                    Text("\(appState.activeSessionCount)")
+                        .font(.system(
+                            size: showToolStatus ? 12 : 13,
+                            weight: showToolStatus ? .semibold : .bold,
+                            design: .monospaced
+                        ))
+                        .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
+                        .contentTransition(.numericText())
+                        .animation(NotchAnimation.micro, value: appState.activeSessionCount)
+                        .help(l10n["active_sessions_tooltip"])
                 }
             }
         }
@@ -1715,21 +1692,57 @@ private struct PixelButton: View {
     }
 }
 
+/// Vertical focus ramp for a session card's content blocks.
+///
+/// Position alone decides: the bottom block is the freshest thing in the card
+/// and stays fully opaque, each block above it recedes one step. No need to know
+/// whether a row is a prompt, a reply or the live status line — which also means
+/// a mis-ordered or mis-classified row can't break the focus effect.
+enum SessionMessageFocus {
+    private static let ramp: [Double] = [1.0, 0.68, 0.44]
+    /// Anything further up shares this floor so history stays readable.
+    private static let floor: Double = 0.32
+
+    static func opacity(indexFromBottom index: Int) -> Double {
+        guard index > 0 else { return ramp[0] }
+        return index < ramp.count ? ramp[index] : floor
+    }
+}
+
 // MARK: - Session List
 
-/// Keeps the expanded list to the N most recently active sessions.
-enum SessionListLimit {
-    /// `limit <= 0` means unlimited. When the limit bites, the survivors come
-    /// back newest-first; equal timestamps fall back to the id so the order
-    /// stays stable across renders.
-    static func apply(ids: [String], limit: Int, lastActivity: (String) -> Date) -> [String] {
-        guard limit > 0, ids.count > limit else { return ids }
-        return ids.sorted { lhs, rhs in
+/// What the expanded list shows, and in which order.
+///
+/// Working sessions always earn a card; a session that has finished a turn
+/// lingers for the grace period so its result stays readable, then leaves. A
+/// session that has never run anything never earns a card at all — opening a
+/// conversation in an IDE registers a session immediately, and those empty
+/// placeholders are what made the list unreadable. Order is oldest to newest so
+/// the freshest sits at the bottom, matching the direction a chat log (and each
+/// card's focus ramp) reads.
+enum SessionListOrder {
+    /// `graceMinutes <= 0` keeps sessions that have run something in the panel
+    /// indefinitely; the "never ran anything" rule applies either way.
+    static func visibleIds(
+        ids: [String],
+        graceMinutes: Int,
+        now: Date = Date(),
+        isActive: (String) -> Bool,
+        hasRunATurn: (String) -> Bool,
+        lastActivity: (String) -> Date
+    ) -> [String] {
+        // Equal timestamps fall back to the id so the order can't flicker.
+        let ordered = ids.sorted { lhs, rhs in
             let l = lastActivity(lhs), r = lastActivity(rhs)
-            return l == r ? lhs < rhs : l > r
+            return l == r ? lhs < rhs : l < r
         }
-        .prefix(limit)
-        .map { $0 }
+        let cutoff = graceMinutes > 0
+            ? now.addingTimeInterval(-Double(graceMinutes) * 60)
+            : Date.distantPast
+        return ordered.filter { id in
+            if isActive(id) { return true }
+            return hasRunATurn(id) && lastActivity(id) >= cutoff
+        }
     }
 }
 
@@ -1739,23 +1752,48 @@ private struct SessionListView: View {
     var onlySessionId: String? = nil
     @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
-    @AppStorage(SettingsKey.sessionListLimit) private var sessionListLimit = SettingsDefaults.sessionListLimit
+    @AppStorage(SettingsKey.panelIdleGraceMinutes) private var idleGraceMinutes = SettingsDefaults.panelIdleGraceMinutes
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
+    @ObservedObject private var l10n = L10n.shared
+    /// Grace expiry is a wall-clock deadline, not a state change — without a tick
+    /// a finished card would sit there until the next session event.
+    @State private var graceTick = Date()
+
+    /// How many cards the full list would show — used by the completion card's
+    /// "show all" link so it never advertises sessions the list won't render.
+    private var otherVisibleCount: Int {
+        SessionListOrder.visibleIds(
+            ids: Array(appState.sessions.keys),
+            graceMinutes: idleGraceMinutes,
+            now: graceTick,
+            isActive: { appState.sessions[$0]?.status != .idle },
+            hasRunATurn: { id in
+                guard let session = appState.sessions[id] else { return false }
+                return session.lastUserPrompt != nil || !session.recentMessages.isEmpty
+            },
+            lastActivity: { appState.sessions[$0]?.lastActivity ?? .distantPast }
+        ).count
+    }
 
     private var groupedSessions: [(header: String, source: String?, ids: [String])] {
         if let only = onlySessionId, appState.sessions[only] != nil {
             return [("", nil, [only])]
         }
 
-        let sorted = SessionListLimit.apply(
-            ids: appState.sessions.keys.sorted(),
-            limit: sessionListLimit,
+        let sorted = SessionListOrder.visibleIds(
+            ids: Array(appState.sessions.keys),
+            graceMinutes: idleGraceMinutes,
+            now: graceTick,
+            isActive: { appState.sessions[$0]?.status != .idle },
+            hasRunATurn: { id in
+                guard let session = appState.sessions[id] else { return false }
+                return session.lastUserPrompt != nil || !session.recentMessages.isEmpty
+            },
             lastActivity: { appState.sessions[$0]?.lastActivity ?? .distantPast }
         )
 
-        // Pinned to one session — a group header over a single row is noise,
-        // and the grouping tabs are hidden in this mode anyway.
-        if sessionListLimit == 1 {
+        // A single card needs no group header, whichever grouping is selected.
+        if sorted.count < 2 {
             return [("", nil, sorted)]
         }
 
@@ -1872,17 +1910,19 @@ private struct SessionListView: View {
                 }
             }
 
-            // Sessions the "most recent N" limit dropped — say so instead of
-            // letting them look lost. "Latest only" mode skips the hint: the
-            // user explicitly chose to ignore everything else.
-            if onlySessionId == nil, sessionListLimit != 1, appState.sessions.count > totalSessionCount {
-                HiddenSessionsFooter(count: appState.sessions.count - totalSessionCount)
+            // Every session aged out of the panel — don't leave a blank sheet.
+            if onlySessionId == nil, totalSessionCount == 0 {
+                Text(l10n["no_active_sessions"])
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.35))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
             }
 
-            // "Show all sessions" — hover with delay to expand. Pointless in
-            // "latest only" mode: the full list holds one session too.
-            if onlySessionId != nil && appState.sessions.count > 1 && sessionListLimit != 1 {
-                SessionsExpandLink(count: appState.sessions.count) {
+            // "Show all sessions" — hover with delay to expand. Counts what the
+            // list will actually render, not every session the app remembers.
+            if onlySessionId != nil, otherVisibleCount > 1 {
+                SessionsExpandLink(count: otherVisibleCount) {
                     withAnimation(NotchAnimation.open) {
                         appState.surface = .sessionList
                         appState.cancelCompletionQueue()
@@ -1891,6 +1931,10 @@ private struct SessionListView: View {
             }
         }
         .padding(.vertical, 4)
+        .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { now in
+            // Only while the panel is on screen — this view is torn down on collapse.
+            if idleGraceMinutes > 0 { graceTick = now }
+        }
 
         VStack(spacing: 0) {
             if needsScroll {
@@ -2090,24 +2134,6 @@ private struct ProjectNameLink: View {
                 }
             }
             .help(isInteractive && cwd != nil ? "\(L10n.shared["open_path"]) \(cwd ?? "")" : "")
-    }
-}
-
-/// Tail line for the session list when `sessionListLimit` hides older sessions.
-private struct HiddenSessionsFooter: View {
-    let count: Int
-    @ObservedObject private var l10n = L10n.shared
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Rectangle().fill(.white.opacity(0.12)).frame(height: 1)
-            Text(String(format: l10n["n_sessions_hidden"], count))
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.35))
-            Rectangle().fill(.white.opacity(0.12)).frame(height: 1)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 4)
     }
 }
 
@@ -2448,11 +2474,13 @@ private struct SessionCard: View {
                     let visibleMessages = session.status != .idle
                         ? Array(session.recentMessages.suffix(2))
                         : session.recentMessages
-                    // Focus split: the current turn starts at the last user
-                    // prompt — everything before it is history and recedes so
-                    // the live task reads first. No user prompt in the window
-                    // (mid-turn streaming) → treat everything as current.
-                    let focusStart = visibleMessages.lastIndex(where: \.isUser) ?? 0
+                    // Focus ramp: the bottom message is the freshest content and
+                    // stays opaque; blocks above it recede by position, one whole
+                    // message at a time. The live status line does not take a
+                    // step of its own — it belongs to the same current turn as
+                    // the message it sits under.
+                    let liveStatusShown = session.status != .idle && !showsExternalCursorQuestion
+                    let blockCount = visibleMessages.count
                     ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { idx, msg in
                         // Extracted to separate view so SwiftUI skips re-rendering
                         // when only the parent's hover state changes (#52 perf).
@@ -2462,14 +2490,15 @@ private struct SessionCard: View {
                             fontSize: fontSize,
                             aiLineLimit: aiLineLimit
                         )
-                        .opacity(idx < focusStart ? 0.55 : 1)
+                        .opacity(SessionMessageFocus.opacity(indexFromBottom: blockCount - 1 - idx))
                     }
-                    .animation(.easeInOut(duration: 0.25), value: focusStart)
+                    .animation(.easeInOut(duration: 0.25), value: blockCount)
 
-                    // Working indicator: show what AI is doing right now.
-                    // Suppressed while a Cursor-side question is pending — the
-                    // question block above already explains the wait (#265).
-                    if session.status != .idle && !showsExternalCursorQuestion {
+                    // Working indicator: show what AI is doing right now, at full
+                    // opacity alongside the newest message. Suppressed while a
+                    // Cursor-side question is pending — the question block above
+                    // already explains the wait (#265).
+                    if liveStatusShown {
                         HStack(spacing: 4) {
                             Text("$")
                                 .font(.system(size: fontSize, weight: .bold, design: .monospaced))
