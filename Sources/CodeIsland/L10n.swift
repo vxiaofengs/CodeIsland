@@ -385,10 +385,6 @@ final class L10n: ObservableObject {
         "cursor_question_answer_hint": "Answer in Cursor to continue",
 
         // Session grouping
-        "status_running": "Running",
-        "status_waiting": "Waiting",
-        "status_processing": "Processing",
-        "status_idle": "Idle",
         "other": "Other",
         "n_sessions": "sessions",
         "scroll_for_more": "Scroll for more",
@@ -734,10 +730,6 @@ final class L10n: ObservableObject {
         "cursor_question_answer_hint": "Zum Fortfahren in Cursor antworten",
 
         // Session grouping
-        "status_running": "Läuft",
-        "status_waiting": "Wartet",
-        "status_processing": "Verarbeitung",
-        "status_idle": "Inaktiv",
         "other": "Andere",
         "n_sessions": "Sitzungen",
         "scroll_for_more": "Für mehr scrollen",
@@ -1087,10 +1079,6 @@ final class L10n: ObservableObject {
         "cursor_question_answer_hint": "请在 Cursor 中回答后继续",
 
         // Session grouping
-        "status_running": "运行中",
-        "status_waiting": "等待中",
-        "status_processing": "处理中",
-        "status_idle": "空闲",
         "other": "其他",
         "n_sessions": "个会话",
         "scroll_for_more": "向下滚动查看更多",
@@ -1440,10 +1428,6 @@ final class L10n: ObservableObject {
         "cursor_question_answer_hint": "請在 Cursor 中回答後繼續",
 
         // Session grouping
-        "status_running": "執行中",
-        "status_waiting": "等待中",
-        "status_processing": "處理中",
-        "status_idle": "閒置",
         "other": "其他",
         "n_sessions": "個會話",
         "scroll_for_more": "向下捲動查看更多",
@@ -1793,10 +1777,6 @@ final class L10n: ObservableObject {
         "cursor_question_answer_hint": "続行するには Cursor で回答してください",
 
         // Session grouping
-        "status_running": "実行中",
-        "status_waiting": "待機中",
-        "status_processing": "処理中",
-        "status_idle": "待機",
         "other": "その他",
         "n_sessions": "セッション",
         "scroll_for_more": "さらに表示するにはスクロール",
@@ -2146,10 +2126,6 @@ final class L10n: ObservableObject {
         "cursor_question_answer_hint": "계속하려면 Cursor에서 답변하세요",
 
         // Session grouping
-        "status_running": "실행 중",
-        "status_waiting": "대기 중",
-        "status_processing": "처리 중",
-        "status_idle": "유휴",
         "other": "기타",
         "n_sessions": "세션",
         "scroll_for_more": "더 보려면 스크롤",
@@ -2499,10 +2475,6 @@ final class L10n: ObservableObject {
         "cursor_question_answer_hint": "Devam etmek için Cursor'da yanıtlayın",
 
         // Session grouping
-        "status_running": "Çalışıyor",
-        "status_waiting": "Bekliyor",
-        "status_processing": "İşleniyor",
-        "status_idle": "Boşta",
         "other": "Diğer",
         "n_sessions": "oturum",
         "scroll_for_more": "Daha fazla için kaydır",

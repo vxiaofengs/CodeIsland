@@ -114,6 +114,8 @@ struct NotchPanelView: View {
     @State private var hoverTimer: Timer?
     @State private var isHovered = false
     @State private var idleHovered = false
+    /// Separate from `hoverTimer`, which owns the expand delay (#52 debounce).
+    @State private var idleHoverTimer: Timer?
     /// Three-stage hover: collapsed → prehover (immediate ack) → expanded (after delay)
     @State private var hoverPhase: NotchHoverPhase = .collapsed
     /// Curtain animation for tool status toggle
@@ -131,8 +133,11 @@ struct NotchPanelView: View {
     private var showBar: Bool {
         isActive && !(hideWhenNoSession && appState.activeSessionCount == 0)
     }
+    /// The idle indicator expands too, so hovering behaves the same whether or
+    /// not the app still remembers a session — it just opens on the empty state.
+    private var canExpand: Bool { showBar || showIdleIndicator }
     private var shouldShowExpanded: Bool {
-        showBar && appState.surface.isExpanded
+        canExpand && appState.surface.isExpanded
     }
     /// Prehover acknowledgement is only rendered on the collapsed active bar —
     /// once the surface expands (from hover or any other path) it disappears.
@@ -159,9 +164,10 @@ struct NotchPanelView: View {
     private var panelWidth: CGFloat {
         let nw = effectiveNotchW
         let maxWidth = min(620, screenWidth - 40)
+        // Expanded wins over the idle indicator's own hover width.
+        if shouldShowExpanded { return min(max(nw + 200, 580), maxWidth) }
         if showIdleIndicator { return idleHovered ? nw + compactWingWidth * 2 + 80 : nw + compactWingWidth * 2 }
         if !isActive { return hasNotch ? nw - 20 : nw }
-        if shouldShowExpanded { return min(max(nw + 200, 580), maxWidth) }
         let wing = compactWingWidth
         let extra: CGFloat = appState.status == .idle ? 0 : 20
         // Reserve space for tool status — proportional to screen width
@@ -174,7 +180,9 @@ struct NotchPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 0) {
-                if showBar {
+                // Expanded state always uses the full bar, even with no sessions
+                // left — the idle indicator has no room for the header controls.
+                if showBar || shouldShowExpanded {
                     // Active: compact bar — wider version when expanded.
                     // Wings hold identity (mascot) and alerts (badges); on
                     // notch-free screens the narrative (project + status) sits
@@ -312,21 +320,21 @@ struct NotchPanelView: View {
             .contentShape(Rectangle())
             .onHover { hovering in
                 // Idle indicator hover — delay un-hover to prevent oscillation when
-                // the animated width change crosses the mouse position (#52).
+                // the animated width change crosses the mouse position (#52). Its
+                // own timer: the shared one below drives the expand delay, and the
+                // two clobbered each other. Falls through so the idle bar expands
+                // like the active one.
                 if showIdleIndicator {
+                    idleHoverTimer?.invalidate()
                     if hovering {
-                        hoverTimer?.invalidate()
-                        hoverTimer = nil
                         withAnimation(NotchAnimation.micro) { idleHovered = true }
                     } else {
-                        hoverTimer?.invalidate()
-                        hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { _ in
+                        idleHoverTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { _ in
                             Task { @MainActor in
                                 withAnimation(NotchAnimation.micro) { idleHovered = false }
                             }
                         }
                     }
-                    return
                 }
                 switch appState.surface {
                 case .approvalCard, .questionCard: return
@@ -446,7 +454,6 @@ private struct CompactLeftWing: View {
     let mascotSize: CGFloat
     let hasNotch: Bool
     let showToolStatus: Bool
-    @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
     // Bound via @AppStorage so flipping the default mascot in Settings rerenders this view
     // even when AppState.primarySource wasn't recomputed (no session mutations in flight).
     @AppStorage(SettingsKey.defaultSource) private var settingsDefaultSource = SettingsDefaults.defaultSource
@@ -472,31 +479,9 @@ private struct CompactLeftWing: View {
     var body: some View {
         HStack(spacing: 6) {
             if expanded {
+                // Just the logo: the ALL/STA/CLI grouping switch is gone with the
+                // grouping itself (see SessionListView.visibleSessionIds).
                 AppLogoView(size: 36, showBackground: false)
-                if appState.sessions.count > 1 {
-                    HStack(spacing: 1) {
-                        ForEach([("all", "ALL"), ("status", "STA"), ("cli", "CLI")], id: \.0) { tag, label in
-                            let selected = groupingMode == tag
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.15)) { groupingMode = tag }
-                            } label: {
-                                PixelText(
-                                    text: label,
-                                    color: selected ? Color(red: 0.3, green: 0.85, blue: 0.4) : .white.opacity(0.3),
-                                    pixelSize: 1.3
-                                )
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 4)
-                                .background(
-                                    Rectangle().fill(selected ? .white.opacity(0.1) : .clear)
-                                )
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .background(Rectangle().fill(.white.opacity(0.05)))
-                    .overlay(Rectangle().stroke(.white.opacity(0.1), lineWidth: 1))
-                }
             } else {
                 MascotView(source: displaySource, status: displayStatus, size: mascotSize)
                     .id(displaySource)
@@ -1754,7 +1739,6 @@ private struct SessionListView: View {
     var appState: AppState
     /// When set, only show this session (auto-expand on completion)
     var onlySessionId: String? = nil
-    @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
     @AppStorage(SettingsKey.panelIdleGraceMinutes) private var idleGraceMinutes = SettingsDefaults.panelIdleGraceMinutes
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
@@ -1780,12 +1764,16 @@ private struct SessionListView: View {
         ).count
     }
 
-    private var groupedSessions: [(header: String, source: String?, ids: [String])] {
+    /// Flat, oldest → newest. Grouping by status or CLI used to be selectable,
+    /// but the list now only holds sessions that are working or just finished:
+    /// the idle group was always empty, a single-CLI setup got one constant
+    /// header, and either way the group order broke "freshest at the bottom".
+    private var visibleSessionIds: [String] {
         if let only = onlySessionId, appState.sessions[only] != nil {
-            return [("", nil, [only])]
+            return [only]
         }
 
-        let sorted = SessionListOrder.visibleIds(
+        return SessionListOrder.visibleIds(
             ids: Array(appState.sessions.keys),
             graceMinutes: idleGraceMinutes,
             now: graceTick,
@@ -1796,122 +1784,22 @@ private struct SessionListView: View {
             },
             lastActivity: { appState.sessions[$0]?.lastActivity ?? .distantPast }
         )
-
-        // A single card needs no group header, whichever grouping is selected.
-        if sorted.count < 2 {
-            return [("", nil, sorted)]
-        }
-
-        switch groupingMode {
-        case "status":
-            let l10n = L10n.shared
-            let groups: [(Set<AgentStatus>, String)] = [
-                ([.running], l10n["status_running"]),
-                ([.waitingApproval, .waitingQuestion], l10n["status_waiting"]),
-                ([.processing], l10n["status_processing"]),
-                ([.idle], l10n["status_idle"]),
-            ]
-            var result: [(String, String?, [String])] = []
-            for (statuses, label) in groups {
-                let ids = sorted.filter { id in
-                    guard let s = appState.sessions[id] else { return false }
-                    return statuses.contains(s.status)
-                }
-                if !ids.isEmpty {
-                    result.append(("\(label) (\(ids.count))", nil, ids))
-                }
-            }
-            return result
-
-        case "cli":
-            let cliOrder: [(source: String, name: String)] = [
-                ("claude", "Claude"),
-                ("codex", "Codex"),
-                ("gemini", "Gemini"),
-                ("antigravity", "AntiGravity"),
-                ("google-antigravity", "Google Antigravity"),
-                ("cursor", "Cursor"),
-                ("trae", "Trae"),
-                ("traecn", "Trae CN"),
-                ("traecli", "Trae CLI"),
-                ("copilot", "Copilot"),
-                ("qoder", "Qoder"),
-                ("qoderwork", "QoderWork"),
-                ("droid", "Factory"),
-                ("codebuddy", "CodeBuddy"),
-                ("codybuddycn", "CodyBuddyCN"),
-                ("stepfun", "StepFun"),
-                ("workbuddy", "WorkBuddy"),
-                ("hermes", "Hermes"),
-                ("openclaw", "OpenClaw"),
-                ("qwen", "Qwen Code"),
-                ("kimi", "Kimi Code CLI"),
-                ("opencode", "OpenCode"),
-                ("pi", "Pi"),
-                ("kiro", "Kiro"),
-                ("cline", "Cline"),
-                ("zcode", "ZCode"),
-            ]
-            var result: [(String, String?, [String])] = []
-            var seen = Set<String>()
-            for cli in cliOrder {
-                let ids = sorted.filter { id in
-                    guard let source = appState.sessions[id]?.source else { return false }
-                    if source == cli.source { return true }
-                    // Bundle promoted -cli variants with their IDE group (#248).
-                    if cli.source == "cursor", source == "cursor-cli" { return true }
-                    if cli.source == "qoder", source == "qoder-cli" { return true }
-                    return false
-                }
-                ids.forEach { seen.insert($0) }
-                if !ids.isEmpty {
-                    result.append(("\(cli.name) (\(ids.count))", cli.source, ids))
-                }
-            }
-            let remaining = sorted.filter { !seen.contains($0) }
-            if !remaining.isEmpty {
-                result.append(("\(L10n.shared["other"]) (\(remaining.count))", nil, remaining))
-            }
-            return result
-
-        default: // "all"
-            return [("", nil, sorted)]
-        }
     }
 
     var body: some View {
-        // Compute once per render — groupedSessions, totalCount, needsScroll
-        let groups = groupedSessions
-        let totalSessionCount = groups.reduce(0) { $0 + $1.ids.count }
+        // Compute once per render — the id list, its count, needsScroll
+        let sessionIds = visibleSessionIds
+        let totalSessionCount = sessionIds.count
         let needsScroll = onlySessionId == nil && totalSessionCount > maxVisibleSessions
         let content = VStack(spacing: 6) {
-            ForEach(groups, id: \.header) { group in
-                if !group.header.isEmpty {
-                    HStack(spacing: 6) {
-                        if let src = group.source, let icon = cliIcon(source: src) {
-                            Image(nsImage: icon)
-                                .resizable()
-                                .frame(width: 14, height: 14)
-                        }
-                        Text(group.header)
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.5))
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 6)
-                    .padding(.bottom, 2)
-                }
-
-                ForEach(group.ids, id: \.self) { sessionId in
-                    if let session = appState.sessions[sessionId] {
-                        SessionCard(
-                            appState: appState,
-                            sessionId: sessionId,
-                            session: session,
-                            isCompletion: onlySessionId != nil
-                        )
-                    }
+            ForEach(sessionIds, id: \.self) { sessionId in
+                if let session = appState.sessions[sessionId] {
+                    SessionCard(
+                        appState: appState,
+                        sessionId: sessionId,
+                        session: session,
+                        isCompletion: onlySessionId != nil
+                    )
                 }
             }
 
@@ -2862,87 +2750,7 @@ private struct TerminalBadge: View {
     }
 }
 
-/// Collapsed single-line row for idle sessions >15 min
-// MARK: - Pixel Text (5×7 dot matrix style)
-
-private struct PixelText: View {
-    let text: String
-    let color: Color
-    var pixelSize: CGFloat = 2
-
-    private static let W = 5  // glyph width
-    private static let H = 7  // glyph height
-
-    // 5×7 bitmaps — each row is 5 bits, 7 rows per glyph
-    private static let glyphs: [Character: [UInt8]] = [
-        "0": [0,1,1,1,0, 1,0,0,1,1, 1,0,1,0,1, 1,1,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "1": [0,0,1,0,0, 0,1,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "2": [0,1,1,1,0, 1,0,0,0,1, 0,0,1,1,0, 0,1,0,0,0, 1,1,1,1,1, 0,0,0,0,0, 0,0,0,0,0],
-        "3": [0,1,1,1,0, 1,0,0,0,1, 0,0,1,1,0, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "4": [0,0,0,1,0, 0,0,1,1,0, 0,1,0,1,0, 1,1,1,1,1, 0,0,0,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "5": [1,1,1,1,1, 1,0,0,0,0, 1,1,1,1,0, 0,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "6": [0,1,1,1,0, 1,0,0,0,0, 1,1,1,1,0, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "7": [1,1,1,1,1, 0,0,0,0,1, 0,0,0,1,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,0,0,0, 0,0,0,0,0],
-        "8": [0,1,1,1,0, 1,0,0,0,1, 0,1,1,1,0, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "9": [0,1,1,1,0, 1,0,0,0,1, 0,1,1,1,1, 0,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "A": [0,0,1,0,0, 0,1,0,1,0, 1,0,0,0,1, 1,1,1,1,1, 1,0,0,0,1, 0,0,0,0,0, 0,0,0,0,0],
-        "B": [1,1,1,1,0, 1,0,0,0,1, 1,1,1,1,0, 1,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "C": [0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,0, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "D": [1,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "E": [1,1,1,1,1, 1,0,0,0,0, 1,1,1,1,0, 1,0,0,0,0, 1,1,1,1,1, 0,0,0,0,0, 0,0,0,0,0],
-        "F": [1,1,1,1,1, 1,0,0,0,0, 1,1,1,1,0, 1,0,0,0,0, 1,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0],
-        "G": [0,1,1,1,0, 1,0,0,0,0, 1,0,0,1,1, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "H": [1,0,0,0,1, 1,0,0,0,1, 1,1,1,1,1, 1,0,0,0,1, 1,0,0,0,1, 0,0,0,0,0, 0,0,0,0,0],
-        "I": [0,1,1,1,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "K": [1,0,0,1,0, 1,0,1,0,0, 1,1,0,0,0, 1,0,1,0,0, 1,0,0,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "L": [1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 1,1,1,1,1, 0,0,0,0,0, 0,0,0,0,0],
-        "N": [1,0,0,0,1, 1,1,0,0,1, 1,0,1,0,1, 1,0,0,1,1, 1,0,0,0,1, 0,0,0,0,0, 0,0,0,0,0],
-        "O": [0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "P": [1,1,1,1,0, 1,0,0,0,1, 1,1,1,1,0, 1,0,0,0,0, 1,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0],
-        "R": [1,1,1,1,0, 1,0,0,0,1, 1,1,1,1,0, 1,0,0,1,0, 1,0,0,0,1, 0,0,0,0,0, 0,0,0,0,0],
-        "S": [0,1,1,1,1, 1,0,0,0,0, 0,1,1,1,0, 0,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "T": [1,1,1,1,1, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,0,0,0, 0,0,0,0,0],
-        "U": [1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "W": [1,0,0,0,1, 1,0,0,0,1, 1,0,1,0,1, 1,0,1,0,1, 0,1,0,1,0, 0,0,0,0,0, 0,0,0,0,0],
-        "X": [1,0,0,0,1, 0,1,0,1,0, 0,0,1,0,0, 0,1,0,1,0, 1,0,0,0,1, 0,0,0,0,0, 0,0,0,0,0],
-        "/": [0,0,0,0,1, 0,0,0,1,0, 0,0,1,0,0, 0,1,0,0,0, 1,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0],
-        "-": [0,0,0,0,0, 0,0,0,0,0, 1,1,1,1,1, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0],
-        " ": [0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0],
-    ]
-
-    var body: some View {
-        let chars = Array(text.uppercased())
-        let px = pixelSize
-        let gap: CGFloat = px
-
-        Canvas { ctx, size in
-            var xOff: CGFloat = 0
-            for ch in chars {
-                guard let glyph = Self.glyphs[ch] else {
-                    xOff += 3 * px
-                    continue
-                }
-                for row in 0..<Self.H {
-                    for col in 0..<Self.W {
-                        if glyph[row * Self.W + col] == 1 {
-                            let rect = CGRect(x: xOff + CGFloat(col) * px, y: CGFloat(row) * px, width: px, height: px)
-                            ctx.fill(Path(rect), with: .color(color))
-                        }
-                    }
-                }
-                xOff += CGFloat(Self.W) * px + gap
-            }
-        }
-        .frame(width: charWidth(chars.count), height: CGFloat(Self.H) * pixelSize)
-    }
-
-    private func charWidth(_ count: Int) -> CGFloat {
-        guard count > 0 else { return 0 }
-        let px = pixelSize
-        return CGFloat(count) * (CGFloat(Self.W) * px + px) - px
-    }
-}
-
+/// Horizontal hairline — the dashed rule under the collapsed bar.
 private struct Line: Shape {
     func path(in rect: CGRect) -> Path {
         var p = Path()

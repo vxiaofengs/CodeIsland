@@ -90,9 +90,6 @@ enum SettingsKey {
     // Mascot
     static let mascotSpeed = "mascotSpeed"
 
-    // Session grouping
-    static let sessionGroupingMode = "sessionGroupingMode"
-
     // Tool status display
     static let showToolStatus = "showToolStatus"              // true = detailed, false = simple
 
@@ -175,8 +172,6 @@ struct SettingsDefaults {
 
     static let mascotSpeed = 100  // percentage: 0–300, 0 = silent
 
-    static let sessionGroupingMode = "all"
-
     static let showToolStatus = true
 
     static let collapsedWidthScale = 100  // percentage
@@ -254,7 +249,6 @@ class SettingsManager {
             SettingsKey.rotationInterval: SettingsDefaults.rotationInterval,
             SettingsKey.maxToolHistory: SettingsDefaults.maxToolHistory,
             SettingsKey.mascotSpeed: SettingsDefaults.mascotSpeed,
-            SettingsKey.sessionGroupingMode: SettingsDefaults.sessionGroupingMode,
             SettingsKey.showToolStatus: SettingsDefaults.showToolStatus,
             SettingsKey.collapsedWidthScale: SettingsDefaults.collapsedWidthScale,
             SettingsKey.esp32BridgeEnabled: SettingsDefaults.esp32BridgeEnabled,
@@ -378,11 +372,6 @@ class SettingsManager {
     var rotationInterval: Int {
         get { defaults.integer(forKey: SettingsKey.rotationInterval) }
         set { defaults.set(newValue, forKey: SettingsKey.rotationInterval) }
-    }
-
-    var sessionGroupingMode: String {
-        get { defaults.string(forKey: SettingsKey.sessionGroupingMode) ?? SettingsDefaults.sessionGroupingMode }
-        set { defaults.set(newValue, forKey: SettingsKey.sessionGroupingMode) }
     }
 
     var defaultSource: String {
