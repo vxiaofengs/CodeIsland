@@ -30,9 +30,13 @@ final class MascotAnimationGate: ObservableObject {
     /// True while the display/system is awake.
     @Published private(set) var isAwake: Bool = true
 
+    /// True when the island is collapsed and every session is idle — i.e. the
+    /// mascot is asleep in a ~20pt strip and nothing is happening.
+    @Published private(set) var isIdleSettled: Bool = false
+
     /// Whether mascot per-frame animations should run right now.
     var animationsActive: Bool {
-        Self.shouldAnimate(isVisible: isPanelVisible, isAwake: isAwake)
+        Self.shouldAnimate(isVisible: isPanelVisible, isAwake: isAwake, isIdleSettled: isIdleSettled)
     }
 
     private var observers: [NSObjectProtocol] = []
@@ -42,8 +46,18 @@ final class MascotAnimationGate: ObservableObject {
     /// Pure decision used by `animationsActive` and unit tests. Animations only
     /// run while the panel is visible *and* the machine is awake — there is no
     /// point burning frames behind a hidden panel or during sleep.
-    static func shouldAnimate(isVisible: Bool, isAwake: Bool) -> Bool {
-        isVisible && isAwake
+    ///
+    /// The third condition is the expensive one. A live `TimelineView` does not
+    /// merely run its own schedule: it keeps SwiftUI's update machinery on a
+    /// display link, and every cycle re-runs the whole panel's layout pass. That
+    /// measured at ~7.6% CPU forever on an idle Mac, against ~2% with no live
+    /// timeline — and *slowing* the schedule barely helped (4 fps still cost
+    /// ~6.2%), because the cost is per display cycle, not per mascot frame.
+    /// So when the island is collapsed and nothing is running, the mascot holds
+    /// a static sleeping frame instead. Any state change — a session waking, the
+    /// panel expanding on hover — re-enables it immediately. (#299)
+    static func shouldAnimate(isVisible: Bool, isAwake: Bool, isIdleSettled: Bool = false) -> Bool {
+        isVisible && isAwake && !isIdleSettled
     }
 
     /// Begin observing system sleep/wake. Idempotent.
@@ -80,6 +94,14 @@ final class MascotAnimationGate: ObservableObject {
         // Coming back on-screen behaves like a wake for the render layer:
         // re-anchor so we don't replay frames accumulated while hidden.
         if visible { epoch &+= 1 }
+    }
+
+    /// Report whether the island is collapsed with nothing running. Coming back
+    /// out of that state re-anchors the schedules, exactly like a wake.
+    func setIdleSettled(_ settled: Bool) {
+        guard isIdleSettled != settled else { return }
+        isIdleSettled = settled
+        if !settled { epoch &+= 1 }
     }
 
     private func setAwake(_ awake: Bool) {

@@ -31,6 +31,7 @@ public struct SessionSnapshot: Sendable {
         "google-antigravity",
         "workbuddy",
         "hermes",
+        "grok",
         "openclaw",
         "qwen",
         "kimi",
@@ -84,9 +85,18 @@ public struct SessionSnapshot: Sendable {
     public var toolHistory: [ToolHistoryEntry] = []
     public var totalToolCallCount: Int = 0
     public var subagents: [String: SubagentState] = [:]
-    /// Agent ids closed by SubagentStop/Stop/SessionEnd.
-    /// Blocks merge/fold from putting a finished subagent back on the parent.
-    public var closedSubagentIds: Set<String> = []
+    /// Agent ids closed by SubagentStop/Stop/SessionEnd, in insertion order
+    /// (newest last). Blocks merge/fold from putting a finished subagent back
+    /// on the parent. Live growth is capped at ``maxClosedSubagentIds``;
+    /// restored lists may be larger (see ``restoreClosedSubagentIds``).
+    /// Mutate only via ``recordClosedSubagentId``, ``clearClosedSubagentId``,
+    /// or ``restoreClosedSubagentIds`` so the live cap cannot be bypassed.
+    public private(set) var closedSubagentIds: [String] = []
+    /// O(1) membership mirror of ``closedSubagentIds`` for hot-path tombstone checks.
+    private var closedSubagentIdSet: Set<String> = []
+    /// Bound for *live* ``closedSubagentIds`` growth in long-lived Cursor sessions.
+    /// Persist restore does not apply this cap (see ``restoreClosedSubagentIds``).
+    public static let maxClosedSubagentIds = 256
     public var startTime: Date = Date()
     public var lastUserPrompt: String?
     public var lastAssistantMessage: String?
@@ -118,6 +128,15 @@ public struct SessionSnapshot: Sendable {
     public var weztermPaneId: String?   // WezTerm / Kaku pane id (numeric string) from WEZTERM_PANE env var
     public var supersetWorkspaceId: String? // Superset workspace UUID (from SUPERSET_WORKSPACE_ID env var); presence means running inside Superset
     public var supersetPaneId: String?  // Superset pane/terminal id (from SUPERSET_PANE_ID / SUPERSET_TERMINAL_ID env var)
+    /// Orca terminal handle (ORCA_TERMINAL_HANDLE) — the argument `orca terminal
+    /// switch --terminal` takes, which is the only way to reach one specific
+    /// worktree tab among several open for the same repo (#302).
+    public var orcaTerminalHandle: String?
+    /// Orca worktree id (ORCA_WORKTREE_ID). Presence alone identifies an Orca
+    /// terminal even when Orca has stripped TERM_PROGRAM (it does that for
+    /// Claude Agent Teams sessions), which is what used to send click-to-jump
+    /// to a blank Terminal.app window.
+    public var orcaWorktreeId: String?
     public var cliPid: pid_t?            // CLI process PID (from bridge _ppid)
     public var cliStartTime: Date?       // Start time of the tracked CLI PID (guards PID reuse)
     public var source: String = "claude" // "claude" or "codex"
@@ -140,6 +159,62 @@ public struct SessionSnapshot: Sendable {
 
     public init(startTime: Date = Date()) {
         self.startTime = startTime
+    }
+
+    /// Record a closed subagent/Task id (no-op if already present). Evicts the
+    /// oldest entries when over ``maxClosedSubagentIds``.
+    ///
+    /// Callers must serialize access (today: `@MainActor` / main-queue session
+    /// mutation). The check-then-append is not atomic across threads the way
+    /// `Set.insert` was — do not call off the session-owning queue.
+    public mutating func recordClosedSubagentId(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !closedSubagentIdSet.contains(trimmed) else { return }
+        closedSubagentIds.append(trimmed)
+        closedSubagentIdSet.insert(trimmed)
+        let overflow = closedSubagentIds.count - Self.maxClosedSubagentIds
+        if overflow > 0 {
+            for evicted in closedSubagentIds.prefix(overflow) {
+                closedSubagentIdSet.remove(evicted)
+            }
+            closedSubagentIds.removeFirst(overflow)
+        }
+    }
+
+    /// Drop a tombstone so the agent/Task may be folded or shown again.
+    /// Trims like ``recordClosedSubagentId`` so whitespace-padded ids clear.
+    public mutating func clearClosedSubagentId(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard closedSubagentIdSet.remove(trimmed) != nil else { return }
+        closedSubagentIds.removeAll { $0 == trimmed }
+    }
+
+    /// O(1) tombstone check used on the subagent hook hot path.
+    /// Trims like ``recordClosedSubagentId`` / ``clearClosedSubagentId``.
+    public func hasClosedSubagentId(_ id: String) -> Bool {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return closedSubagentIdSet.contains(trimmed)
+    }
+
+    /// Restore persisted ids in file order **without** applying the live cap.
+    ///
+    /// Pre-cap builds wrote this array via `Set.sorted()` (lexicographic) — that
+    /// order is not recency, so keep-last-N on restore would drop arbitrary
+    /// tombstones and allow finished Tasks to re-fold. Disk size already bounds
+    /// memory; ``recordClosedSubagentId`` still caps *new* live growth.
+    public mutating func restoreClosedSubagentIds(_ ids: [String]) {
+        closedSubagentIds = []
+        closedSubagentIdSet = []
+        closedSubagentIds.reserveCapacity(ids.count)
+        closedSubagentIdSet.reserveCapacity(ids.count)
+        for id in ids {
+            let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !closedSubagentIdSet.contains(trimmed) else { continue }
+            closedSubagentIds.append(trimmed)
+            closedSubagentIdSet.insert(trimmed)
+        }
     }
 
     public static func normalizedSupportedSource(_ source: String?) -> String? {
@@ -171,6 +246,10 @@ public struct SessionSnapshot: Sendable {
             "hermes-agents": "hermes",
             "hermes agent": "hermes",
             "hermes agents": "hermes",
+            "grok-cli": "grok",
+            "grokcli": "grok",
+            "grok-build": "grok",
+            "grok build": "grok",
             // OpenClaw (openclaw.ai) — personal-assistant Gateway daemon,
             // formerly branded Clawdbot. Keep the old name as an alias so
             // events from a not-yet-renamed install land on the same source.
@@ -183,6 +262,13 @@ public struct SessionSnapshot: Sendable {
             "cursoragent": "cursor-cli",
             "cursorcli": "cursor-cli",
             "qodercli": "qoder-cli",
+            // Qoder 国行 (China build): a separate `qoderclicn` binary rooted at
+            // ~/.qoder-cn, but the same Claude-format hook contract as the
+            // international CLI — so it shares the qoder-cli source (#289).
+            "qoderclicn": "qoder-cli",
+            "qodercli-cn": "qoder-cli",
+            "qoder-cn": "qoder-cli",
+            "qodercn": "qoder-cli",
             // QoderWork — Qoder's standalone desktop assistant app (not the
             // IDE); own hooks file at ~/.qoderwork/settings.json (#249).
             "qoder-work": "qoderwork",
@@ -222,6 +308,7 @@ public struct SessionSnapshot: Sendable {
         if canonical.hasPrefix("antigravity") { return "antigravity" }
         if canonical.hasPrefix("workbuddy") { return "workbuddy" }
         if canonical.hasPrefix("hermes") { return "hermes" }
+        if canonical.hasPrefix("grok") { return "grok" }
         if canonical.hasPrefix("openclaw") { return "openclaw" }
         if canonical.hasPrefix("qwen") { return "qwen" }
         if canonical.hasPrefix("kiro") { return "kiro" }
@@ -303,10 +390,10 @@ public struct SessionSnapshot: Sendable {
     /// exact dot-dirs are peeled / treated as unhelpful — legitimate dot-named
     /// repos (.dotfiles, .config, .emacs.d) must keep their own name.
     static let agentMetadataDirNames: Set<String> = [
-        ".claude", ".cursor", ".codex", ".gemini", ".qoder", ".qoderwork",
+        ".claude", ".cursor", ".codex", ".gemini", ".qoder", ".qoder-cn", ".qoderwork",
         ".trae", ".trae-cn", ".kiro", ".copilot", ".factory", ".codebuddy",
         ".codybuddycn", ".stepfun", ".workbuddy", ".hermes", ".kimi", ".kimi-code",
-        ".pi", ".omp", ".qwen", ".zcode", ".openclaw", ".codeisland",
+        ".grok", ".pi", ".omp", ".qwen", ".zcode", ".openclaw", ".codeisland",
     ]
 
     /// Resolve a human project folder label from a cwd path.
@@ -532,6 +619,7 @@ public struct SessionSnapshot: Sendable {
         case "google-antigravity": return "Google Antigravity"
         case "workbuddy": return "WorkBuddy"
         case "hermes": return "Hermes"
+        case "grok": return "Grok CLI"
         case "openclaw": return "OpenClaw"
         case "qwen": return "Qwen Code"
         case "kimi": return "Kimi Code CLI"
@@ -562,7 +650,13 @@ public struct SessionSnapshot: Sendable {
     /// True when the session runs inside an IDE's integrated terminal.
     /// We can't query IDE tab/pane state, so notification suppression should be skipped.
     public var isIDETerminal: Bool {
-        guard let bid = termBundleId else { return false }
+        guard let bid = termBundleId else {
+            // Zed rebuilds the environment it gives its integrated terminal, so
+            // no __CFBundleIdentifier reaches the hook — TERM_PROGRAM is the only
+            // signal left, and without this the session reads as a plain terminal
+            // whose tab visibility we would wrongly claim to know (#307).
+            return termApp?.lowercased() == "zed"
+        }
         if isNativeAppMode { return false }
         // Known apps used as terminal (e.g., Claude CLI in Cursor's integrated terminal)
         if Self.appBundleNames[bid] != nil { return true }
@@ -615,6 +709,48 @@ public struct SessionSnapshot: Sendable {
         "com.anthropic.claudefordesktop": "claude",
     ]
 
+    /// Source id for the native app that owns `bundleId`, if any.
+    public static func sourceForAppBundleId(_ bundleId: String) -> String? {
+        appBundleSources[bundleId]
+    }
+
+    /// Source used for the session-card mascot.
+    ///
+    /// Prefers the hook/discovery source. When that is missing, fall back to the
+    /// native-app bundle map so a Cursor/Codex desktop session does not render
+    /// as the default Claude mascot while the right-hand badge still says Cursor.
+    public var mascotSource: String {
+        if let normalized = Self.normalizedSupportedSource(source) {
+            return normalized
+        }
+        if let bid = termBundleId, let inferred = Self.appBundleSources[bid] {
+            return inferred
+        }
+        return source
+    }
+
+    /// True when this is a CLI agent hosted inside another IDE/app terminal
+    /// (e.g. Claude Code inside Cursor) — mascot/badge should follow the CLI,
+    /// not the host IDE brand.
+    public var isCLIHostedInForeignApp: Bool {
+        guard isIDETerminal,
+              let src = Self.normalizedSupportedSource(source),
+              let bid = termBundleId,
+              let hostSource = Self.appBundleSources[bid] else {
+            return false
+        }
+        return src != hostSource
+    }
+
+    /// Right-hand session badge text: CLI brand when hosted in a foreign IDE,
+    /// otherwise the host terminal/app name.
+    public var terminalBadgeLabel: String? {
+        if isCLIHostedInForeignApp {
+            return sourceLabel
+        }
+        return terminalName
+    }
+
     /// Short terminal/app name for display tag
     public var terminalName: String? {
         if isRemote {
@@ -660,6 +796,9 @@ public struct SessionSnapshot: Sendable {
         // way to label it correctly is its own SUPERSET_* env vars. Check before the TERM_PROGRAM
         // fallback below, otherwise it would mislabel as "Kitty". (#213)
         if supersetWorkspaceId != nil || supersetPaneId != nil { return "Superset" }
+        // Orca strips TERM_PROGRAM for Claude Agent Teams sessions, so its own
+        // ORCA_* vars are the only label that survives every launch path (#302).
+        if orcaTerminalHandle != nil || orcaWorktreeId != nil { return "Orca" }
         // Fallback to TERM_PROGRAM
         guard let app = termApp else { return nil }
         let lower = app.lowercased()
@@ -840,7 +979,7 @@ public func reduceEvent(
         // Separate-mode Cursor Task Stop self-tombstones; a new prompt means relaunch.
         if let source = sessions[sessionId]?.source,
            source == "cursor" || source == "cursor-cli" {
-            sessions[sessionId]?.closedSubagentIds.remove(sessionId)
+            sessions[sessionId]?.clearClosedSubagentId(sessionId)
         }
         // Probe a wider set of field names + nested containers. Qwen Code (#103),
         // Hermes (#117), and most Claude forks put the prompt at "prompt" top-level,
@@ -942,6 +1081,25 @@ public func reduceEvent(
         } else {
             sessions[sessionId]?.status = .processing
         }
+    case "AgentTurnSettled":
+        // A model response just completed. Drop the tool chrome and record the
+        // reply, but do NOT enqueue a completion — a mid-turn response is
+        // followed within a second or two by the next pre_tool_call, which puts
+        // the card straight back to running. What settles the card is the idle
+        // sweep's daemon-source timeout, which only fires when nothing follows.
+        sessions[sessionId]?.currentTool = nil
+        sessions[sessionId]?.toolDescription = nil
+        if let msg = firstStringFromEvent(
+            event,
+            keys: ["assistant_response", "last_assistant_message", "text", "message"],
+            includeNested: true
+        ), !msg.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
+            sessions[sessionId]?.lastAssistantMessage = msg
+            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+        }
+        if !isWaiting {
+            sessions[sessionId]?.status = .processing
+        }
     case "TaskRoundComplete":
         sessions[sessionId]?.interrupted = (event.eventName == "TaskCancel")
         sessions[sessionId]?.status = .processing
@@ -989,7 +1147,7 @@ public func reduceEvent(
                childSessionId: sessionId,
                transcriptPath: sessions[sessionId]?.transcriptPath
            ) != nil {
-            sessions[sessionId]?.closedSubagentIds.insert(sessionId)
+            sessions[sessionId]?.recordClosedSubagentId(sessionId)
             // Drop process identity so a still-open IDE `_ppid` does not look like
             // a live Task after Stop when the card is later considered for merge.
             sessions[sessionId]?.cliPid = nil
@@ -1098,9 +1256,16 @@ public func reduceEvent(
         if let remoteHostName = event.rawJSON["_remote_host_name"] as? String, !remoteHostName.isEmpty {
             sessions[sessionId]?.remoteHostName = remoteHostName
         }
-        if let providerSessionId = event.rawJSON["session_id"] as? String, !providerSessionId.isEmpty,
-           sessions[sessionId]?.isRemote == true {
-            sessions[sessionId]?.providerSessionId = providerSessionId
+        if let providerSessionId = event.rawJSON["session_id"] as? String,
+           !providerSessionId.isEmpty,
+           sessions[sessionId]?.isRemote == true
+                || (sessions[sessionId]?.source == "codex"
+                    && sessions[sessionId]?.termBundleId == "com.openai.codex") {
+            let isCodexDesktop = sessions[sessionId]?.source == "codex"
+                && sessions[sessionId]?.termBundleId == "com.openai.codex"
+            sessions[sessionId]?.providerSessionId = isCodexDesktop
+                ? normalizedCodexDesktopProviderSessionId(providerSessionId)
+                : providerSessionId
         }
         if let sessionTitle = event.rawJSON["session_title"] as? String,
            !sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1124,6 +1289,22 @@ public func reduceEvent(
         }
         if QuestionPayload.from(event: event) != nil {
             sessions[sessionId]?.status = .waitingQuestion
+        } else {
+            // Notifications that describe what the agent is waiting for. A
+            // Notification cannot block (it is observe-only), so this is a
+            // display-only wait: the decision is made in the terminal, and the
+            // next PostToolUse/Stop clears it via the existing wasWaiting drain.
+            // Without this the card sat on "thinking" while the CLI was in fact
+            // blocked on the user (#290).
+            switch notificationKind(from: event) {
+            case "permission_prompt":
+                sessions[sessionId]?.status = .waitingApproval
+            case "idle_prompt":
+                // "Waiting for your input after 60s idle" — the turn is over.
+                sessions[sessionId]?.status = .idle
+            default:
+                break
+            }
         }
     case "PreCompact":
         sessions[sessionId]?.status = .processing
@@ -1213,6 +1394,14 @@ private func applyEnvMetadata(into sessions: inout [String: SessionSnapshot], se
        let pane = env["SUPERSET_PANE_ID"] ?? env["SUPERSET_TERMINAL_ID"], !pane.isEmpty {
         sessions[sessionId]?.supersetPaneId = pane
     }
+    if sessions[sessionId]?.orcaTerminalHandle == nil,
+       let handle = env["ORCA_TERMINAL_HANDLE"], !handle.isEmpty {
+        sessions[sessionId]?.orcaTerminalHandle = handle
+    }
+    if sessions[sessionId]?.orcaWorktreeId == nil,
+       let worktree = env["ORCA_WORKTREE_ID"], !worktree.isEmpty {
+        sessions[sessionId]?.orcaWorktreeId = worktree
+    }
 }
 
 /// Fill identity fields on a parent card from a merged Task/subagent hook.
@@ -1230,6 +1419,13 @@ public func fillMissingParentMetadataFromSubagentEvent(
         ?? SessionSnapshot.normalizedSupportedSource(event.rawJSON["source"] as? String),
        source != "claude" {
         sessions[sessionId]?.source = source
+    }
+    // Cursor Task hooks often omit `--source` and keep the default "claude".
+    // Rebrand when transcript_path is clearly under Cursor agent-transcripts.
+    if sessions[sessionId]?.source == "claude",
+       let path = event.rawJSON["transcript_path"] as? String,
+       CursorSessionFolding.isCursorAgentTranscriptPath(path) {
+        sessions[sessionId]?.source = "cursor"
     }
 
     let cwdMissing = sessions[sessionId]?.cwd == nil
@@ -1270,6 +1466,18 @@ private func shouldReopenCursorSubagentOnPrompt(event: HookEvent, session: Sessi
         ?? SessionSnapshot.normalizedSupportedSource(event.rawJSON["source"] as? String)
         ?? session?.source
     return source == "cursor" || source == "cursor-cli"
+}
+
+/// Whether folded-child prompt/response text should appear on the parent card.
+private func shouldSurfaceCursorSubagentChat(event: HookEvent, session: SessionSnapshot?) -> Bool {
+    if (event.rawJSON["_cursor_subagent"] as? Bool) == true {
+        return true
+    }
+    return CursorSubsessionRouter.isCursorFamilySource(
+        (event.rawJSON["_source"] as? String)
+            ?? (event.rawJSON["source"] as? String)
+            ?? session?.source
+    )
 }
 
 public func extractMetadata(into sessions: inout [String: SessionSnapshot], sessionId: String, event: HookEvent) {
@@ -1355,6 +1563,13 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     }
     if let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) {
         sessions[sessionId]?.source = source
+    } else if sessions[sessionId]?.source == "claude",
+              let path = (event.rawJSON["transcript_path"] as? String)
+                ?? (event.rawJSON["transcriptPath"] as? String),
+              CursorSessionFolding.isCursorAgentTranscriptPath(path) {
+        // Untagged Cursor Agent Task hooks inherit SessionSnapshot's default
+        // "claude" — rebrand so merge/hide and the badge follow Cursor.
+        sessions[sessionId]?.source = "cursor"
     }
     // cmux surface / workspace (injected by bridge from CMUX_SURFACE_ID / CMUX_WORKSPACE_ID env vars)
     if let surface = event.rawJSON["_cmux_surface_id"] as? String, !surface.isEmpty {
@@ -1382,21 +1597,43 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     if let supersetPane = event.rawJSON["_superset_pane_id"] as? String, !supersetPane.isEmpty {
         sessions[sessionId]?.supersetPaneId = supersetPane
     }
+    // Orca terminal handle / worktree (injected by bridge from ORCA_* env vars).
+    // Presence routes activation to com.stablyai.orca and drives a per-terminal
+    // `orca terminal switch`, which is what makes several worktrees of one repo
+    // distinguishable (#302).
+    if let orcaHandle = event.rawJSON["_orca_terminal_handle"] as? String, !orcaHandle.isEmpty {
+        sessions[sessionId]?.orcaTerminalHandle = orcaHandle
+    }
+    if let orcaWorktree = event.rawJSON["_orca_worktree_id"] as? String, !orcaWorktree.isEmpty {
+        sessions[sessionId]?.orcaWorktreeId = orcaWorktree
+    }
     if let remoteHostId = event.rawJSON["_remote_host_id"] as? String, !remoteHostId.isEmpty {
         sessions[sessionId]?.remoteHostId = remoteHostId
     }
     if let remoteHostName = event.rawJSON["_remote_host_name"] as? String, !remoteHostName.isEmpty {
         sessions[sessionId]?.remoteHostName = remoteHostName
     }
-    if sessions[sessionId]?.isRemote == true,
-       let providerSessionId = event.rawJSON["session_id"] as? String,
-       !providerSessionId.isEmpty {
-        sessions[sessionId]?.providerSessionId = providerSessionId
+    if let providerSessionId = event.rawJSON["session_id"] as? String,
+       !providerSessionId.isEmpty,
+       sessions[sessionId]?.isRemote == true
+            || (sessions[sessionId]?.source == "codex"
+                && sessions[sessionId]?.termBundleId == "com.openai.codex") {
+        let isCodexDesktop = sessions[sessionId]?.source == "codex"
+            && sessions[sessionId]?.termBundleId == "com.openai.codex"
+        sessions[sessionId]?.providerSessionId = isCodexDesktop
+            ? normalizedCodexDesktopProviderSessionId(providerSessionId)
+            : providerSessionId
     }
     if let sessionTitle = event.rawJSON["session_title"] as? String,
        !sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         sessions[sessionId]?.sessionTitle = sessionTitle
     }
+}
+
+private func normalizedCodexDesktopProviderSessionId(_ sessionId: String) -> String {
+    let prefix = "codexapp:"
+    guard sessionId.hasPrefix(prefix) else { return sessionId }
+    return String(sessionId.dropFirst(prefix.count))
 }
 
 /// Pull a non-empty string from a hook JSON value.
@@ -1442,12 +1679,27 @@ private func firstStringFromDict(_ dict: [String: Any], keys: [String]) -> Strin
     return nil
 }
 
+/// Lowercased `notification_type` for a Notification event, if it carries one.
+/// CodeBuddy documents `permission_prompt` / `idle_prompt` / `auth_success`;
+/// other CLIs either omit the field or use the same spellings. (#290)
+public func notificationKind(from event: HookEvent) -> String? {
+    guard let raw = firstStringFromEvent(
+        event,
+        keys: ["notification_type", "notificationType"],
+        includeNested: true
+    ) else { return nil }
+    let trimmed = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).lowercased()
+    return trimmed.isEmpty ? nil : trimmed
+}
+
 private func firstStringFromEvent(_ event: HookEvent, keys: [String], includeNested: Bool) -> String? {
     if let value = firstStringFromDict(event.rawJSON, keys: keys) {
         return value
     }
     if includeNested {
-        for containerKey in ["payload", "data"] {
+        // "extra" is Hermes's envelope for everything beyond the four common
+        // hook fields — assistant_response and friends live there (#303).
+        for containerKey in ["payload", "data", "extra"] {
             if let nested = event.rawJSON[containerKey] as? [String: Any],
                let value = firstStringFromDict(nested, keys: keys) {
                 return value
@@ -1470,7 +1722,7 @@ private func ensureSubagent(
     // Only SubagentStart/SessionStart may reopen a closed agent id for most
     // providers. Cursor Tasks relaunch via UserPromptSubmit (see handleSubagentEvent).
     // Later tool/response hooks with the same agent_id must not revive it.
-    if sessions[sessionId]?.closedSubagentIds.contains(agentId) == true {
+    if sessions[sessionId]?.hasClosedSubagentId(agentId) == true {
         return false
     }
     if sessions[sessionId]?.subagents[agentId] == nil {
@@ -1495,7 +1747,7 @@ private func handleSubagentEvent(
     switch eventName {
     case "SubagentStart", "SessionStart":
         let agentType = subagentType(from: event)
-        sessions[sessionId]?.closedSubagentIds.remove(agentId)
+        sessions[sessionId]?.clearClosedSubagentId(agentId)
         sessions[sessionId]?.subagents[agentId] = SubagentState(
             agentId: agentId,
             agentType: agentType
@@ -1513,13 +1765,28 @@ private func handleSubagentEvent(
     case "UserPromptSubmit":
         // Cursor has no SessionStart for Tasks; beforeSubmitPrompt is the relaunch signal.
         if shouldReopenCursorSubagentOnPrompt(event: event, session: sessions[sessionId]) {
-            sessions[sessionId]?.closedSubagentIds.remove(agentId)
+            sessions[sessionId]?.clearClosedSubagentId(agentId)
         }
         guard ensureSubagent(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event) else {
             return true
         }
         sessions[sessionId]?.subagents[agentId]?.status = .processing
         sessions[sessionId]?.subagents[agentId]?.lastActivity = Date()
+        // Cursor merge-into-main only: keep parent chat text live for folded Tasks
+        // (and for main-chat hooks incorrectly tagged with agent_id). Do not apply
+        // to Codex/plugin children — their prompts must not overwrite the parent card.
+        if shouldSurfaceCursorSubagentChat(event: event, session: sessions[sessionId]),
+           let prompt = firstStringFromEvent(
+               event,
+               keys: ["prompt", "user_prompt", "userPrompt"],
+               includeNested: true
+           ) {
+            sessions[sessionId]?.lastUserPrompt = prompt
+            if sessions[sessionId]?.recentMessages.last?.isUser == true {
+                sessions[sessionId]?.recentMessages.removeLast()
+            }
+            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: true, text: prompt))
+        }
         if sessions[sessionId]?.status != .waitingApproval && sessions[sessionId]?.status != .waitingQuestion {
             let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
             sessions[sessionId]?.status = .running
@@ -1532,7 +1799,7 @@ private func handleSubagentEvent(
 
     case "SubagentStop", "Stop", "SessionEnd":
         sessions[sessionId]?.subagents.removeValue(forKey: agentId)
-        sessions[sessionId]?.closedSubagentIds.insert(agentId)
+        sessions[sessionId]?.recordClosedSubagentId(agentId)
         // If no more subagents, revert parent to processing (waiting for main thread to continue)
         if sessions[sessionId]?.subagents.isEmpty == true {
             if sessions[sessionId]?.status == .running && sessions[sessionId]?.currentTool == "Agent" {
@@ -1592,9 +1859,20 @@ private func handleSubagentEvent(
 
     case "AfterAgentResponse":
         // Merged Cursor Task events arrive with parent session_id + child agent_id.
-        // Handle here so they do not overwrite the parent's reply or enqueue a false completion.
         guard ensureSubagent(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event) else {
             return true
+        }
+        // Cursor-only: surface the folded reply on the parent card, but never
+        // enqueue parent-turn completion from a Task response.
+        if shouldSurfaceCursorSubagentChat(event: event, session: sessions[sessionId]),
+           let text = firstStringFromEvent(
+               event,
+               keys: ["text", "message"],
+               includeNested: true
+           ),
+           !text.isEmpty {
+            sessions[sessionId]?.lastAssistantMessage = text
+            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: text))
         }
         sessions[sessionId]?.subagents[agentId]?.status = .processing
         sessions[sessionId]?.subagents[agentId]?.lastActivity = Date()

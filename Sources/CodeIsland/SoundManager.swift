@@ -19,6 +19,28 @@ class SoundManager {
 
     private var soundCache: [String: NSSound] = [:]
 
+    /// Where a *decided* event sound goes. Production plays it; a test installs
+    /// a recorder and asserts on the names it receives.
+    ///
+    /// Only the play step is swappable — everything above it (master toggle,
+    /// quiet hours, the per-event toggle, and the caller's own "is this the
+    /// start of a burst" decision) stays the code under test. That decision is
+    /// not the same question as "should a card open", and it has already drifted
+    /// once behind a shared `if` with nothing able to catch it. (#312)
+    ///
+    /// Deliberately not used by `preview` / `previewCustom`: those are direct UI
+    /// actions, and folding them in here would make a recorder pick up button
+    /// presses as if they were event sounds.
+    var playSink: ((String) -> Void)?
+
+    private func emit(_ soundName: String) {
+        if let playSink {
+            playSink(soundName)
+            return
+        }
+        play(soundName)
+    }
+
     private init() {
         // Pre-load all sounds into cache
         for entry in Self.eventSounds {
@@ -34,7 +56,7 @@ class SoundManager {
         guard !quietHoursActive else { return }
         guard let entry = Self.eventSounds.first(where: { $0.event == eventName }) else { return }
         guard defaults.bool(forKey: entry.key) else { return }
-        play(entry.sound)
+        emit(entry.sound)
     }
 
     /// Play boot sound on app launch
@@ -42,7 +64,7 @@ class SoundManager {
         guard defaults.bool(forKey: SettingsKey.soundEnabled) else { return }
         guard !quietHoursActive else { return }
         guard defaults.bool(forKey: SettingsKey.soundBoot) else { return }
-        play("8bit_boot")
+        emit("8bit_boot")
     }
 
     /// Quiet-hours window test. Half-open [start, end) in minutes since

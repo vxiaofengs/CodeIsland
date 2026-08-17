@@ -1,5 +1,55 @@
 # Changelog
 
+## [v1.0.32] - 2026-08-15
+
+### English
+- Idle CPU drops from ~10% to ~1% — a live TimelineView keeps SwiftUI re-running the whole panel layout every display cycle, so a collapsed island with nothing running now holds a static sleeping frame; also removes the 3s running-app enumeration and the 500ms observation poll (#299, thanks @cbingb666 for the stack sample that made this findable)
+- Answers now go to the card's own session instead of the head of the queue — with several sessions waiting, an answer could reach the wrong CLI (#308, thanks @halindrome)
+- A dismissed approval no longer silences every later permission request from every session (#309, thanks @halindrome)
+- Fix the approval / question card rendering blank after ~2s on some displays — a very tall transparent panel had its compositing dropped by the macOS 26 WindowServer (#304, thanks @LikeSundayLikeRain)
+- Add Grok CLI integration — native $GROK_HOME hooks, with imported Claude/Cursor hook copies suppressed so each event is delivered exactly once (#291, thanks @hyiiiii)
+- Add Windows support as a community-maintained port under windows/ — C#/WPF, near feature parity, no impact on the macOS build (#275, thanks @feelingsa)
+- Codex Desktop: restore discovery and lifecycle tracking, keeping app-server, rollout, hook and SQLite channels on one card (#280, thanks @hyiiiii)
+- Antigravity sessions no longer stick on "thinking" — its Stop hook was written in a shape Antigravity silently ignores; existing installs are repaired automatically (#297)
+- Add Qoder CN (国行 qoderclicn) — process detection, ~/.qoder-cn config root, transcripts, and a one-click installer entry (#289, thanks @someBrown)
+- CodeBuddy: the boot-time auth notification no longer mints a second, never-updating session card, and a permission prompt now shows as waiting instead of spinning (#288/#290, thanks @someBrown)
+- Hermes sessions settle to idle again — its one per-turn hook is now installed, backed by a timeout for daemon-backed agents (#303, thanks @al9000-max)
+- Remote SSH: Codex approval requests now reach the island — the remote installer never registered PermissionRequest (#306, thanks @Em-perseon)
+- Click-to-jump reaches Orca worktree terminals (per-terminal switch, so two worktrees of one repo are distinguishable) and Zed's integrated terminal (#302/#307, thanks @chelswcs and @Felictycf)
+- Terminal.app click-to-jump no longer aborts on a tab-less invisible window, which used to skip every later window (#294, thanks @kuznetsov-m)
+- OMP: the terminal's native Ask and the island now race — whichever you answer first wins and cancels the other (#264, thanks @haixing23)
+- pi: approving on the island marks the tool call so a co-installed permission-gate can skip its terminal prompt (#286, thanks @cat0825)
+- Cursor Tasks without a foldable transcript path now merge or hide via a narrow same-PID parent fallback; mascot and badge always agree on the brand (#296, thanks @zephyr110)
+- Menu-bar icon is now a monochrome template image, per macOS convention — it follows light/dark, menu-bar tint and the pressed state (#313, thanks @RooobinYe)
+- New setting: Auto-Expand on Approval (on by default). Turn it off and the island stays collapsed on approvals — the sound still plays and the card is one click away (#292, thanks @chris-tim)
+- New setting: Always-proceed Agents — permission requests from listed agents are approved without a card, for CLIs already running in their own Turbo/YOLO mode (#283, thanks @fajarnuha)
+- Qoder: omit the scalar `answer` key that its strict AskUserQuestion schema rejects (#300, thanks @ri-char)
+- Sound behaviour is now testable, and pinned: a burst of queued approvals chimes once (#312, thanks @halindrome)
+
+### 中文
+- 空闲 CPU 从约 10% 降到约 1%——只要屏幕上还有一个活着的 TimelineView，SwiftUI 就每个显示周期重跑整个面板布局；现在灵动岛收起且无任务时渲染静态睡眠帧，同时去掉 3 秒一次的运行程序枚举和 500 毫秒轮询（#299，感谢 @cbingb666 提供的堆栈采样）
+- 作答现在投递到卡片所属的会话，而不是队列头——多个会话同时等待时，答案可能发给错误的 CLI（#308，感谢 @halindrome）
+- 关掉一张审批卡不再让之后所有会话的权限请求集体静默（#309，感谢 @halindrome）
+- 修复部分屏幕上审批 / 提问卡片约 2 秒后变空白——过高的透明面板被 macOS 26 WindowServer 停止合成（#304，感谢 @LikeSundayLikeRain）
+- 新增 Grok CLI 集成——接入 $GROK_HOME 原生 hooks，并抑制 Grok 导入的 Claude/Cursor hook 副本，保证每个事件只投递一次（#291，感谢 @hyiiiii）
+- 新增 Windows 支持，作为社区维护的移植放在 windows/ 目录——C#/WPF，功能基本对齐，不影响 macOS 构建（#275，感谢 @feelingsa）
+- Codex Desktop：恢复会话发现与生命周期跟踪，app-server / rollout / hook / SQLite 四条通道归到同一张卡（#280，感谢 @hyiiiii）
+- Antigravity 会话不再卡在「思考中」——它的 Stop hook 之前写成了 Antigravity 会静默忽略的格式，已安装的配置会自动修复（#297）
+- 新增 Qoder 国行版（qoderclicn）支持——进程识别、~/.qoder-cn 配置根、transcript 读取，以及设置里一键安装（#289，感谢 @someBrown）
+- CodeBuddy：启动时的登录通知不再多出一张永不更新的会话卡；权限提示现在显示为「等待批准」而不是一直转圈（#288/#290，感谢 @someBrown）
+- Hermes 会话恢复回到空闲——装上它唯一的每轮 hook，并为守护进程型 agent 加了沉默超时兜底（#303，感谢 @al9000-max）
+- 远程 SSH：Codex 的审批请求终于能到岛上了——远程安装器此前从未注册 PermissionRequest（#306，感谢 @Em-perseon）
+- 点击跳转支持 Orca 的 worktree 终端（按终端精确切换，同一仓库的两个 worktree 可区分）与 Zed 内置终端（#302/#307，感谢 @chelswcs 和 @Felictycf）
+- Terminal.app 点击跳转不再因为一个无标签页的隐形窗口而中断，之前会导致其后所有窗口都被跳过（#294，感谢 @kuznetsov-m）
+- OMP：终端原生 Ask 与灵动岛现在并行竞速——先答的一端生效并取消另一端（#264，感谢 @haixing23）
+- pi：在岛上批准后会标记该工具调用，共存的 permission-gate 可据此跳过终端里的二次确认（#286，感谢 @cat0825）
+- Cursor Task 在没有可折叠 transcript 路径时，改用收紧的同 PID 父卡兜底来合并 / 隐藏；吉祥物与角标的品牌始终一致（#296，感谢 @zephyr110）
+- 菜单栏图标改为黑白模板图，遵循 macOS 惯例——跟随浅色 / 深色、菜单栏着色与按下状态（#313，感谢 @RooobinYe）
+- 新增设置项「权限请求时自动展开」（默认开启）。关闭后收到审批时灵动岛保持收起——提示音照常，卡片点一下就能打开（#292，感谢 @chris-tim）
+- 新增设置项「免确认的 Agent」——名单内 agent 的权限请求直接放行、不弹卡片，适合本身已开 Turbo/YOLO 模式的 CLI（#283，感谢 @fajarnuha）
+- Qoder：去掉其严格 AskUserQuestion schema 会拒绝的标量 `answer` 字段（#300，感谢 @ri-char）
+- 提示音行为现在可测试并已加断言：一串排队的审批只响一次（#312，感谢 @halindrome）
+
 ## [v1.0.31] - 2026-07-23
 
 ### English

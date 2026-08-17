@@ -100,10 +100,14 @@ final class GoogleAntigravitySupportTests: XCTestCase {
         let wrapper = try XCTUnwrap(root["codeisland"] as? [String: Any])
         XCTAssertNil(root["hooks"], "Antigravity must NOT use the bare hooks root key")
 
-        // Each event nests {matcher?, hooks:[{type,command,timeout}]}.
-        for event in ["PreToolUse", "PostToolUse", "Stop"] {
+        // Tool events nest {matcher, hooks:[{type,command,timeout}]}; model events
+        // (Stop / Pre|PostInvocation) are a DIRECT handler list. Antigravity
+        // silently ignores a model event wrapped in `hooks`, which is how every
+        // session ended up stuck on "thinking" — Stop never fired (#297).
+        for event in ["PreToolUse", "PostToolUse"] {
             let entries = try XCTUnwrap(wrapper[event] as? [[String: Any]], "missing event \(event)")
             let entry = try XCTUnwrap(entries.first)
+            XCTAssertEqual(entry["matcher"] as? String, "*")
             let hookList = try XCTUnwrap(entry["hooks"] as? [[String: Any]])
             let hook = try XCTUnwrap(hookList.first)
             XCTAssertEqual(hook["type"] as? String, "command")
@@ -114,13 +118,40 @@ final class GoogleAntigravitySupportTests: XCTestCase {
             XCTAssertTrue(command.contains("--event \(event)"))
         }
 
-        // matcher "*" only on the two tool events; omitted for Stop.
-        let preEntry = try XCTUnwrap((wrapper["PreToolUse"] as? [[String: Any]])?.first)
-        XCTAssertEqual(preEntry["matcher"] as? String, "*")
-        let postEntry = try XCTUnwrap((wrapper["PostToolUse"] as? [[String: Any]])?.first)
-        XCTAssertEqual(postEntry["matcher"] as? String, "*")
-        let stopEntry = try XCTUnwrap((wrapper["Stop"] as? [[String: Any]])?.first)
+        let stopEntries = try XCTUnwrap(wrapper["Stop"] as? [[String: Any]], "missing event Stop")
+        let stopEntry = try XCTUnwrap(stopEntries.first)
+        XCTAssertNil(stopEntry["hooks"], "Stop takes a direct handler, not a hooks array")
         XCTAssertNil(stopEntry["matcher"], "Stop ignores matcher; we must not emit one")
+        XCTAssertEqual(stopEntry["type"] as? String, "command")
+        XCTAssertNotNil(stopEntry["timeout"])
+        let stopCommand = try XCTUnwrap(stopEntry["command"] as? String)
+        XCTAssertTrue(stopCommand.contains("codeisland-bridge --source google-antigravity"))
+        XCTAssertTrue(stopCommand.contains("--event Stop"))
+    }
+
+    /// A config written before #297 (Stop wrapped in a `hooks` array) must read
+    /// as "needs repair" so verifyAndRepair rewrites it — `containsOurHook`
+    /// accepts both shapes, so without the shape check it looked healthy forever.
+    func testLegacyNestedStopEntryIsReportedAsNeedingRepair() throws {
+        let legacy: [String: Any] = [
+            "Stop": [[
+                "hooks": [[
+                    "type": "command",
+                    "command": "\(NSHomeDirectory())/.codeisland/codeisland-bridge --source google-antigravity --event Stop",
+                    "timeout": 5,
+                ]],
+            ]],
+        ]
+        XCTAssertTrue(ConfigInstaller.hasNestedAntigravityModelEvent(legacy))
+
+        let fixed: [String: Any] = [
+            "Stop": [[
+                "type": "command",
+                "command": "\(NSHomeDirectory())/.codeisland/codeisland-bridge --source google-antigravity --event Stop",
+                "timeout": 5,
+            ]],
+        ]
+        XCTAssertFalse(ConfigInstaller.hasNestedAntigravityModelEvent(fixed))
     }
 
     func testGoogleAntigravityPreToolUseRoutesToPermission() async throws {

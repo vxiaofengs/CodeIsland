@@ -381,6 +381,7 @@ private struct BehaviorPage: View {
     @AppStorage(SettingsKey.smartSuppress) private var smartSuppress = SettingsDefaults.smartSuppress
     @AppStorage(SettingsKey.collapseOnMouseLeave) private var collapseOnMouseLeave = SettingsDefaults.collapseOnMouseLeave
     @AppStorage(SettingsKey.autoCollapseAfterSessionJump) private var autoCollapseAfterSessionJump = SettingsDefaults.autoCollapseAfterSessionJump
+    @AppStorage(SettingsKey.autoExpandOnPermission) private var autoExpandOnPermission = SettingsDefaults.autoExpandOnPermission
     // Seeded through the migration shim so a legacy autoExpandOnCompletion=false
     // shows up as "off" here; writes go to the new key via onChange.
     @State private var completionStyle: String = AppState.completionStyle().rawValue
@@ -391,6 +392,7 @@ private struct BehaviorPage: View {
     @AppStorage(SettingsKey.rotationInterval) private var rotationInterval = SettingsDefaults.rotationInterval
     @AppStorage(SettingsKey.maxToolHistory) private var maxToolHistory = SettingsDefaults.maxToolHistory
     @AppStorage(SettingsKey.autoApproveTools) private var autoApproveRaw: String = SettingsDefaults.autoApproveTools
+    @AppStorage(SettingsKey.autoApproveSources) private var autoApproveSources: String = SettingsDefaults.autoApproveSources
     @AppStorage(SettingsKey.excludedHookCwdSubstrings) private var excludedHookCwdSubstrings: String = SettingsDefaults.excludedHookCwdSubstrings
     @AppStorage(SettingsKey.claudeConfigDir) private var claudeConfigDir: String = SettingsDefaults.claudeConfigDir
     @AppStorage(SettingsKey.webhookEnabled) private var webhookEnabled: Bool = SettingsDefaults.webhookEnabled
@@ -438,6 +440,12 @@ private struct BehaviorPage: View {
                     title: l10n["smart_suppress"],
                     desc: l10n["smart_suppress_desc"],
                     isOn: $smartSuppress,
+                    animation: .smartSuppress
+                )
+                BehaviorToggleRow(
+                    title: l10n["auto_expand_on_permission"],
+                    desc: l10n["auto_expand_on_permission_desc"],
+                    isOn: $autoExpandOnPermission,
                     animation: .smartSuppress
                 )
                 BehaviorToggleRow(
@@ -498,6 +506,20 @@ private struct BehaviorPage: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                }
+                Divider()
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(l10n["auto_approve_sources"])
+                        .font(.system(size: 12, weight: .medium))
+                    Text(l10n["auto_approve_sources_desc"])
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField(
+                        l10n["auto_approve_sources_placeholder"],
+                        text: $autoApproveSources
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
                 }
             }
 
@@ -1061,6 +1083,7 @@ private struct MascotsPage: View {
     private let mascotList: [(name: String, source: String, desc: String, color: Color)] = [
         ("Clawd", "claude", "Claude Code", Color(red: 0.871, green: 0.533, blue: 0.427)),
         ("Dex", "codex", "Codex (OpenAI)", Color(red: 0.92, green: 0.92, blue: 0.93)),
+        ("Grok", "grok", "Grok CLI", Color.white),
         ("Gemini", "gemini", "Gemini CLI", Color(red: 0.278, green: 0.588, blue: 0.894)),
         ("CursorBot", "cursor", "Cursor", Color(red: 0.96, green: 0.31, blue: 0.0)),
         ("TraeBot", "trae", "Trae", Color(red: 0.96, green: 0.31, blue: 0.0)),

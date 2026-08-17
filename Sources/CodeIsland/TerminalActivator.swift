@@ -39,6 +39,13 @@ struct TerminalActivator {
     /// Most sources should use nativeAppBundles instead (by bundle ID).
     private static let appSources: [String: String] = [:]
 
+    /// IDEs whose integrated terminal is only identifiable by `TERM_PROGRAM`,
+    /// because they hand the terminal a rebuilt environment that carries no
+    /// `__CFBundleIdentifier`. Keys are lowercased TERM_PROGRAM values. (#307)
+    static let termProgramToIDEBundleId: [String: String] = [
+        "zed": "dev.zed.Zed",
+    ]
+
     /// Reverse map: source → native app bundle ID. Used as a fallback when
     /// termBundleId is missing but the source's desktop app is running.
     static let sourceToNativeAppBundleId: [String: String] = [
@@ -171,6 +178,22 @@ struct TerminalActivator {
             return
         }
 
+        // --- Orca (Electron ADE: one git worktree + terminal per task) ---
+        // Must come before the generic branches: Orca sets TERM_PROGRAM="Orca" on
+        // most launch paths but DELETES it for Claude Agent Teams sessions, and its
+        // PTY env carries no __CFBundleIdentifier — so those sessions used to fall
+        // through to `bringToFront("Terminal")` and pop a blank Terminal.app window.
+        // Its own ORCA_* vars survive every path, and ORCA_TERMINAL_HANDLE is what
+        // `orca terminal switch` takes, which is the only way to reach one specific
+        // worktree tab when several worktrees of the same repo are open (#302).
+        if session.orcaTerminalHandle != nil
+            || session.orcaWorktreeId != nil
+            || session.termBundleId == orcaBundleId
+            || lower == "orca" {
+            activateOrca(terminalHandle: session.orcaTerminalHandle)
+            return
+        }
+
         // --- Zellij multiplexer: precise pane → tab focus, then activate parent terminal ---
         // Must come before tmux/cmux/iTerm/Ghostty branches AND the Terax branch below:
         // Zellij runs *inside* one of those terminals, so termApp/termBundleId points to
@@ -277,6 +300,19 @@ struct TerminalActivator {
         // --- Warp (SQLite pane precision jump + Cmd+N tab switch) ---
         if lower.contains("warp") {
             activateWarp(cwd: session.cwd)
+            return
+        }
+
+        // --- IDEs identified only by TERM_PROGRAM ---
+        // Zed replaces the environment it hands its integrated terminal, so
+        // __CFBundleIdentifier never reaches the hook and `isIDETerminal` (which
+        // keys off the bundle id) is false. TERM_PROGRAM=zed is all that survives,
+        // and `bringToFront("zed")` below looks for an app literally named "zed"
+        // and silently does nothing — which is what clicking such a session did.
+        // Resolve the bundle id from TERM_PROGRAM and match the workspace window
+        // by project folder, same as any other IDE terminal. (#307)
+        if let ideBundleId = termProgramToIDEBundleId[lower] {
+            activateIDEWindow(bundleId: ideBundleId, cwd: session.cwd)
             return
         }
 
@@ -703,19 +739,25 @@ struct TerminalActivator {
             set found to false
 
             -- Strategy 1: precise tty match
+            -- `tabs of w` is wrapped in its own try: Terminal.app can keep a window
+            -- with no tabs at all (invisible utility window: name "", visible false).
+            -- Asking it for tabs raises -10000, which would abort the whole tell block
+            -- and skip every later window plus the final `activate`.
             if targetTty is not "" then
                 repeat with w in windows
-                    repeat with t in tabs of w
-                        try
-                            if tty of t is targetTty then
-                                if miniaturized of w then set miniaturized of w to false
-                                set selected tab of w to t
-                                set index of w to 1
-                                set found to true
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
+                    try
+                        repeat with t in tabs of w
+                            try
+                                if tty of t is targetTty then
+                                    if miniaturized of w then set miniaturized of w to false
+                                    set selected tab of w to t
+                                    set index of w to 1
+                                    set found to true
+                                    exit repeat
+                                end if
+                            end try
+                        end repeat
+                    end try
                     if found then exit repeat
                 end repeat
             end if
@@ -723,17 +765,19 @@ struct TerminalActivator {
             -- Strategy 2: auto tab title contains the cwd folder name
             if not found and targetDir is not "" then
                 repeat with w in windows
-                    repeat with t in tabs of w
-                        try
-                            if (name of t as text) contains targetDir then
-                                if miniaturized of w then set miniaturized of w to false
-                                set selected tab of w to t
-                                set index of w to 1
-                                set found to true
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
+                    try
+                        repeat with t in tabs of w
+                            try
+                                if (name of t as text) contains targetDir then
+                                    if miniaturized of w then set miniaturized of w to false
+                                    set selected tab of w to t
+                                    set index of w to 1
+                                    set found to true
+                                    exit repeat
+                                end if
+                            end try
+                        end repeat
+                    end try
                     if found then exit repeat
                 end repeat
             end if
@@ -741,17 +785,19 @@ struct TerminalActivator {
             -- Strategy 3: user-set custom title
             if not found and targetDir is not "" then
                 repeat with w in windows
-                    repeat with t in tabs of w
-                        try
-                            if custom title of t contains targetDir then
-                                if miniaturized of w then set miniaturized of w to false
-                                set selected tab of w to t
-                                set index of w to 1
-                                set found to true
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
+                    try
+                        repeat with t in tabs of w
+                            try
+                                if custom title of t contains targetDir then
+                                    if miniaturized of w then set miniaturized of w to false
+                                    set selected tab of w to t
+                                    set index of w to 1
+                                    set found to true
+                                    exit repeat
+                                end if
+                            end try
+                        end repeat
+                    end try
                     if found then exit repeat
                 end repeat
             end if
@@ -908,6 +954,31 @@ struct TerminalActivator {
             if runProcess(bin, args: ["@", "focus-tab", "--match", "cwd:\(cwd)"]) == nil {
                 _ = runProcess(bin, args: ["@", "focus-tab", "--match", "title:\(source)"])
             }
+        }
+    }
+
+    // MARK: - Orca (CLI: orca terminal switch)
+
+    static let orcaBundleId = "com.stablyai.orca"
+
+    /// Raise Orca and, when we know which terminal the session runs in, switch the
+    /// UI to that tab. Window-title matching cannot do this job: two worktrees of
+    /// one repo share the repo name, which is exactly the case that was broken.
+    private static func activateOrca(terminalHandle: String?) {
+        if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == orcaBundleId }) {
+            activateByBundleId(orcaBundleId)
+        } else {
+            bringToFront("Orca")
+        }
+
+        // The CLI ships inside the app bundle as well as on PATH, so check both.
+        guard let handle = terminalHandle, !handle.isEmpty,
+              let bin = findBinary("orca", extraPaths: [
+                  "/Applications/Orca.app/Contents/Resources/bin/orca",
+                  NSHomeDirectory() + "/Applications/Orca.app/Contents/Resources/bin/orca",
+              ]) else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = runProcess(bin, args: ["terminal", "switch", "--terminal", handle, "--json"])
         }
     }
 

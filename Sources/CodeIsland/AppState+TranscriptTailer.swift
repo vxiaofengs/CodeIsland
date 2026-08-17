@@ -22,7 +22,13 @@ extension AppState {
         attachedTranscriptPaths[sessionId] = path
 
         // Backfill messages from the transcript file so recentMessages is populated
-        let (_, messages) = Self.readRecentFromTranscript(path: path)
+        let messages: [ChatMessage]
+        if let source = sessions[sessionId]?.source,
+           source == "cursor" || source == "cursor-cli" {
+            messages = Self.readRecentFromCursorTranscript(path: path).1
+        } else {
+            messages = Self.readRecentFromTranscript(path: path).1
+        }
         if !messages.isEmpty, var session = sessions[sessionId] {
             session.recentMessages = messages
             if let lastUser = messages.last(where: { $0.isUser }) {
@@ -82,7 +88,10 @@ extension AppState {
             }
         }
 
-        transcriptTailer.attach(sessionId: sessionId, filePath: path)
+        attachedTranscriptTokens[sessionId] = transcriptTailer.attach(
+            sessionId: sessionId,
+            filePath: path
+        )
     }
 
     /// Backfill freshness bound for flipping a session into the display-only
@@ -160,42 +169,22 @@ extension AppState {
         }
     }
 
-    private nonisolated static func latestCodexTurnStatus(path: String) -> ConversationTurnStatus? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { handle.closeFile() }
-
-        // A long Codex turn can place its task_started event well before the
-        // final 128 KB after emitting large reasoning/tool rows. Scan in chunks
-        // so startup state recovery remains bounded in memory without missing
-        // that event.
-        handle.seek(toFileOffset: 0)
-        let chunkSize = 64 * 1024
-        var pendingFragment = Data()
-        var latestStatus: ConversationTurnStatus?
-
-        while true {
-            let chunk = handle.readData(ofLength: chunkSize)
-            if chunk.isEmpty { break }
-
-            let result = JSONLTailer.scanLines(pendingFragment + chunk)
-            pendingFragment = result.trailingFragment
-            if let turnStatus = result.delta.turnStatus {
-                latestStatus = turnStatus
-            }
-        }
-
-        return latestStatus
-    }
-
     /// Stop watching a session's transcript. Called when the session is removed or
     /// when a new transcript path supersedes an older one.
     func detachTranscriptTailer(sessionId: String) {
         attachedTranscriptPaths.removeValue(forKey: sessionId)
+        attachedTranscriptTokens.removeValue(forKey: sessionId)
         transcriptTailer.detach(sessionId: sessionId)
     }
 
     /// Apply an incremental update produced by the tailer. Runs on the main actor.
     func applyTranscriptDelta(_ delta: ConversationTailDelta) {
+        if let attachmentToken = delta.attachmentToken {
+            guard attachedTranscriptTokens[delta.sessionId] == attachmentToken,
+                  attachedTranscriptPaths[delta.sessionId] == delta.filePath else {
+                return
+            }
+        }
         guard var session = sessions[delta.sessionId] else { return }
         var mutated = false
 
@@ -224,11 +213,19 @@ extension AppState {
         // One scanned chunk can hold the tail of a turn plus the head of the
         // next, so replay both in transcript order. Appending the prompt first
         // unconditionally parked the next question above the previous answer.
+        // Text is compared normalized (Cursor wraps its chat copy), so a
+        // cosmetic difference does not read as a new message.
+        func normalized(_ text: String) -> String {
+            JSONLTailer.normalizedCursorChatText(from: text) ?? text
+        }
+
         var incoming: [(isUser: Bool, text: String)] = []
-        if let prompt = delta.lastUserPrompt, session.lastUserPrompt != prompt {
+        if let prompt = delta.lastUserPrompt.map(normalized),
+           session.lastUserPrompt.map(normalized) != prompt {
             incoming.append((true, prompt))
         }
-        if let reply = delta.lastAssistantMessage, session.lastAssistantMessage != reply {
+        if let reply = delta.lastAssistantMessage.map(normalized),
+           session.lastAssistantMessage.map(normalized) != reply {
             incoming.append((false, reply))
         }
         if incoming.count == 2, delta.promptIsNewer {
@@ -237,12 +234,14 @@ extension AppState {
         for message in incoming {
             if message.isUser {
                 session.lastUserPrompt = message.text
-                if session.recentMessages.last(where: { $0.isUser })?.text != message.text {
+                let lastSameRole = session.recentMessages.last(where: { $0.isUser })?.text
+                if lastSameRole.map(normalized) != message.text {
                     session.addRecentMessage(ChatMessage(isUser: true, text: message.text))
                 }
             } else {
                 session.lastAssistantMessage = message.text
-                if session.recentMessages.last(where: { !$0.isUser })?.text != message.text {
+                let lastSameRole = session.recentMessages.last(where: { !$0.isUser })?.text
+                if lastSameRole.map(normalized) != message.text {
                     session.addRecentMessage(ChatMessage(isUser: false, text: message.text))
                 }
             }

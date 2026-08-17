@@ -22,15 +22,33 @@ public enum CLIProcessResolver {
                 || lowercasedPath.contains("/qwen-code ")
         case "gemini":
             return lowercasedPath.hasSuffix("/gemini") || lowercasedPath.contains("/gemini ")
+        case "grok":
+            // Managed Grok installs execute the versioned binary directly from
+            // $GROK_HOME/downloads (e.g. grok-0.2.106-macos-aarch64), while
+            // package-manager installs may expose a plain `.../bin/grok`.
+            let basename = (lowercasedPath as NSString).lastPathComponent
+            return basename == "grok"
+                || (basename.hasPrefix("grok-")
+                    && (lowercasedPath.contains("/.grok/downloads/")
+                        || lowercasedPath.contains("/grok/downloads/")))
         case "cursor-cli":
             // Cursor's CLI agent installs to ~/.local/share/cursor-agent/versions/<v>/cursor-agent
             // and is also referenced by /cursor-agent/index.js when invoked via Node.
             return lowercasedPath.contains("/cursor-agent")
         case "qoder-cli":
-            // npm @qoder-ai/qodercli installs as `qodercli` in PATH (Homebrew/npm-global)
+            // npm @qoder-ai/qodercli installs as `qodercli` in PATH (Homebrew/npm-global).
+            // The China build ships as a SEPARATE binary named `qoderclicn`, rooted at
+            // ~/.qoder-cn instead of ~/.qoder, and its managed install execs a versioned
+            // file (`qoderclicn-1.1.5`) rather than a bare name — so match the prefix,
+            // not just the exact basename (#289).
+            let basename = (lowercasedPath as NSString).lastPathComponent
             return lowercasedPath.hasSuffix("/qodercli")
                 || lowercasedPath.contains("/qodercli ")
                 || lowercasedPath.contains("/@qoder-ai/qodercli")
+                || basename == "qoderclicn"
+                || basename.hasPrefix("qoderclicn-")
+                || lowercasedPath.contains("/qoderclicn/")
+                || lowercasedPath.contains("/.qoder-cn/")
         case "google-antigravity":
             return lowercasedPath.hasSuffix("/agy")
                 || lowercasedPath.contains("/agy ")
@@ -165,6 +183,15 @@ public struct HookEvent {
            let remoteHostId = json["_remote_host_id"] as? String,
            !remoteHostId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             self.sessionId = "remote:\(remoteHostId):\(rawSessionId)"
+        } else if let rawSessionId,
+                  (json["_source"] as? String)?.lowercased() == "codex",
+                  json["_term_bundle"] as? String == "com.openai.codex" {
+            // Codex Desktop hooks, app-server notifications, rollout discovery,
+            // and state-DB polling must all address one card. Keep the provider's
+            // raw id in rawJSON for title lookup and persisted providerSessionId.
+            self.sessionId = rawSessionId.hasPrefix("codexapp:")
+                ? rawSessionId
+                : "codexapp:\(rawSessionId)"
         } else {
             self.sessionId = rawSessionId
         }
@@ -175,7 +202,11 @@ public struct HookEvent {
         // kernel emits {toolCallId, toolName, toolInput} on every tool event).
         // Parsing it keeps zcode permission requests correlated by id so they
         // are never mistaken for orphans and auto-resolved on session activity.
-        self.toolUseId = HookEvent.firstString(in: json, keys: ["tool_use_id", "toolUseId", "toolCallId"])
+        // `_pi_tool_call_id` is the pi/OMP extension's spelling of the same id.
+        self.toolUseId = HookEvent.firstString(
+            in: json,
+            keys: ["tool_use_id", "toolUseId", "toolCallId", "_pi_tool_call_id"]
+        )
             ?? HookEvent.firstString(inNestedDictionary: json, containerKeys: ["tool", "tool_use", "toolUse", "payload", "data"], keys: ["id", "tool_use_id", "toolUseId"])
         self.toolInput = HookEvent.firstDictionary(in: json, keys: ["tool_input", "toolInput", "input", "arguments", "args", "params"])
             ?? HookEvent.firstDictionary(inNestedDictionary: json, containerKeys: ["tool", "payload", "data"], keys: ["input", "tool_input", "toolInput", "arguments", "args", "params"])

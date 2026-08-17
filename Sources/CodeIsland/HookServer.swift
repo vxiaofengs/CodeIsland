@@ -122,6 +122,26 @@ class HookServer {
         SettingsManager.shared.autoApproveTools
     }
 
+    /// Whether this event's agent is on the user's always-proceed list (#283).
+    /// Matched on both the raw `_source` and its normalized form so "agy",
+    /// "google-antigravity" and "antigravity-cli" all resolve to one entry.
+    static func isAutoApprovedSource(_ event: HookEvent) -> Bool {
+        isAutoApprovedSource(event, approved: SettingsManager.shared.autoApproveSources)
+    }
+
+    nonisolated static func isAutoApprovedSource(
+        _ event: HookEvent,
+        approved: Set<String>
+    ) -> Bool {
+        guard !approved.isEmpty,
+              let raw = event.rawJSON["_source"] as? String else { return false }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return false }
+        if approved.contains(trimmed) { return true }
+        guard let normalized = SessionSnapshot.normalizedSupportedSource(trimmed) else { return false }
+        return approved.contains(normalized)
+    }
+
     /// User-configured cwd substring blocklist for plugin/background hooks (e.g. claude-mem).
     /// Empty default = no filtering. Trimmed, blank entries skipped.
     private static func eventMatchesExcludedCwd(_ cwd: String) -> Bool {
@@ -262,20 +282,17 @@ class HookServer {
     }
 
     private static func pluginPpid(from raw: [String: Any]) -> Int? {
-        if let p = raw["_ppid"] as? Int { return p }
-        if let p = raw["_ppid"] as? Int32 { return Int(p) }
-        if let p = raw["_ppid"] as? NSNumber { return p.intValue }
-        return nil
+        CursorSubsessionRouter.positivePpid(from: raw)
     }
 
     private static func nonEmptyString(_ value: Any?) -> String? {
         guard let string = value as? String else { return nil }
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : string
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func rawSessionId(from raw: [String: Any]) -> String? {
-        nonEmptyString(raw["session_id"]) ?? nonEmptyString(raw["sessionId"])
+        CursorSubsessionRouter.sessionId(from: raw)
     }
 
     private static func rawEventName(from raw: [String: Any]) -> String? {
@@ -313,14 +330,57 @@ class HookServer {
     private static let sourceMarkerBytes = Data(#""_source""#.utf8)
     private static let codexMarkerBytes = Data("codex".utf8)
     private static let cursorTranscriptMarkerBytes = Data("agent-transcripts".utf8)
-    private static let cursorSourceMarkerBytes = Data("cursor".utf8)
+    private static let cursorSourceExactBytes = Data(#""_source":"cursor""#.utf8)
+    private static let cursorCliSourceExactBytes = Data(#""_source":"cursor-cli""#.utf8)
+    private static let ppidKeyBytes = Data(#""_ppid""#.utf8)
+    /// JSON `\uXXXX` escape — only then do we fall back to a full parse.
+    private static let jsonUnicodeEscapeBytes = Data(#"\u"#.utf8)
+    private static let cursorSourceFlexibleRegex: NSRegularExpression = {
+        try! NSRegularExpression(
+            pattern: #""_source"\s*:\s*"(cursor-cli|cursor)""#,
+            options: []
+        )
+    }()
+
+    /// Whether Cursor Task routing may need a JSON parse (transcript fold path).
+    ///
+    /// Requires `agent-transcripts` plus either a Cursor `_source` or a path under
+    /// `/.cursor/` (misbranded Claude-default Task hooks still fold).
+    internal static func mayNeedCursorSubsessionRouting(data: Data) -> Bool {
+        guard data.range(of: cursorTranscriptMarkerBytes) != nil else { return false }
+        if mayBeCursorHookSource(data: data) { return true }
+        return data.range(of: Data("/.cursor/".utf8)) != nil
+    }
+
+    /// `_source` is `cursor` / `cursor-cli` (compact, spaced, or `\u`-escaped).
+    /// Used for merge/hide `_ppid` fallback when `agent-transcripts` is absent.
+    internal static func mayBeCursorHookSource(data: Data) -> Bool {
+        // Compact forms first — bridge JSONSerialization emits no spaces after `:`.
+        if data.range(of: cursorCliSourceExactBytes) != nil
+            || data.range(of: cursorSourceExactBytes) != nil {
+            return true
+        }
+        guard data.range(of: sourceMarkerBytes) != nil else { return false }
+        if let text = String(data: data, encoding: .utf8) {
+            let range = NSRange(text.startIndex..., in: text)
+            if cursorSourceFlexibleRegex.firstMatch(in: text, options: [], range: range) != nil {
+                return true
+            }
+        }
+        guard data.range(of: jsonUnicodeEscapeBytes) != nil,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let source = obj["_source"] as? String else {
+            return false
+        }
+        return CursorSubsessionRouter.isCursorFamilySource(source)
+    }
 
     private static func codexSubagentMetadata(from raw: [String: Any]) -> CodexSubagentMetadata? {
         guard let path = nonEmptyString(raw["transcript_path"]) else { return nil }
         return AppState.codexSubagentMetadata(inTranscriptPath: path)
     }
 
-    private func codexNativeSubsessionParentId(from raw: [String: Any]) -> String? {
+    func codexNativeSubsessionParentId(from raw: [String: Any]) -> String? {
         guard (raw["_via_plugin"] as? Bool) != true,
               SessionSnapshot.normalizedSupportedSource(raw["_source"] as? String) == "codex",
               let childSessionId = Self.rawSessionId(from: raw) else {
@@ -328,7 +388,10 @@ class HookServer {
         }
 
         if let metadata = Self.codexSubagentMetadata(from: raw),
-           let parentSessionId = appState.findSessionId(providerSessionId: metadata.parentThreadId) {
+           let parentSessionId = appState.findCodexParentSessionId(
+               providerSessionId: metadata.parentThreadId,
+               childTermBundleId: raw["_term_bundle"] as? String
+           ) {
             return parentSessionId
         }
 
@@ -347,22 +410,165 @@ class HookServer {
         )
     }
 
+    /// Resolve parent via `_ppid` after transcript fold failed. Only call when
+    /// ``CursorSubsessionRouter.shouldAttemptPpidParentFallback`` is true.
+    ///
+    /// Requires a **unique** active same-PID Cursor card for the preferred source
+    /// (then sibling). If two chats share the IDE process, guessing is unsafe —
+    /// leave the Task separate until `transcript_path` can fold it.
+    private func cursorSubsessionParentId(from raw: [String: Any]) -> String? {
+        guard let source = SessionSnapshot.normalizedSupportedSource(raw["_source"] as? String),
+              CursorSubsessionRouter.isCursorFamilySource(source),
+              let childSessionId = Self.rawSessionId(from: raw),
+              let ppid = Self.pluginPpid(from: raw) else {
+            return nil
+        }
+        let cutoff = Date().addingTimeInterval(-300)
+        for src in CursorSubsessionRouter.parentSourceSearchOrder(primarySource: source) {
+            if let match = uniqueActiveSamePidCursorSession(
+                source: src,
+                ppid: ppid,
+                excluding: childSessionId,
+                activeSince: cutoff
+            ) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    /// Sole suitable same-PID session for `source`, or `nil` when zero / ambiguous.
+    /// Prefers main chats over orphan Task cards; idle mains remain eligible.
+    private func uniqueActiveSamePidCursorSession(
+        source: String,
+        ppid: Int,
+        excluding excludedSessionId: String,
+        activeSince cutoff: Date
+    ) -> String? {
+        let normalized = SessionSnapshot.normalizedSupportedSource(source)
+        let candidates: [(sessionId: String, status: AgentStatus, startTime: Date, isMain: Bool, isTask: Bool)] =
+            appState.sessions.compactMap { sessionId, snap in
+                let snapSource = SessionSnapshot.normalizedSupportedSource(snap.source)
+                guard snapSource == normalized,
+                      snap.cliPid == pid_t(ppid),
+                      sessionId != excludedSessionId else {
+                    return nil
+                }
+                // Recent activity, or idle with live IDE pid (main often idles while
+                // a Task keeps the process busy).
+                guard snap.lastActivity >= cutoff || snap.status == .idle else {
+                    return nil
+                }
+                let isTask = CursorSubsessionRouter.isLikelyCursorTaskCard(
+                    sessionId: sessionId,
+                    providerSessionId: snap.providerSessionId,
+                    transcriptPath: snap.transcriptPath
+                )
+                let isMain = CursorSubsessionRouter.isLikelyCursorMainCard(
+                    sessionId: sessionId,
+                    providerSessionId: snap.providerSessionId,
+                    transcriptPath: snap.transcriptPath,
+                    hasSubagents: !snap.subagents.isEmpty
+                )
+                return (sessionId, snap.status, snap.startTime, isMain, isTask)
+            }
+        return CursorSubsessionRouter.choosePpidFallbackParentId(candidates: candidates)
+    }
+
+    /// Rewrite `raw` onto the parent session and serialize.
+    /// On serialization failure, returns the original hook `data` unchanged.
+    private func applyCursorMerge(
+        data: Data,
+        raw: [String: Any],
+        parentSessionId: String,
+        childSessionId: String
+    ) -> (processedData: Data, responseData: Data?) {
+        var rewritten = raw
+        CursorSubsessionRouter.applyMerge(
+            to: &rewritten,
+            parentSessionId: parentSessionId,
+            childSessionId: childSessionId
+        )
+        guard let newData = try? JSONSerialization.data(withJSONObject: rewritten) else {
+            return (data, nil)
+        }
+        return (newData, nil)
+    }
+
+    /// merge/hide fallback when transcript fold returned `.leave`.
+    private func routeCursorLeaveFallback(
+        data: Data,
+        raw: [String: Any],
+        mode: String
+    ) -> (processedData: Data, responseData: Data?)? {
+        guard mode == "hide" || mode == "merge",
+              CursorSubsessionRouter.shouldAttemptPpidParentFallback(raw: raw),
+              let childId = Self.rawSessionId(from: raw) else {
+            return nil
+        }
+        // Established top-level card for this session_id = main chat continuing.
+        // Never `_ppid`-fold it onto a sibling Task (that freezes parent chat text).
+        if cursorSessionCardExists(for: childId) {
+            return nil
+        }
+        guard let parentId = cursorSubsessionParentId(from: raw) else {
+            return nil
+        }
+        if mode == "hide" {
+            return (data, Self.hiddenPluginResponse(for: raw))
+        }
+        return applyCursorMerge(
+            data: data,
+            raw: raw,
+            parentSessionId: parentId,
+            childSessionId: childId
+        )
+    }
+
+    /// True when `sessionId` already names a top-level AppState Cursor card
+    /// (exact key or `providerSessionId` match).
+    private func cursorSessionCardExists(for sessionId: String) -> Bool {
+        if let snap = appState.sessions[sessionId],
+           CursorSubsessionRouter.isCursorFamilySource(snap.source) {
+            return true
+        }
+        if let key = appState.findSessionId(providerSessionId: sessionId),
+           let snap = appState.sessions[key],
+           CursorSubsessionRouter.isCursorFamilySource(snap.source) {
+            return true
+        }
+        return false
+    }
+
+    /// Test seam for Agent Sub-Sessions pre-routing (Cursor / Codex / plugin).
+    internal func routeSubsessionPayloadIfNeededForTesting(
+        data: Data
+    ) -> (processedData: Data, responseData: Data?) {
+        routeSubsessionPayloadIfNeeded(data: data)
+    }
+
     private func routeSubsessionPayloadIfNeeded(data: Data) -> (processedData: Data, responseData: Data?) {
         let mayNeedPluginOrCodex = data.range(of: Self.pluginMarkerBytes) != nil
             || (data.range(of: Self.sourceMarkerBytes) != nil && data.range(of: Self.codexMarkerBytes) != nil)
-        let mayNeedCursor = data.range(of: Self.cursorTranscriptMarkerBytes) != nil
-            && data.range(of: Self.cursorSourceMarkerBytes) != nil
+        let mayNeedCursorTranscript = Self.mayNeedCursorSubsessionRouting(data: data)
 
         let mode = UserDefaults.standard.string(forKey: SettingsKey.pluginSessionMode)
             ?? SettingsDefaults.pluginSessionMode
+        let isMergeOrHide = mode == "hide" || mode == "merge"
+
+        // merge/hide: parse Cursor hooks that lack `agent-transcripts` only when
+        // `_ppid` is present — otherwise there is nothing for the fallback to use.
+        let mayNeedCursorPpidFallback = isMergeOrHide
+            && Self.mayBeCursorHookSource(data: data)
+            && data.range(of: Self.ppidKeyBytes) != nil
 
         // Cursor Task routing is a no-op in separate mode; skip JSON parse when
         // the payload is Cursor-only (Codex/plugin may still need it below).
-        if mayNeedCursor && !mayNeedPluginOrCodex && mode != "hide" && mode != "merge" {
+        if mayNeedCursorTranscript && !mayNeedPluginOrCodex && !isMergeOrHide {
             return (data, nil)
         }
 
-        guard mayNeedPluginOrCodex || mayNeedCursor,
+        guard mayNeedPluginOrCodex || mayNeedCursorTranscript || mayNeedCursorPpidFallback,
               let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return (data, nil)
         }
@@ -370,23 +576,24 @@ class HookServer {
         // Cursor Task/subagent: apply Agent Sub-Sessions (separate / merge / hide).
         switch CursorSubsessionRouter.decide(raw: raw, mode: mode) {
         case .leave:
-            break
+            if let routed = routeCursorLeaveFallback(data: data, raw: raw, mode: mode) {
+                return routed
+            }
         case .hide:
             return (data, Self.hiddenPluginResponse(for: raw))
         case .merge(let parentSessionId, let childSessionId):
-            var rewritten = raw
-            CursorSubsessionRouter.applyMerge(
-                to: &rewritten,
-                parentSessionId: parentSessionId,
+            // Transcript parent UUID may differ from the AppState session key.
+            let resolvedParent = appState.findSessionId(providerSessionId: parentSessionId)
+                ?? parentSessionId
+            return applyCursorMerge(
+                data: data,
+                raw: raw,
+                parentSessionId: resolvedParent,
                 childSessionId: childSessionId
             )
-            if let newData = try? JSONSerialization.data(withJSONObject: rewritten) {
-                return (newData, nil)
-            }
-            return (data, nil)
         }
 
-        guard mode == "hide" || mode == "merge" else {
+        guard isMergeOrHide else {
             return (data, nil)
         }
 
@@ -537,6 +744,17 @@ class HookServer {
 
             // Auto-approve safe internal tools without showing UI
             if let toolName = event.toolName, Self.autoApproveTools.contains(toolName) {
+                let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+                sendResponse(connection: connection, data: Data(response.utf8))
+                return
+            }
+
+            // Agents the user has already put in an always-proceed mode
+            // (Antigravity Turbo, Cursor YOLO, …). Re-asking on the island is the
+            // exact interruption that mode exists to remove (#283). Questions are
+            // not permissions, so AskUserQuestion is deliberately excluded below.
+            if event.toolName != "AskUserQuestion",
+               Self.isAutoApprovedSource(event) {
                 let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
                 sendResponse(connection: connection, data: Data(response.utf8))
                 return

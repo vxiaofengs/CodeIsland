@@ -38,4 +38,42 @@ final class MascotAnimationGateTests: XCTestCase {
         gate.setPanelVisible(true)
         XCTAssertEqual(gate.epoch, epoch)
     }
+
+    /// #299 — a live TimelineView keeps SwiftUI's update machinery on a display
+    /// link and re-runs the panel's whole layout pass every cycle, which is the
+    /// bulk of the idle CPU baseline. A collapsed island with nothing running
+    /// holds a static frame instead.
+    func testSettledIslandStopsAnimationsEvenWhileVisibleAndAwake() {
+        XCTAssertFalse(
+            MascotAnimationGate.shouldAnimate(isVisible: true, isAwake: true, isIdleSettled: true)
+        )
+        XCTAssertTrue(
+            MascotAnimationGate.shouldAnimate(isVisible: true, isAwake: true, isIdleSettled: false)
+        )
+    }
+
+    func testLeavingTheSettledStateReAnchorsSchedules() {
+        let gate = MascotAnimationGate.shared
+        gate.setPanelVisible(true)
+        gate.setIdleSettled(true)
+        XCTAssertFalse(gate.animationsActive)
+        let settledEpoch = gate.epoch
+
+        gate.setIdleSettled(false)
+        XCTAssertTrue(gate.animationsActive)
+        XCTAssertEqual(
+            gate.epoch,
+            settledEpoch + 1,
+            "resuming must re-anchor, or SwiftUI replays every tick missed while settled"
+        )
+    }
+
+    func testSettlingDoesNotReAnchor() {
+        let gate = MascotAnimationGate.shared
+        gate.setIdleSettled(false)
+        let epoch = gate.epoch
+        gate.setIdleSettled(true)
+        XCTAssertEqual(gate.epoch, epoch)
+        gate.setIdleSettled(false)
+    }
 }

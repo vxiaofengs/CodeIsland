@@ -5,7 +5,7 @@ import socket
 import subprocess
 import sys
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 # Per-user socket path (#193): CodeIsland injects CODEISLAND_SOCKET_PATH via the hook
 # command, but fall back to a uid-scoped path so multiple users on a shared host never
 # collide on a single /tmp/codeisland.sock.
@@ -14,6 +14,11 @@ REMOTE_HOST_ID = os.environ.get("CODEISLAND_REMOTE_HOST_ID", "")
 REMOTE_HOST_NAME = os.environ.get("CODEISLAND_REMOTE_HOST_NAME", "")
 SOURCE = os.environ.get("CODEISLAND_SOURCE", "")
 TIMEOUT_SECONDS = 300
+# A blocking approval waits on a human, so it must not be capped at the
+# fire-and-forget budget: the hook is registered with an 86400s timeout on the
+# agent side, and a socket timeout of 5 minutes would silently drop the decision
+# of anyone who stepped away (#306).
+BLOCKING_TIMEOUT_SECONDS = 86400
 
 
 def _normalize_event(name):
@@ -201,7 +206,7 @@ def _read_stdin_json():
 
 def _send_event(payload, expects_response):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(TIMEOUT_SECONDS)
+    sock.settimeout(BLOCKING_TIMEOUT_SECONDS if expects_response else TIMEOUT_SECONDS)
     try:
         sock.connect(SOCKET_PATH)
         sock.sendall(json.dumps(payload).encode("utf-8"))

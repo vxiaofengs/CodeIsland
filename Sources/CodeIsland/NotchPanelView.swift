@@ -224,26 +224,28 @@ struct NotchPanelView: View {
 
                     switch appState.surface {
                     case .approvalCard(let sid):
-                        if let pending = appState.pendingPermission {
+                        // Card is addressed by session — render that session's
+                        // request, not whatever is at the head of the queue. (#308)
+                        if let pending = appState.pendingPermission(forSession: sid) {
                             let session = appState.sessions[sid]
                             ApprovalBar(
                                 tool: pending.event.toolName ?? "Unknown",
                                 toolInput: pending.event.toolInput,
-                                queuePosition: 1,
+                                queuePosition: appState.permissionQueuePosition(forSession: sid),
                                 queueTotal: appState.permissionQueue.count,
                                 session: session,
                                 sessionId: sid,
                                 appState: appState,
-                                onAllow: { appState.approvePermission(always: false) },
-                                onAlwaysAllow: { appState.approvePermission(always: true) },
-                                onDeny: { appState.denyPermission() },
-                                onDismiss: { appState.dismissPermissionPrompt() }
+                                onAllow: { appState.approvePermission(always: false, expectedSessionId: sid) },
+                                onAlwaysAllow: { appState.approvePermission(always: true, expectedSessionId: sid) },
+                                onDeny: { appState.denyPermission(expectedSessionId: sid) },
+                                onDismiss: { appState.dismissPermissionPrompt(expectedSessionId: sid) }
                             )
                             .transition(.blurFade.combined(with: .scale(scale: 0.96, anchor: .top)))
                         }
                     case .questionCard(let sid):
                         let session = appState.sessions[sid]
-                        if let q = appState.pendingQuestion {
+                        if let q = appState.pendingQuestion(forSession: sid) {
                             QuestionBar(
                                 question: q.question.question,
                                 options: q.question.options,
@@ -251,11 +253,11 @@ struct NotchPanelView: View {
                                 allQuestions: q.askUserQuestionState?.items ?? [],
                                 sessionSource: session?.source,
                                 sessionContext: session?.cwd,
-                                queuePosition: 1,
+                                queuePosition: appState.questionQueuePosition(forSession: sid),
                                 queueTotal: appState.questionQueue.count,
-                                onAnswer: { appState.answerQuestion($0) },
-                                onAnswerMulti: { appState.answerQuestionMulti($0) },
-                                onSkip: { appState.skipQuestion() }
+                                onAnswer: { appState.answerQuestion($0, expectedSessionId: sid) },
+                                onAnswerMulti: { appState.answerQuestionMulti($0, expectedSessionId: sid) },
+                                onSkip: { appState.skipQuestion(expectedSessionId: sid) }
                             )
                             .transition(.blurFade.combined(with: .scale(scale: 0.96, anchor: .top)))
                         } else if let preview = appState.previewQuestionPayload {
@@ -468,7 +470,14 @@ private struct CompactLeftWing: View {
         // happening. Covers no-session and all-idle equally (#149) — without
         // this, an idle session's source overrides the user preference.
         if displayStatus == .idle { return settingsDefaultSource }
-        if let s = displaySession?.source { return s }
+        // Prefer mascotSource so a Cursor/Codex session with empty hook source
+        // still resolves via termBundleId instead of falling through to Clawd.
+        if let s = displaySession {
+            let resolved = s.mascotSource
+            if !resolved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return resolved
+            }
+        }
         return appState.primarySource
     }
     private var displayStatus: AgentStatus { displaySession?.status ?? .idle }
@@ -1157,6 +1166,19 @@ private struct ApprovalBar: View {
 
 // MARK: - Question Bar (below notch, auto-expanded)
 
+func makeQuestionBarFreeTextAnswer(
+    question: String,
+    text: String
+) -> AskUserQuestionAnswer? {
+    guard !text.isEmpty else { return nil }
+    return AskUserQuestionAnswer(
+        question: question,
+        answer: text,
+        selectedOptions: [],
+        customInput: text
+    )
+}
+
 private struct QuestionBar: View {
     let question: String
     let options: [String]?
@@ -1168,7 +1190,7 @@ private struct QuestionBar: View {
     let queuePosition: Int
     let queueTotal: Int
     let onAnswer: (String) -> Void
-    let onAnswerMulti: ([(question: String, answer: String)]) -> Void
+    let onAnswerMulti: ([AskUserQuestionAnswer]) -> Void
     let onSkip: () -> Void
 
     @State private var textInput = ""
@@ -1177,7 +1199,7 @@ private struct QuestionBar: View {
 
     // Multi-question wizard state
     @State private var currentQuestionIndex: Int = 0
-    @State private var collectedAnswers: [(question: String, answer: String)] = []
+    @State private var collectedAnswers: [AskUserQuestionAnswer] = []
     @State private var selectedIndices: Set<Int> = []
     @State private var showOtherInput: Bool = false
     @State private var otherText: String = ""
@@ -1284,7 +1306,7 @@ private struct QuestionBar: View {
                                   isSelected: selectedIndex == idx, accent: cyan) {
                             selectedIndex = idx
                             showOtherInput = false
-                            advanceWithAnswer(option)
+                            advanceWithAnswer(option, selectedOptions: [option])
                         }
                     }
                 }
@@ -1305,7 +1327,7 @@ private struct QuestionBar: View {
                             .focused($otherFocused)
                             .onSubmit {
                                 if !item.multiSelect && !otherText.isEmpty {
-                                    advanceWithAnswer(otherText)
+                                    advanceWithAnswer(otherText, customInput: otherText)
                                 }
                             }
                     }
@@ -1333,9 +1355,7 @@ private struct QuestionBar: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(.white)
                     .focused($isFocused)
-                    .onSubmit {
-                        if !textInput.isEmpty { advanceWithAnswer(textInput) }
-                    }
+                    .onSubmit(submitFreeText)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
@@ -1366,7 +1386,15 @@ private struct QuestionBar: View {
                 border: Color.white.opacity(0.12),
                 action: onSkip
             )
-            if item.multiSelect {
+            if item.payload.options?.isEmpty != false {
+                PixelButton(
+                    label: L10n.shared["submit"],
+                    fg: .white.opacity(0.95),
+                    bg: Color(red: 0.16, green: 0.38, blue: 0.18),
+                    border: Color(red: 0.28, green: 0.62, blue: 0.32),
+                    action: submitFreeText
+                )
+            } else if item.multiSelect {
                 PixelButton(
                     label: L10n.shared["confirm"],
                     fg: .white.opacity(0.95),
@@ -1374,21 +1402,13 @@ private struct QuestionBar: View {
                     border: Color(red: 0.28, green: 0.62, blue: 0.32),
                     action: confirmMultiSelect
                 )
-            } else if item.payload.options == nil || item.payload.options?.isEmpty == true {
-                PixelButton(
-                    label: L10n.shared["submit"],
-                    fg: .white.opacity(0.95),
-                    bg: Color(red: 0.16, green: 0.38, blue: 0.18),
-                    border: Color(red: 0.28, green: 0.62, blue: 0.32),
-                    action: { if !textInput.isEmpty { advanceWithAnswer(textInput) } }
-                )
             } else if showOtherInput && !item.multiSelect {
                 PixelButton(
                     label: L10n.shared["submit"],
                     fg: .white.opacity(0.95),
                     bg: Color(red: 0.16, green: 0.38, blue: 0.18),
                     border: Color(red: 0.28, green: 0.62, blue: 0.32),
-                    action: { if !otherText.isEmpty { advanceWithAnswer(otherText) } }
+                    action: { if !otherText.isEmpty { advanceWithAnswer(otherText, customInput: otherText) } }
                 )
             }
         }
@@ -1416,9 +1436,31 @@ private struct QuestionBar: View {
 
     // MARK: - Navigation
 
-    private func advanceWithAnswer(_ answer: String) {
+    private func submitFreeText() {
+        guard let item = currentItem,
+              let answer = makeQuestionBarFreeTextAnswer(
+                  question: item.payload.question,
+                  text: textInput
+              ) else { return }
+        advance(with: answer)
+    }
+
+    private func advanceWithAnswer(
+        _ answer: String,
+        selectedOptions: [String] = [],
+        customInput: String? = nil
+    ) {
         guard let item = currentItem else { return }
-        collectedAnswers.append((question: item.payload.question, answer: answer))
+        advance(with: AskUserQuestionAnswer(
+            question: item.payload.question,
+            answer: answer,
+            selectedOptions: selectedOptions,
+            customInput: customInput
+        ))
+    }
+
+    private func advance(with answer: AskUserQuestionAnswer) {
+        collectedAnswers.append(answer)
 
         if currentQuestionIndex + 1 < allQuestions.count {
             withAnimation(NotchAnimation.micro) {
@@ -1432,14 +1474,17 @@ private struct QuestionBar: View {
 
     private func confirmMultiSelect() {
         guard let item = currentItem, let opts = item.payload.options else { return }
-        var parts: [String] = selectedIndices.sorted().compactMap { idx in
+        let selectedOptions = selectedIndices.sorted().compactMap { idx in
             opts.indices.contains(idx) ? opts[idx] : nil
         }
-        if showOtherInput && !otherText.isEmpty {
-            parts.append(otherText)
-        }
+        let customInput = showOtherInput && !otherText.isEmpty ? otherText : nil
+        let parts = selectedOptions + (customInput.map { [$0] } ?? [])
         guard !parts.isEmpty else { return }
-        advanceWithAnswer(parts.joined(separator: ", "))
+        advanceWithAnswer(
+            parts.joined(separator: ", "),
+            selectedOptions: selectedOptions,
+            customInput: customInput
+        )
     }
 
     private func goBack() {
@@ -2206,7 +2251,7 @@ private struct SessionCard: View {
         HStack(alignment: .center, spacing: 8) {
             // Column 1: Character + subagent icons
             VStack(spacing: 3) {
-                MascotView(source: session.source, status: session.status, size: 32)
+                MascotView(source: session.mascotSource, status: session.status, size: 32)
                 if showAgentDetails && !session.subagents.isEmpty {
                     let sorted = session.subagents.values.sorted { $0.startTime < $1.startTime }
                     // Grid: 4 per row, 8px icons
@@ -2283,21 +2328,21 @@ private struct SessionCard: View {
                             fg: .white,
                             bg: Color(red: 0.25, green: 0.65, blue: 0.35),
                             enabled: isActiveApproval,
-                            action: { appState.approvePermission(always: false) }
+                            action: { appState.approvePermission(always: false, expectedSessionId: sessionId) }
                         )
                         inlineActionButton(
                             L10n.shared["always"],
                             fg: .white,
                             bg: Color(red: 0.25, green: 0.55, blue: 0.85),
                             enabled: isActiveApproval,
-                            action: { appState.approvePermission(always: true) }
+                            action: { appState.approvePermission(always: true, expectedSessionId: sessionId) }
                         )
                         inlineActionButton(
                             L10n.shared["deny"],
                             fg: .white,
                             bg: Color(red: 0.85, green: 0.3, blue: 0.3),
                             enabled: isActiveApproval,
-                            action: { appState.denyPermission() }
+                            action: { appState.denyPermission(expectedSessionId: sessionId) }
                         )
                     }
 
@@ -2708,13 +2753,23 @@ private struct TerminalBadge: View {
     private static var termIconCache: [String: NSImage] = [:]
 
     private var termIcon: NSImage? {
-        let bid = session.termBundleId ?? Self.sourceBundleIds[session.source]
+        // CLI hosted in a foreign IDE: show the agent icon, not the host IDE.
+        if session.isCLIHostedInForeignApp,
+           let src = SessionSnapshot.normalizedSupportedSource(session.source),
+           let icon = cliIcon(source: src, size: 13) {
+            return icon
+        }
+        let bid = session.termBundleId ?? Self.sourceBundleIds[session.mascotSource]
         guard let bid else { return nil }
         if let cached = Self.termIconCache[bid] { return cached }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) else { return nil }
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         Self.termIconCache[bid] = icon
         return icon
+    }
+
+    private var badgeLabel: String? {
+        session.terminalBadgeLabel
     }
 
     private let remoteColor = Color(red: 0.3, green: 0.75, blue: 0.5)
@@ -2745,7 +2800,7 @@ private struct TerminalBadge: View {
                             .resizable()
                             .frame(width: 13, height: 13)
                     }
-                    if let term = session.terminalName {
+                    if let term = badgeLabel {
                         Text(term)
                             .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                             .foregroundStyle(.white.opacity(0.5))
@@ -2790,6 +2845,7 @@ private let cliIconFiles: [String: String] = [
     "stepfun": "stepfun",
     "workbuddy": "workbuddy",
     "hermes": "hermes",
+    "grok": "grok",
     "qwen": "qwen",
     "kimi": "kimi",
     "pi": "pi",

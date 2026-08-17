@@ -1,5 +1,6 @@
 import AppKit
 import ServiceManagement
+import CodeIslandCore
 
 enum AppVersion {
     /// Update this each release. Used as fallback when Info.plist is unavailable (debug builds).
@@ -33,6 +34,7 @@ enum SettingsKey {
     static let smartSuppress = "smartSuppress"
     static let collapseOnMouseLeave = "collapseOnMouseLeave"
     static let autoCollapseAfterSessionJump = "autoCollapseAfterSessionJump"
+    static let autoExpandOnPermission = "autoExpandOnPermission"
     static let autoExpandOnCompletion = "autoExpandOnCompletion"
     static let pluginSessionMode = "pluginSessionMode"  // "separate" | "merge" | "hide"
     static let hapticOnHover = "hapticOnHover"
@@ -114,6 +116,11 @@ enum SettingsKey {
     // Auto-approve tools (comma-separated tool names)
     static let autoApproveTools = "autoApproveTools"
 
+    // Agents whose permission requests are approved without a prompt
+    // (comma-separated sources) — for CLIs already running in their own
+    // Turbo/YOLO/always-proceed mode (#283)
+    static let autoApproveSources = "autoApproveSources"
+
     // Hook cwd exclusion (comma-separated substrings; cwd containing any drops the event)
     static let excludedHookCwdSubstrings = "excludedHookCwdSubstrings"
 
@@ -137,6 +144,7 @@ struct SettingsDefaults {
     static let smartSuppress = true
     static let collapseOnMouseLeave = true
     static let autoCollapseAfterSessionJump = false
+    static let autoExpandOnPermission = true
     static let autoExpandOnCompletion = true
     static let pluginSessionMode = "separate"
     static let hapticOnHover = false
@@ -194,6 +202,8 @@ struct SettingsDefaults {
     // EnterPlanMode etc.) which hid those calls from the panel.
     static let autoApproveTools = ""
 
+    static let autoApproveSources = ""
+
     static let excludedHookCwdSubstrings = ""
 
     static let claudeConfigDir = ""
@@ -220,6 +230,7 @@ class SettingsManager {
             SettingsKey.smartSuppress: SettingsDefaults.smartSuppress,
             SettingsKey.collapseOnMouseLeave: SettingsDefaults.collapseOnMouseLeave,
             SettingsKey.autoCollapseAfterSessionJump: SettingsDefaults.autoCollapseAfterSessionJump,
+            SettingsKey.autoExpandOnPermission: SettingsDefaults.autoExpandOnPermission,
             SettingsKey.autoExpandOnCompletion: SettingsDefaults.autoExpandOnCompletion,
             SettingsKey.pluginSessionMode: SettingsDefaults.pluginSessionMode,
             SettingsKey.hapticOnHover: SettingsDefaults.hapticOnHover,
@@ -261,6 +272,7 @@ class SettingsManager {
             SettingsKey.appleCompanionHeartbeatSeconds: SettingsDefaults.appleCompanionHeartbeatSeconds,
             SettingsKey.defaultSource: SettingsDefaults.defaultSource,
             SettingsKey.autoApproveTools: SettingsDefaults.autoApproveTools,
+            SettingsKey.autoApproveSources: SettingsDefaults.autoApproveSources,
             SettingsKey.excludedHookCwdSubstrings: SettingsDefaults.excludedHookCwdSubstrings,
             SettingsKey.claudeConfigDir: SettingsDefaults.claudeConfigDir,
             SettingsKey.webhookEnabled: SettingsDefaults.webhookEnabled,
@@ -400,6 +412,29 @@ class SettingsManager {
         }
         set {
             defaults.set(newValue.sorted().joined(separator: ","), forKey: SettingsKey.autoApproveTools)
+        }
+    }
+
+    /// Agent sources whose permission requests are approved without ever showing
+    /// a card. For CLIs the user has already put in an always-proceed mode
+    /// (Antigravity Turbo, Cursor YOLO, …), where a second confirmation on the
+    /// island is exactly the interruption that mode exists to remove (#283).
+    /// Stored as a comma-separated list of source ids; matched after
+    /// `normalizedSupportedSource`, so aliases and raw spellings both work.
+    var autoApproveSources: Set<String> {
+        get {
+            let raw = defaults.string(forKey: SettingsKey.autoApproveSources)
+                ?? SettingsDefaults.autoApproveSources
+            let entries = raw.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+            return Set(entries.flatMap { entry -> [String] in
+                guard let normalized = SessionSnapshot.normalizedSupportedSource(entry) else { return [entry] }
+                return [entry, normalized]
+            })
+        }
+        set {
+            defaults.set(newValue.sorted().joined(separator: ","), forKey: SettingsKey.autoApproveSources)
         }
     }
 

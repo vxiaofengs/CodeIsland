@@ -75,6 +75,8 @@ final class L10n: ObservableObject {
         "hide_in_fullscreen_desc": "Automatically hide panel when any app enters fullscreen mode",
         "hide_when_no_session": "Auto-hide When No Active Session",
         "hide_when_no_session_desc": "Hide panel completely when no AI agents are running",
+        "auto_expand_on_permission": "Auto-Expand on Approval",
+        "auto_expand_on_permission_desc": "Expand the panel when an approval is requested. Turn off to keep the island collapsed — the sound still plays and the card is one click away.",
         "smart_suppress": "Smart Suppress",
         "smart_suppress_desc": "Don't auto-expand panel when agent's terminal tab is in foreground",
         "collapse_on_mouse_leave": "Auto-collapse on Mouse Leave",
@@ -138,6 +140,9 @@ final class L10n: ObservableObject {
         "plugin_session_mode_hide": "Hide",
 
         // Auto-approve tools
+        "auto_approve_sources": "Always-proceed Agents",
+        "auto_approve_sources_desc": "Comma-separated agent ids. Permission requests from these agents are approved without a card — for CLIs already running in their own Turbo / YOLO / always-proceed mode. Questions are still asked.",
+        "auto_approve_sources_placeholder": "google-antigravity, cursor",
         "auto_approve_tools": "Auto-approve Tools",
         "auto_approve_tools_desc": "These internal tools are auto-approved without showing a confirmation dialog. Disable tools you want to review manually.",
         "auto_approve_TaskCreate": "Create a new task",
@@ -424,6 +429,8 @@ final class L10n: ObservableObject {
         "hide_in_fullscreen_desc": "Panel automatisch ausblenden, wenn eine App in den Vollbildmodus wechselt",
         "hide_when_no_session": "Ohne aktive Sitzung automatisch ausblenden",
         "hide_when_no_session_desc": "Panel vollständig ausblenden, wenn keine AI-Agenten laufen",
+        "auto_expand_on_permission": "Bei Freigabe automatisch erweitern",
+        "auto_expand_on_permission_desc": "Panel erweitern, wenn eine Freigabe angefragt wird. Deaktiviert bleibt die Insel eingeklappt — der Ton erklingt weiterhin und die Karte ist einen Klick entfernt.",
         "smart_suppress": "Intelligent unterdrücken",
         "smart_suppress_desc": "Panel nicht automatisch erweitern, wenn der Terminal-Tab des Agenten im Vordergrund ist",
         "collapse_on_mouse_leave": "Beim Verlassen mit der Maus einklappen",
@@ -487,6 +494,9 @@ final class L10n: ObservableObject {
         "plugin_session_mode_hide": "Ausblenden",
 
         // Auto-approve tools
+        "auto_approve_sources": "Agenten im Durchlaufmodus",
+        "auto_approve_sources_desc": "Kommagetrennte Agenten-IDs. Freigabeanfragen dieser Agenten werden ohne Karte genehmigt — für CLIs, die bereits im Turbo-/YOLO-Modus laufen. Fragen werden weiterhin gestellt.",
+        "auto_approve_sources_placeholder": "google-antigravity, cursor",
         "auto_approve_tools": "Tools automatisch genehmigen",
         "auto_approve_tools_desc": "Diese internen Tools werden ohne Bestätigungsdialog automatisch genehmigt. Deaktiviere Tools, die du manuell prüfen möchtest.",
         "auto_approve_TaskCreate": "Neue Aufgabe erstellen",
@@ -769,6 +779,8 @@ final class L10n: ObservableObject {
         "hide_in_fullscreen_desc": "当任意应用进入全屏模式时自动隐藏面板",
         "hide_when_no_session": "无活跃会话时自动隐藏",
         "hide_when_no_session_desc": "没有 AI Agent 运行时完全隐藏面板",
+        "auto_expand_on_permission": "权限请求时自动展开",
+        "auto_expand_on_permission_desc": "收到权限请求时展开面板。关闭后灵动岛保持收起——提示音照常，卡片点一下就能打开，不会抢占当前 App 的焦点",
         "smart_suppress": "智能抑制",
         "smart_suppress_desc": "Agent 所在终端标签页在前台时不自动展开面板",
         "collapse_on_mouse_leave": "鼠标离开时自动收起",
@@ -832,6 +844,9 @@ final class L10n: ObservableObject {
         "plugin_session_mode_hide": "隐藏",
 
         // Auto-approve tools
+        "auto_approve_sources": "免确认的 Agent",
+        "auto_approve_sources_desc": "英文逗号分隔的 agent 标识。来自这些 agent 的权限请求直接放行、不弹卡片——适合本身已开 Turbo / YOLO / always-proceed 模式的 CLI。提问（AskUserQuestion）仍会正常询问。",
+        "auto_approve_sources_placeholder": "google-antigravity, cursor",
         "auto_approve_tools": "自动批准工具",
         "auto_approve_tools_desc": "这些内部工具会自动批准，无需弹出确认对话框。关闭你想要手动审核的工具。",
         "auto_approve_TaskCreate": "创建新任务",
@@ -1118,6 +1133,8 @@ final class L10n: ObservableObject {
         "hide_in_fullscreen_desc": "當任一應用程式進入全螢幕模式時自動隱藏面板",
         "hide_when_no_session": "無活躍會話時自動隱藏",
         "hide_when_no_session_desc": "沒有 AI Agent 執行時完全隱藏面板",
+        "auto_expand_on_permission": "權限請求時自動展開",
+        "auto_expand_on_permission_desc": "收到權限請求時展開面板。關閉後靈動島保持收合——提示音照常，卡片點一下就能開啟，不會搶走目前 App 的焦點",
         "smart_suppress": "智慧抑制",
         "smart_suppress_desc": "Agent 所在終端機分頁在前景時不自動展開面板",
         "collapse_on_mouse_leave": "滑鼠離開時自動收合",
@@ -1181,6 +1198,9 @@ final class L10n: ObservableObject {
         "plugin_session_mode_hide": "隱藏",
 
         // Auto-approve tools
+        "auto_approve_sources": "免確認的 Agent",
+        "auto_approve_sources_desc": "以半形逗號分隔的 agent 識別碼。來自這些 agent 的權限請求直接放行、不顯示卡片——適合本身已開 Turbo / YOLO / always-proceed 模式的 CLI。提問（AskUserQuestion）仍會照常詢問。",
+        "auto_approve_sources_placeholder": "google-antigravity, cursor",
         "auto_approve_tools": "自動核准工具",
         "auto_approve_tools_desc": "這些內部工具會自動核准，不需彈出確認對話框。關閉你想手動審核的工具。",
         "auto_approve_TaskCreate": "建立新任務",
@@ -1467,6 +1487,8 @@ final class L10n: ObservableObject {
         "hide_in_fullscreen_desc": "いずれかのアプリがフルスクリーンモードに入るとパネルを自動で隠します",
         "hide_when_no_session": "アクティブなセッションがないとき自動で隠す",
         "hide_when_no_session_desc": "実行中の AI エージェントがいないときはパネルを完全に隠します",
+        "auto_expand_on_permission": "承認要求で自動展開",
+        "auto_expand_on_permission_desc": "承認が要求されたときにパネルを展開します。オフにするとアイランドは折りたたまれたまま——通知音は鳴り、カードはワンクリックで開けます。",
         "smart_suppress": "スマート抑制",
         "smart_suppress_desc": "エージェントのターミナルタブが前面にあるときはパネルを自動展開しません",
         "collapse_on_mouse_leave": "マウスが離れたら自動で折りたたむ",
@@ -1530,6 +1552,9 @@ final class L10n: ObservableObject {
         "plugin_session_mode_hide": "非表示",
 
         // Auto-approve tools
+        "auto_approve_sources": "常時続行エージェント",
+        "auto_approve_sources_desc": "カンマ区切りのエージェント ID。これらのエージェントからの承認要求はカードを出さずに許可します — すでに Turbo / YOLO モードで動いている CLI 向けです。質問は引き続き表示されます。",
+        "auto_approve_sources_placeholder": "google-antigravity, cursor",
         "auto_approve_tools": "自動承認ツール",
         "auto_approve_tools_desc": "これらの内部ツールは確認ダイアログなしで自動承認されます。手動で確認したいツールはオフにしてください。",
         "auto_approve_TaskCreate": "新しいタスクを作成",
@@ -1816,6 +1841,8 @@ final class L10n: ObservableObject {
         "hide_in_fullscreen_desc": "앱이 전체 화면 모드로 들어가면 패널을 자동으로 숨깁니다",
         "hide_when_no_session": "활성 세션이 없을 때 자동 숨김",
         "hide_when_no_session_desc": "실행 중인 AI 에이전트가 없으면 패널을 완전히 숨깁니다",
+        "auto_expand_on_permission": "승인 요청 시 자동 확장",
+        "auto_expand_on_permission_desc": "승인이 요청되면 패널을 확장합니다. 끄면 아일랜드가 접힌 상태로 유지됩니다 — 알림음은 그대로 울리고 카드는 클릭 한 번이면 열립니다.",
         "smart_suppress": "스마트 억제",
         "smart_suppress_desc": "에이전트의 터미널 탭이 전경일 때 패널을 자동 확장하지 않습니다",
         "collapse_on_mouse_leave": "마우스가 벗어나면 자동 접기",
@@ -1879,6 +1906,9 @@ final class L10n: ObservableObject {
         "plugin_session_mode_hide": "숨김",
 
         // Auto-approve tools
+        "auto_approve_sources": "항상 진행 에이전트",
+        "auto_approve_sources_desc": "쉼표로 구분된 에이전트 ID. 이 에이전트의 권한 요청은 카드 없이 승인됩니다 — 이미 Turbo / YOLO 모드로 실행 중인 CLI용입니다. 질문은 계속 표시됩니다.",
+        "auto_approve_sources_placeholder": "google-antigravity, cursor",
         "auto_approve_tools": "자동 승인 도구",
         "auto_approve_tools_desc": "이 내부 도구들은 확인 대화상자 없이 자동 승인됩니다. 수동으로 검토하려는 도구는 비활성화하세요.",
         "auto_approve_TaskCreate": "새 작업 만들기",
@@ -2165,6 +2195,8 @@ final class L10n: ObservableObject {
         "hide_in_fullscreen_desc": "Herhangi bir uygulama tam ekran moduna girdiğinde paneli otomatik gizle",
         "hide_when_no_session": "Aktif Oturum Yokken Otomatik Gizle",
         "hide_when_no_session_desc": "AI ajanları çalışırken paneli tamamen gizle",
+        "auto_expand_on_permission": "Onay İsteğinde Otomatik Genişlet",
+        "auto_expand_on_permission_desc": "Bir onay istendiğinde paneli genişletir. Kapatıldığında ada kapalı kalır — ses yine çalar ve kart bir tık uzaktadır.",
         "smart_suppress": "Akıllı Bastırma",
         "smart_suppress_desc": "Ajanın terminal sekmesi ön plandayken paneli otomatik genişletme",
         "collapse_on_mouse_leave": "Fare Çıkınca Daralt",
@@ -2228,6 +2260,9 @@ final class L10n: ObservableObject {
         "plugin_session_mode_hide": "Gizle",
 
         // Auto-approve tools
+        "auto_approve_sources": "Her Zaman Devam Eden Ajanlar",
+        "auto_approve_sources_desc": "Virgülle ayrılmış ajan kimlikleri. Bu ajanlardan gelen izin istekleri kart gösterilmeden onaylanır — zaten Turbo / YOLO modunda çalışan CLI'lar için. Sorular yine sorulur.",
+        "auto_approve_sources_placeholder": "google-antigravity, cursor",
         "auto_approve_tools": "Otomatik Onay Araçları",
         "auto_approve_tools_desc": "Bu iç araçlar onay iletişim kutusu gösterilmeden otomatik olarak onaylanır. Manuel olarak incelemek istediğiniz araçları devre dışı bırakın.",
         "auto_approve_TaskCreate": "Yeni görev oluştur",

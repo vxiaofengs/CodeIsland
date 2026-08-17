@@ -38,6 +38,10 @@ public enum EventNormalizer {
         case "post_tool_use":         return "PostToolUse"
         case "post_tool_use_failure": return "PostToolUseFailure"
         case "permission_request":    return "PermissionRequest"
+        case "permission_denied":     return "PermissionDenied"
+        // Grok emits StopFailure when a turn ends on an API error. It is still
+        // terminal for Island state, so fold both wire spellings onto Stop.
+        case "stop_failure", "StopFailure": return "Stop"
         case "subagent_start":        return "SubagentStart"
         case "subagent_stop":         return "SubagentStop"
         case "pre_compact":           return "PreCompact"
@@ -48,6 +52,13 @@ public enum EventNormalizer {
         case "pre_tool_call":         return "PreToolUse"
         case "post_tool_call":        return "PostToolUse"
         case "pre_llm_call":          return "UserPromptSubmit"
+        // Hermes has no per-turn terminal event — `on_session_end` only fires on
+        // /reset or an explicit close, and the backend is a long-lived daemon, so
+        // process exit never settles the card either (#303). `post_llm_call` is
+        // the only per-turn signal, but it fires after EVERY model response,
+        // including mid-turn ones that go on to call tools, so it cannot mean
+        // "done" by itself — hence its own name rather than Stop.
+        case "post_llm_call":         return "AgentTurnSettled"
         case "on_session_start":      return "SessionStart"
         case "on_session_end":        return "SessionEnd"
         case "on_session_reset":      return "SessionEnd"

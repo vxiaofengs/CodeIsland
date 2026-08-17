@@ -237,6 +237,25 @@ struct ConfigInstaller {
         return "~/.kimi-code/config.toml"
     }
 
+    // MARK: - Grok Build home resolution
+
+    /// Resolve Grok Build's config/session root. Grok documents `GROK_HOME`
+    /// as the override for the default `~/.grok` directory.
+    static func grokHome() -> String {
+        let raw = (ProcessInfo.processInfo.environment["GROK_HOME"] ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        guard !raw.isEmpty else { return NSHomeDirectory() + "/.grok" }
+        if raw == "~" { return NSHomeDirectory() }
+        if raw.hasPrefix("~/") { return NSHomeDirectory() + "/" + raw.dropFirst(2) }
+        return raw
+    }
+
+    static func displayGrokPath(filename: String) -> String {
+        let raw = (ProcessInfo.processInfo.environment["GROK_HOME"] ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        return raw.isEmpty ? "~/.grok/\(filename)" : "$GROK_HOME/\(filename)"
+    }
+
     // MARK: - All supported CLIs
 
     private static let builtInCLIs: [CLIConfig] = [
@@ -367,6 +386,30 @@ struct ConfigInstaller {
                 ("PreCompact", 5, true),
             ]
         ),
+        // Qoder CN (国行) — the China build ships as its own `qoderclicn` binary
+        // with a separate config root ~/.qoder-cn, so the international entry
+        // above never reaches it. The hook contract is identical, so events are
+        // reported under the shared `qoder-cli` source (#289).
+        CLIConfig(
+            name: "Qoder CN", source: "qoder-cn",
+            configPath: ".qoder-cn/settings.json", configKey: "hooks",
+            format: .claude,
+            events: [
+                ("UserPromptSubmit", 5, true),
+                ("PreToolUse", 5, false),
+                ("PostToolUse", 5, true),
+                ("PostToolUseFailure", 5, true),
+                ("PermissionRequest", 86400, false),
+                ("Stop", 5, true),
+                ("SubagentStart", 5, true),
+                ("SubagentStop", 5, true),
+                ("SessionStart", 5, false),
+                ("SessionEnd", 5, true),
+                ("Notification", 86400, false),
+                ("PreCompact", 5, true),
+            ],
+            bridgeSourceOverride: "qoder-cli"
+        ),
         // QoderWork — Qoder's standalone desktop assistant app (not the IDE).
         // Claude-format hooks, but user-level ~/.qoderwork/settings.json ONLY
         // (no project-level config) and no hot reload: the user must restart
@@ -453,6 +496,17 @@ struct ConfigInstaller {
             configPath: ".hermes/config.yaml", configKey: "hooks",
             format: .hermes,
             events: defaultEvents(for: .hermes)
+        ),
+        // Grok Build CLI — native global hooks are standalone JSON files under
+        // $GROK_HOME/hooks. Use `.nested` rather than the Claude format because
+        // Grok rejects `matcher` on lifecycle events such as SessionStart/Stop.
+        CLIConfig(
+            name: "Grok CLI", source: "grok",
+            configPath: "hooks/codeisland.json", configKey: "hooks",
+            format: .nested,
+            events: GrokHookForwardingPolicy.managedHookEvents.map { ($0, 5, false) },
+            rootOverride: { ConfigInstaller.grokHome() },
+            displayPathOverride: { ConfigInstaller.displayGrokPath(filename: "hooks/codeisland.json") }
         ),
         // Qwen Code — timeout in milliseconds
         CLIConfig(
@@ -669,6 +723,11 @@ struct ConfigInstaller {
             return [
                 ("pre_tool_call", 5, false),
                 ("post_tool_call", 5, false),
+                // The only per-turn signal Hermes has: on_session_end fires on
+                // /reset, not at the end of a reply, and the backend daemon never
+                // exits. Without it a card could only ever be settled by a
+                // timeout (#303).
+                ("post_llm_call", 5, false),
                 ("on_session_start", 5, false),
                 ("on_session_end", 5, false),
                 ("subagent_stop", 5, false),
@@ -971,6 +1030,7 @@ struct ConfigInstaller {
         if source == "pi" { return FileManager.default.fileExists(atPath: piAgentDir) }
         if source == "omp" { return FileManager.default.fileExists(atPath: ompAgentDir) }
         if source == "openclaw" { return FileManager.default.fileExists(atPath: openclawDir) }
+        if source == "grok" { return FileManager.default.fileExists(atPath: grokHome()) }
         if source == "copilot" { return FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.copilot") }
         if source == "cline" {
             let fm = FileManager.default
@@ -1069,6 +1129,10 @@ struct ConfigInstaller {
             let dirExists: Bool
             if cli.format == .copilot {
                 dirExists = fm.fileExists(atPath: NSHomeDirectory() + "/.copilot")
+            } else if cli.source == "grok" {
+                // The hooks directory does not exist on a fresh Grok install;
+                // its parent $GROK_HOME is the installation marker.
+                dirExists = fm.fileExists(atPath: grokHome())
             } else if cli.source == "pi" {
                 dirExists = fm.fileExists(atPath: piAgentDir)
             } else if cli.source == "omp" {
@@ -1381,6 +1445,15 @@ struct ConfigInstaller {
             if !fm.fileExists(atPath: cli.dirPath) {
                 try? fm.createDirectory(atPath: cli.dirPath, withIntermediateDirectories: true)
             }
+        } else if cli.source == "grok" {
+            // Grok discovers every JSON file in $GROK_HOME/hooks. A managed
+            // install may not have created that subdirectory yet, so gate on
+            // its existing root and create only the hooks child directory.
+            let rootDir = (cli.dirPath as NSString).deletingLastPathComponent
+            guard fm.fileExists(atPath: rootDir) else { return true }
+            if !fm.fileExists(atPath: cli.dirPath) {
+                try? fm.createDirectory(atPath: cli.dirPath, withIntermediateDirectories: true)
+            }
         } else if cli.format == .kiroAgent {
             // Kiro: check ~/.kiro exists; create agents/ subdir if needed.
             let kiroRoot = NSHomeDirectory() + "/.kiro"
@@ -1479,14 +1552,19 @@ struct ConfigInstaller {
                 // configKey ("codeisland"), keyed here by installExternalHooks, so we
                 // emit only the inner {matcher?, hooks:[{type,command,timeout}]} value.
                 // stdin lacks hook_event_name -> the command must carry --event.
-                // `matcher` is meaningful ONLY for PreToolUse/PostToolUse (regex over
-                // the tool name, "*" = all); it's ignored for Stop, so we omit it there.
+                //
+                // The two event families take DIFFERENT shapes, and getting this
+                // wrong is silent — Antigravity just never runs the handler:
+                //   tool events  (PreToolUse/PostToolUse) → [{matcher, hooks:[…]}]
+                //   model events (PreInvocation/PostInvocation/Stop) → [{type, command}]
+                // We previously wrapped Stop in a `hooks` array too, so Stop never
+                // fired and every Antigravity session sat on "thinking" forever (#297).
                 let agyCommand = "\(baseCommand) --event \(event)"
-                let hookList: [[String: Any]] = [["type": "command", "command": agyCommand, "timeout": timeout]]
+                let handler: [String: Any] = ["type": "command", "command": agyCommand, "timeout": timeout]
                 if event == "PreToolUse" || event == "PostToolUse" {
-                    entry = ["matcher": "*", "hooks": hookList]
+                    entry = ["matcher": "*", "hooks": [handler]]
                 } else {
-                    entry = ["hooks": hookList]
+                    entry = handler
                 }
             case .cline, .none:
                 // Handled at the top of installExternalHooks; never reaches here
@@ -2503,13 +2581,19 @@ struct ConfigInstaller {
         return result.joined(separator: "\n")
     }
 
+    /// Paths checked for Kimi hooks *status* (Settings installed badge).
+    /// Exactly one path: the install target (`cli.fullPath` / `kimiHome()`).
+    /// Must never OR modern + legacy — that false-positives migrated users.
+    internal static func kimiHooksStatusConfigPaths(for cli: CLIConfig) -> [String] {
+        [cli.fullPath]
+    }
+
+    /// Whether CodeIsland hooks are present in the config kimi-code (or legacy
+    /// kimi-cli) will actually read. Matches install's `cli.fullPath` target —
+    /// do not OR legacy when `~/.kimi-code` exists, or migrated users with hooks
+    /// only under `~/.kimi` show a false "installed" while kimi-code ignores them.
     private static func isKimiHooksInstalled(cli: CLIConfig, fm: FileManager) -> Bool {
-        // Prefer modern home, but also treat legacy ~/.kimi as installed if our
-        // hooks are still there (migration leaves the old tree intact).
-        var candidates = [kimiCodeHome() + "/config.toml", kimiLegacyHome() + "/config.toml"]
-        let resolved = cli.fullPath
-        if !candidates.contains(resolved) { candidates.append(resolved) }
-        return candidates.contains { path in
+        kimiHooksStatusConfigPaths(for: cli).contains { path in
             guard fm.fileExists(atPath: path),
                   let data = fm.contents(atPath: path),
                   let contents = String(data: data, encoding: .utf8) else { return false }
@@ -2517,6 +2601,19 @@ struct ConfigInstaller {
                 contentsContainsKimiHook(contents, event: event)
             }
         }
+    }
+
+    /// Test seam: status for an explicit config path (hermetic fixtures).
+    internal static func isKimiHooksInstalled(at configPath: String, cli: CLIConfig, fm: FileManager) -> Bool {
+        let probe = CLIConfig(
+            name: cli.name,
+            source: cli.source,
+            configPath: configPath,
+            configKey: cli.configKey,
+            format: cli.format,
+            events: cli.events
+        )
+        return isKimiHooksInstalled(cli: probe, fm: fm)
     }
 
     static func contentsContainsKimiHook(_ contents: String, event: String) -> Bool {
@@ -2698,7 +2795,26 @@ struct ConfigInstaller {
         guard allPresent else { return false }
         // Also check for stale "async" keys that need cleanup
         if hasStaleAsyncKey(hooks) { return false }
+        // Pre-#297 installs wrapped Antigravity's model events in a `hooks` array,
+        // a shape Antigravity silently ignores. Report those as not-installed so
+        // verifyAndRepair rewrites them into the flat handler form.
+        if cli.format == .antigravityNamed, hasNestedAntigravityModelEvent(hooks) { return false }
         return true
+    }
+
+    /// Antigravity's `PreInvocation` / `PostInvocation` / `Stop` handlers are a
+    /// direct `[{type, command}]` list; only `PreToolUse` / `PostToolUse` take the
+    /// `[{matcher, hooks: […]}]` wrapper. A CodeIsland entry for a model event
+    /// carrying a `hooks` array is the broken legacy shape. (#297)
+    static func hasNestedAntigravityModelEvent(_ hooks: [String: Any]) -> Bool {
+        let modelEvents = ["Stop", "PreInvocation", "PostInvocation"]
+        for event in modelEvents {
+            guard let entries = hooks[event] as? [[String: Any]] else { continue }
+            if entries.contains(where: { containsOurHook($0) && $0["hooks"] != nil }) {
+                return true
+            }
+        }
+        return false
     }
 
     /// #182: tell apart a user who intentionally kept only some hook events
@@ -2719,6 +2835,9 @@ struct ConfigInstaller {
         if cli.format == .kimi { return false }
         guard let root = parseJSONFile(at: cli.fullPath, fm: fm),
               let hooks = root[cli.configKey] as? [String: Any] else { return false }
+        // A legacy-shaped Antigravity model event is broken, not "intentionally
+        // pruned by the user" — it must be rewritten, not preserved. (#297)
+        if cli.format == .antigravityNamed, hasNestedAntigravityModelEvent(hooks) { return false }
         return shouldPreservePartialHooks(hooks: hooks, events: cli.events)
     }
 
@@ -2821,7 +2940,13 @@ struct ConfigInstaller {
     // MARK: - pi Extension
 
     /// Current pi extension version — bump when codeisland-pi.ts changes.
-    private static let piExtensionVersion = "v2"
+    private static let piExtensionVersion = "v3"
+
+    /// Current omp extension version — bump when codeisland-omp.ts changes.
+    /// Kept independent of pi (OMP reuses the "CodeIsland pi extension" banner
+    /// but ships its own resource file), so a pi-only bump does not false-flag
+    /// healthy OMP installs as needing repair.
+    private static let ompExtensionVersion = "v6"
 
     private static func piExtensionSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-pi", withExtension: "ts", subdirectory: "Resources"),
@@ -2902,7 +3027,14 @@ struct ConfigInstaller {
         ompExtensionPath: String = ompExtensionPath,
         fm: FileManager
     ) -> Bool {
-        isPiExtensionInstalled(piExtensionPath: ompExtensionPath, fm: fm)
+        guard fm.fileExists(atPath: ompExtensionPath),
+              let data = fm.contents(atPath: ompExtensionPath),
+              let content = String(data: data, encoding: .utf8)
+        else { return false }
+        // OMP ships a separate resource; do not share piExtensionVersion or a
+        // pi-only bump would force a false "needs repair" for healthy OMP installs.
+        return content.contains("CodeIsland pi extension")
+            && content.contains("// version: \(ompExtensionVersion)")
     }
 
     // MARK: - OpenClaw plugin (#235)

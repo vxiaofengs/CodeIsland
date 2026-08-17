@@ -154,6 +154,38 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
         XCTAssertTrue(cmds.contains { $0.contains("codeisland-remote-hook.py") }, "our hook missing: \(cmds)")
     }
 
+    /// #306 — remote Codex registered only SessionStart / UserPromptSubmit /
+    /// Stop, so an approval never left the remote terminal even though remote
+    /// Claude, on the same host and the same tunnel, worked. The blocking event
+    /// needs the long timeout too: the wait is on a human.
+    func testCodexInstallRegistersBlockingPermissionRequest() throws {
+        try writeJSON(["hooks": [:]], to: ".codex/hooks.json")
+
+        try runConfigureScript()
+
+        let settings = try readJSON(".codex/hooks.json")
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        let permission = try XCTUnwrap(
+            hooks["PermissionRequest"] as? [[String: Any]],
+            "no PermissionRequest hook — the approval can only be answered in the remote terminal"
+        )
+        XCTAssertTrue(commands(in: permission).contains { $0.contains("CODEISLAND_SOURCE=codex") })
+
+        let timeouts = permission.flatMap { entry -> [Int] in
+            ((entry["hooks"] as? [[String: Any]]) ?? []).compactMap { $0["timeout"] as? Int }
+        }
+        XCTAssertTrue(
+            timeouts.contains(86400),
+            "a permission prompt waits on a person; a 60s timeout would abandon it: \(timeouts)"
+        )
+
+        // The tool events the local installer registers must be there too, or the
+        // card sits on "running" with no idea what the agent is doing.
+        for event in ["PreToolUse", "PostToolUse", "SessionEnd"] {
+            XCTAssertNotNil(hooks[event] as? [[String: Any]], "missing \(event)")
+        }
+    }
+
     func testQoderInstallIsIdempotentAcrossReconnects() throws {
         let userEntry: [String: Any] = [
             "hooks": [["type": "command", "command": "echo keep-qoder", "timeout": 5]],
