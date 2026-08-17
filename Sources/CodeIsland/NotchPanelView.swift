@@ -1008,6 +1008,10 @@ private struct ApprovalBar: View {
         VStack(spacing: 8) {
             // Tool name + file context
             HStack(spacing: 6) {
+                // Says which agent is asking — and its 20fps timeline is what
+                // keeps this surface committing frames; a fully static panel
+                // loses its content (see PanelWindowController.nudgeRepaint).
+                MascotView(source: session?.source ?? "claude", status: .waitingApproval, size: 22)
                 Text("!")
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(Color(red: 1.0, green: 0.7, blue: 0.28))
@@ -1188,9 +1192,11 @@ private struct QuestionBar: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            // Session context
-            if sessionSource != nil || sessionContext != nil {
-                HStack(spacing: 5) {
+            // Session context — the mascot doubles as this surface's frame
+            // driver, same as on the approval card.
+            HStack(spacing: 5) {
+                MascotView(source: sessionSource ?? "claude", status: .waitingQuestion, size: 22)
+                if sessionSource != nil || sessionContext != nil {
                     if let src = sessionSource, let icon = cliIcon(source: src, size: 12) {
                         Image(nsImage: icon)
                             .resizable()
@@ -1204,10 +1210,10 @@ private struct QuestionBar: View {
                             .font(.system(size: 9, weight: .medium))
                             .foregroundStyle(.white.opacity(0.6))
                     }
-                    Spacer()
                 }
-                .padding(.horizontal, 14)
+                Spacer()
             }
+            .padding(.horizontal, 14)
 
             if let item = currentItem {
                 multiQuestionContent(item)

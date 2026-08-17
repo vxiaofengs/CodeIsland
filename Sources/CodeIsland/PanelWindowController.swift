@@ -363,10 +363,11 @@ class PanelWindowController: NSObject, NSWindowDelegate {
 
     private func nudgeRepaint() {
         guard let panel = panel, panel.isVisible, !isAnimatingScreenHop else { return }
-        // Only while nothing is animating: a working session keeps the mascot and
-        // the typing indicator committing frames on their own, and those sessions
-        // never showed the blank-out.
-        guard appState.activeSessionCount == 0 else { return }
+        // Unconditional backstop. It used to skip whenever a session was active,
+        // which is exactly why the approval card still blanked out: a session
+        // waiting for approval counts as active, and that card had no animation
+        // of its own. Every surface now carries a mascot, so this is only here to
+        // catch a state nobody thought about.
         // Only the nonce: it changes the rendered output by a hair, so SwiftUI
         // commits a real frame. `needsDisplay` + `display()` are worse than
         // useless here — AppKit sees SwiftUI's layers as already drawn, so the
