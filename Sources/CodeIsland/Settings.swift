@@ -39,6 +39,7 @@ enum SettingsKey {
     static let pluginSessionMode = "pluginSessionMode"  // "separate" | "merge" | "hide"
     static let hapticOnHover = "hapticOnHover"
     static let hapticIntensity = "hapticIntensity"      // 1=light, 2=medium, 3=strong
+    static let hoverExpandDelay = "hoverExpandDelay"    // seconds; 0 = expand immediately
     static let sessionTimeout = "sessionTimeout"
 
     // Display
@@ -149,6 +150,7 @@ struct SettingsDefaults {
     static let pluginSessionMode = "separate"
     static let hapticOnHover = false
     static let hapticIntensity = 1          // 1=light
+    static let hoverExpandDelay = 0.5       // seconds
     static let sessionTimeout = 30
 
     static let maxPanelHeight = 560
@@ -235,6 +237,7 @@ class SettingsManager {
             SettingsKey.pluginSessionMode: SettingsDefaults.pluginSessionMode,
             SettingsKey.hapticOnHover: SettingsDefaults.hapticOnHover,
             SettingsKey.hapticIntensity: SettingsDefaults.hapticIntensity,
+            SettingsKey.hoverExpandDelay: SettingsDefaults.hoverExpandDelay,
             SettingsKey.sessionTimeout: SettingsDefaults.sessionTimeout,
             SettingsKey.maxPanelHeight: SettingsDefaults.maxPanelHeight,
             SettingsKey.maxVisibleSessions: SettingsDefaults.maxVisibleSessions,

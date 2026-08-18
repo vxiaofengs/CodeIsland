@@ -387,6 +387,7 @@ private struct BehaviorPage: View {
     @State private var completionStyle: String = AppState.completionStyle().rawValue
     @AppStorage(SettingsKey.pluginSessionMode) private var pluginSessionMode = SettingsDefaults.pluginSessionMode
     @AppStorage(SettingsKey.hapticOnHover) private var hapticOnHover = SettingsDefaults.hapticOnHover
+    @AppStorage(SettingsKey.hoverExpandDelay) private var hoverExpandDelay = SettingsDefaults.hoverExpandDelay
     @AppStorage(SettingsKey.hapticIntensity) private var hapticIntensity = SettingsDefaults.hapticIntensity
     @AppStorage(SettingsKey.sessionTimeout) private var sessionTimeout = SettingsDefaults.sessionTimeout
     @AppStorage(SettingsKey.rotationInterval) private var rotationInterval = SettingsDefaults.rotationInterval
@@ -460,6 +461,25 @@ private struct BehaviorPage: View {
                     isOn: $autoCollapseAfterSessionJump,
                     animation: .clickJumpCollapse
                 )
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(l10n["hover_expand_delay"])
+                        Spacer()
+                        Text(hoverExpandDelay <= 0
+                             ? l10n["hover_expand_delay_instant"]
+                             : String(format: "%.1fs", hoverExpandDelay))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(
+                        value: $hoverExpandDelay,
+                        in: NotchHoverInteraction.minExpandDelay...NotchHoverInteraction.maxExpandDelay,
+                        step: NotchHoverInteraction.expandDelayStep
+                    )
+                    Text(l10n["hover_expand_delay_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     Picker(l10n["completion_notification"], selection: $completionStyle) {
                         Text(l10n["completion_style_expand"]).tag(AppState.CompletionStyle.expand.rawValue)

@@ -233,6 +233,22 @@ final class NotchHoverInteractionTests: XCTestCase {
         XCTAssertEqual(NotchHoverInteraction.nextPhase(from: .prehover, event: .collapseDelayElapsed), .prehover)
     }
 
+    func testHoverExpandDelayClampsToSliderBounds() {
+        XCTAssertEqual(NotchHoverInteraction.clampedExpandDelay(0.3), 0.3, accuracy: 0.0001)
+        // Zero is a valid choice — it means expand without waiting.
+        XCTAssertEqual(NotchHoverInteraction.clampedExpandDelay(0), 0, accuracy: 0.0001)
+        // A stale or hand-edited value must not strand the panel.
+        XCTAssertEqual(NotchHoverInteraction.clampedExpandDelay(-5), NotchHoverInteraction.minExpandDelay, accuracy: 0.0001)
+        XCTAssertEqual(NotchHoverInteraction.clampedExpandDelay(30), NotchHoverInteraction.maxExpandDelay, accuracy: 0.0001)
+    }
+
+    func testHoverExpandDelayDefaultSitsInsideTheBounds() {
+        XCTAssertGreaterThanOrEqual(SettingsDefaults.hoverExpandDelay, NotchHoverInteraction.minExpandDelay)
+        XCTAssertLessThanOrEqual(SettingsDefaults.hoverExpandDelay, NotchHoverInteraction.maxExpandDelay)
+        // Unchanged default keeps the behaviour users are used to.
+        XCTAssertEqual(SettingsDefaults.hoverExpandDelay, NotchHoverInteraction.expandDelay, accuracy: 0.0001)
+    }
+
     func testWidthScaleQuantizesAndClampsSliderValues() {
         XCTAssertEqual(NotchWidthScale.quantized(72.4), 72)
         XCTAssertEqual(NotchWidthScale.quantized(72.6), 73)

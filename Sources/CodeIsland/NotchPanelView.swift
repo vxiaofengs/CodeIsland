@@ -50,10 +50,23 @@ enum NotchHoverEvent {
 
 enum NotchHoverInteraction {
     static let prehoverAnimationDuration: TimeInterval = 0.21
+    /// Default for the user-configurable hover delay (`hoverExpandDelay`).
     static let expandDelay: TimeInterval = 0.5
     static let collapseDelay: TimeInterval = 0.5
     static let prehoverWidthDelta: CGFloat = 7
     static let prehoverScale: CGFloat = 1.004
+
+    /// Bounds for the setting's slider, shared with the width math so the UI and
+    /// the timer can't drift apart. Zero means expand on the same run-loop turn.
+    static let minExpandDelay: TimeInterval = 0
+    static let maxExpandDelay: TimeInterval = 2
+    static let expandDelayStep: TimeInterval = 0.1
+
+    /// Clamp whatever is in defaults — a stale or hand-edited value must not be
+    /// able to strand the panel behind a 30-second delay.
+    static func clampedExpandDelay(_ value: TimeInterval) -> TimeInterval {
+        Swift.min(Swift.max(value, minExpandDelay), maxExpandDelay)
+    }
 
     static func nextPhase(from phase: NotchHoverPhase, event: NotchHoverEvent) -> NotchHoverPhase {
         switch (phase, event) {
@@ -109,6 +122,7 @@ struct NotchPanelView: View {
     @AppStorage(SettingsKey.collapsedWidthScale) private var collapsedWidthScale = SettingsDefaults.collapsedWidthScale
     @AppStorage(SettingsKey.hapticOnHover) private var hapticOnHover = SettingsDefaults.hapticOnHover
     @AppStorage(SettingsKey.hapticIntensity) private var hapticIntensity = SettingsDefaults.hapticIntensity
+    @AppStorage(SettingsKey.hoverExpandDelay) private var hoverExpandDelay = SettingsDefaults.hoverExpandDelay
 
     /// Delayed hover: prevents accidental expansion when mouse passes through
     @State private var hoverTimer: Timer?
@@ -375,34 +389,20 @@ struct NotchPanelView: View {
                     withAnimation(NotchAnimation.hoverPrehover) {
                         hoverPhase = NotchHoverInteraction.nextPhase(from: hoverPhase, event: .mouseEntered)
                     }
-                    // Delay full expansion to avoid accidental triggers
+                    // Delay full expansion to avoid accidental triggers. The wait
+                    // is the user's call: a long one makes passing the pointer over
+                    // the island safe, zero makes it feel instant.
                     hoverTimer?.invalidate()
-                    hoverTimer = Timer.scheduledTimer(withTimeInterval: NotchHoverInteraction.expandDelay, repeats: false) { _ in
+                    let delay = NotchHoverInteraction.clampedExpandDelay(hoverExpandDelay)
+                    guard delay > 0 else {
+                        expandFromHover()
+                        return
+                    }
+                    hoverTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
                         Task { @MainActor in
                             // Guard: mouse may have left during the delay
                             guard isHovered else { return }
-                            if hapticOnHover {
-                                let performer = NSHapticFeedbackManager.defaultPerformer
-                                switch hapticIntensity {
-                                case 3: // strong: two taps
-                                    performer.perform(.levelChange, performanceTime: .now)
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                        performer.perform(.levelChange, performanceTime: .now)
-                                    }
-                                case 2: // medium
-                                    performer.perform(.levelChange, performanceTime: .default)
-                                default: // light
-                                    performer.perform(.alignment, performanceTime: .default)
-                                }
-                            }
-                            hoverPhase = NotchHoverInteraction.nextPhase(from: hoverPhase, event: .expandDelayElapsed)
-                            withAnimation(NotchAnimation.open) {
-                                appState.surface = .sessionList
-                                appState.cancelCompletionQueue()
-                                if appState.activeSessionId == nil {
-                                    appState.activeSessionId = appState.sessions.keys.sorted().first
-                                }
-                            }
+                            expandFromHover()
                         }
                     }
                 } else {
@@ -443,6 +443,33 @@ struct NotchPanelView: View {
         // AppState.repaintNonce). The difference has to be real for SwiftUI to
         // commit it, and 1/1000 of alpha is the smallest one that cannot be seen.
         .opacity(appState.repaintNonce.isMultiple(of: 2) ? 1 : 0.999)
+    }
+
+    /// Full expansion, reached either straight away or after the hover delay.
+    @MainActor
+    private func expandFromHover() {
+        if hapticOnHover {
+            let performer = NSHapticFeedbackManager.defaultPerformer
+            switch hapticIntensity {
+            case 3: // strong: two taps
+                performer.perform(.levelChange, performanceTime: .now)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    performer.perform(.levelChange, performanceTime: .now)
+                }
+            case 2: // medium
+                performer.perform(.levelChange, performanceTime: .default)
+            default: // light
+                performer.perform(.alignment, performanceTime: .default)
+            }
+        }
+        hoverPhase = NotchHoverInteraction.nextPhase(from: hoverPhase, event: .expandDelayElapsed)
+        withAnimation(NotchAnimation.open) {
+            appState.surface = .sessionList
+            appState.cancelCompletionQueue()
+            if appState.activeSessionId == nil {
+                appState.activeSessionId = appState.sessions.keys.sorted().first
+            }
+        }
     }
 }
 
