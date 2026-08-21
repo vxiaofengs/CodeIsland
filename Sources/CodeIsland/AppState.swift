@@ -1657,16 +1657,14 @@ final class AppState {
             responseData = Self.zcodeAlwaysAllowResponse(toolName: pending.event.toolName)
         } else if always {
             let toolName = pending.event.toolName ?? ""
-            // MCP tools (`mcp__server__tool`) don't accept a rule specifier — the
-            // rule must be the bare tool name. Sending `ruleContent: "*"` makes
-            // Claude Code assemble `mcp__server__tool(*)`, which never matches an
-            // actual MCP call, so the "always allow" rule silently fails to
-            // persist and the same approval keeps re-prompting. Non-MCP tools
-            // (Bash/Read/Edit/…) keep the `*` specifier. (#224)
-            var rule: [String: Any] = ["toolName": toolName]
-            if !toolName.hasPrefix("mcp__") {
-                rule["ruleContent"] = "*"
-            }
+            // A rule specifier is compared against the *subject* of the call —
+            // the command for Bash, the path for Read/Edit — and the vocabulary
+            // is an exact subject or a `prefix:*`. A lone `"*"` is neither, so
+            // `Bash(*)` matched nothing and every new command re-prompted; the
+            // bare tool name is the "any call of this tool" form. MCP tools were
+            // already fixed this way (#224) — the same trap applied to all the
+            // others, and ZCode's path documents it too (zcodeAlwaysAllowResponse).
+            let rule: [String: Any] = ["toolName": toolName]
             let obj: [String: Any] = [
                 "hookSpecificOutput": [
                     "hookEventName": "PermissionRequest",
