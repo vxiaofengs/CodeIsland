@@ -1,6 +1,9 @@
 import AppKit
 import ApplicationServices
 import CodeIslandCore
+import os.log
+
+private let log = Logger(subsystem: "com.codeisland", category: "Jump")
 
 /// Activates the terminal window/tab running a specific Claude Code session.
 /// Supports tab-level switching for: Ghostty, iTerm2, Terminal.app, WezTerm, kitty.
@@ -647,7 +650,7 @@ struct TerminalActivator {
                 end tell
             end try
             """
-            runAppleScript(script)
+            runAppleScript(script, purpose: "iterm-tty-or-cwd")
             return
         }
         // Strategy 2: match by cwd directory name in session name/path
@@ -676,7 +679,7 @@ struct TerminalActivator {
             end tell
         end try
         """
-        runAppleScript(script)
+        runAppleScript(script, purpose: "iterm-tty-or-cwd")
     }
 
     private static func activateITerm(sessionId: String) {
@@ -710,7 +713,7 @@ struct TerminalActivator {
             end tell
         end try
         """
-        runAppleScript(script)
+        runAppleScript(script, purpose: "iterm-session")
     }
 
     // MARK: - Terminal.app (AppleScript: match by TTY, fallback to CWD)
@@ -843,7 +846,7 @@ struct TerminalActivator {
             end tell
         end try
         """
-        runAppleScript(script)
+        runAppleScript(script, purpose: "terminal-app")
     }
 
     // MARK: - WezTerm (CLI: wezterm cli list + activate-tab)
@@ -1130,37 +1133,63 @@ struct TerminalActivator {
         if app.isHidden { app.unhide() }
         app.activate()
 
-        // Use System Events to iterate windows and AXRaise the best match.
-        // Priority: exact folder name at word boundary > shortest title containing folder name.
-        // This avoids jumping to the wrong window when multiple projects share a folder name
-        // (e.g., /work/app vs /backup/app).
+        // Window-level targeting reads the window list through System Events,
+        // which needs the Accessibility grant. Surface that once per launch and
+        // then try anyway: gating the attempt on the check re-asked on every
+        // single click, and the grant can read as ON in System Settings while
+        // still being refused — replacing the app bundle leaves a stale entry
+        // that only a toggle off/on repairs.
+        noteAccessibilityIfMissing(purpose: "ide-window(\(bundleId))")
+
+        // Raise the window belonging to this session's project. Editors title
+        // their windows "<file> — <folder>", so an anchored match on the trailing
+        // folder beats "contains": `/work/app` no longer wins over `/backup/app`,
+        // and a file *named* like the folder cannot hijack the match. A workspace
+        // window appends a localized qualifier — "… — Keep-release (工作区)" —
+        // so the anchor also accepts the folder followed by one parenthesised
+        // suffix, which is otherwise left to the loose fallback. Falls back to
+        // the shortest containing title for editors that title differently.
         let appName = app.localizedName ?? "Application"
         let escapedFolder = escapeAppleScript(folderName)
         let script = """
         tell application "System Events"
             tell process "\(escapeAppleScript(appName))"
                 set frontmost to true
-                set bestWindow to missing value
-                set bestLen to 999999
+                set exactWindow to missing value
+                set fallbackWindow to missing value
+                set fallbackLen to 999999
                 repeat with w in windows
                     try
                         set wName to name of w as text
-                        if wName contains "\(escapedFolder)" then
+                        set isAnchored to false
+                        if wName ends with "\(escapedFolder)" then
+                            set isAnchored to true
+                        else if wName contains ("\(escapedFolder)" & " (") and wName ends with ")" then
+                            set isAnchored to true
+                        end if
+                        if isAnchored then
+                            if exactWindow is missing value then set exactWindow to w
+                        else if wName contains "\(escapedFolder)" then
                             set wLen to count of wName
-                            if wLen < bestLen then
-                                set bestWindow to w
-                                set bestLen to wLen
+                            if wLen < fallbackLen then
+                                set fallbackWindow to w
+                                set fallbackLen to wLen
                             end if
                         end if
                     end try
                 end repeat
-                if bestWindow is not missing value then
-                    perform action "AXRaise" of bestWindow
+                if exactWindow is not missing value then
+                    perform action "AXRaise" of exactWindow
+                    return "raised-anchored"
+                else if fallbackWindow is not missing value then
+                    perform action "AXRaise" of fallbackWindow
+                    return "raised-fallback"
                 end if
+                return "no-match"
             end tell
         end tell
         """
-        runAppleScript(script)
+        runAppleScript(script, purpose: "ide-window(\(bundleId))")
     }
 
     // MARK: - Generic terminal window matching (Alacritty, Warp, Hyper, etc.)
@@ -1195,7 +1224,7 @@ struct TerminalActivator {
             end tell
         end tell
         """
-        runAppleScript(script)
+        runAppleScript(script, purpose: "terminal-window")
     }
 
     private static func activateHerdrIfAvailable(
@@ -1291,12 +1320,24 @@ struct TerminalActivator {
             app.activate()
             return
         }
-        // Fallback: open -a (app not running yet)
+        // Fallback: launch the terminal that isn't running yet — but only one we
+        // actually recognise. `name` can still be the raw TERM_PROGRAM value that
+        // matched none of the cases above, and `open -a <not an app>` puts a
+        // Finder error dialog ("The application cannot be opened. -50") on the
+        // user's screen for what was only ever a best-effort jump.
+        guard knownTerminals.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            log.error("bring-to-front: \(name, privacy: .public) is not a known terminal — not launching anything")
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
             proc.arguments = ["-a", name]
-            try? proc.run()
+            do {
+                try proc.run()
+            } catch {
+                log.error("bring-to-front: launching \(name, privacy: .public) failed — \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
@@ -1312,14 +1353,53 @@ struct TerminalActivator {
         return "Terminal"
     }
 
-    private static func runAppleScript(_ source: String) {
+    /// Window- and tab-level targeting all runs through here, and every caller
+    /// used to discard the error. When System Events is refused — no Accessibility
+    /// grant is error -1728 — the precise jump silently became a plain app
+    /// activation, which lands on whatever window was last used. That is
+    /// indistinguishable from "the jump is just inaccurate", so name it.
+    private static func runAppleScript(_ source: String, purpose: String = "applescript") {
         DispatchQueue.global(qos: .userInitiated).async {
-            if let script = NSAppleScript(source: source) {
-                var error: NSDictionary?
-                script.executeAndReturnError(&error)
+            guard let script = NSAppleScript(source: source) else {
+                log.error("\(purpose, privacy: .public): could not compile the script")
+                return
             }
+            var error: NSDictionary?
+            let result = script.executeAndReturnError(&error)
+            guard let error else {
+                // Scripts that pick a window report which rule matched. Only the
+                // miss is worth a line: it is the one outcome that looks like a
+                // working jump to the wrong place.
+                if result.stringValue == "no-match" {
+                    log.notice("\(purpose, privacy: .public): no window matched the session's folder")
+                }
+                return
+            }
+            let code = (error[NSAppleScript.errorNumber] as? Int) ?? 0
+            let message = (error[NSAppleScript.errorMessage] as? String) ?? "unknown error"
+            let reason: String
+            switch code {
+            case Self.errAXNotTrusted, Self.errAXAPIDisabled:
+                reason = "System Events refused: no Accessibility grant (toggle it off and on — "
+                    + "replacing the app bundle leaves the entry looking enabled but stale)"
+            case Self.errAppleEventsNotAllowed:
+                reason = "Apple Events to System Events not allowed: approve it under "
+                    + "Privacy & Security → Automation → CodeIsland"
+            default:
+                reason = message
+            }
+            log.error("\(purpose, privacy: .public): failed (\(code)) \(reason, privacy: .public)")
         }
     }
+
+    /// "not allowed assistive access" — the Accessibility grant is missing.
+    /// Both codes mean that: -1728 comes from AppleScript itself, -25211
+    /// (kAXErrorAPIDisabled) is what System Events forwards, and that is the one
+    /// actually seen in the field.
+    private static let errAXNotTrusted = -1728
+    private static let errAXAPIDisabled = -25211
+    /// "Not authorized to send Apple events" — the Automation grant is missing.
+    private static let errAppleEventsNotAllowed = -1743
 
     private static func runOsaScript(_ source: String) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -1507,5 +1587,25 @@ struct TerminalActivator {
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt
         ] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
+    }
+
+    private static let accessibilityNoticeLock = NSLock()
+    private static var accessibilityNoticeShown = false
+
+    /// Ask for the Accessibility grant at most once per launch. The system panel
+    /// is modal-ish and appears on every call while untrusted, so prompting from
+    /// a click handler turns a missing grant into a dialog on every click.
+    private static func noteAccessibilityIfMissing(purpose: String) {
+        guard !hasAccessibilityPermission(prompt: false) else { return }
+        log.error("""
+            \(purpose, privacy: .public): no Accessibility grant — window targeting \
+            will be refused, only the app comes forward
+            """)
+        accessibilityNoticeLock.lock()
+        let alreadyShown = accessibilityNoticeShown
+        accessibilityNoticeShown = true
+        accessibilityNoticeLock.unlock()
+        guard !alreadyShown else { return }
+        _ = hasAccessibilityPermission(prompt: true)
     }
 }
