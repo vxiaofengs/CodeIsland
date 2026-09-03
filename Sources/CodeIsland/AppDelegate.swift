@@ -70,6 +70,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         ESP32BridgeManager.shared.onControlCommand = { [weak appState] command in
             guard let appState else { return }
+            // The hardware Buddy shows whatever is featured and has no session
+            // id on the wire, so it keeps acting on the head of the queue.
             appState.handleBuddyControlCommand(command)
         }
         AppleCompanionPublisher.shared.attach(appState)
@@ -77,13 +79,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let appState else { return }
             ESP32FocusCoordinator.handle(mascot: mascot, appState: appState)
         }
-        AppleCompanionPublisher.shared.onControlCommand = { [weak appState] command in
+        AppleCompanionPublisher.shared.onControlCommand = { [weak appState] command, sessionId in
             guard let appState else { return }
-            appState.handleBuddyControlCommand(command)
+            appState.handleBuddyControlCommand(command, expectedSessionId: sessionId)
         }
-        AppleCompanionPublisher.shared.onQuestionAnswer = { [weak appState] answer in
+        AppleCompanionPublisher.shared.onQuestionAnswer = { [weak appState] answer, sessionId in
             guard let appState else { return }
-            appState.answerCompanionQuestion(answer)
+            appState.answerCompanionQuestion(answer, expectedSessionId: sessionId)
         }
         let buddyEnabled = UserDefaults.standard.bool(forKey: SettingsKey.esp32BridgeEnabled)
         let buddySyncInterval = UserDefaults.standard.double(forKey: SettingsKey.esp32HeartbeatSeconds)

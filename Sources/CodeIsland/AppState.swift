@@ -616,6 +616,28 @@ final class AppState {
         return pid_t(info.pbi_ppid)
     }
 
+    /// Both bundle names the Qoder IDE has shipped under, lowercased.
+    ///
+    /// Qoder IDE 1.25.1 (2026-08-19) renamed the macOS bundle from `Qoder.app`
+    /// to `Qoder IDE.app` and its executable from `Electron` to `Qoder` — so
+    /// matching on `/qoder.app/contents/` alone stopped recognising the IDE
+    /// entirely (#327). Both names stay listed: the rename doesn't reach
+    /// installs that haven't updated. `com.qoder.ide` is unchanged, so
+    /// activation and badge labels were never affected — only the
+    /// process-ancestry matching that runs off executable paths.
+    ///
+    /// Neither prefix collides with QoderWork's `/qoderwork.app/`.
+    nonisolated static let qoderIDEBundlePrefixes = [
+        "/qoder.app/contents/",
+        "/qoder ide.app/contents/",
+    ]
+
+    /// Is `executablePath` inside a Qoder IDE bundle, under either name?
+    nonisolated static func isQoderIDEBundlePath(_ executablePath: String) -> Bool {
+        let path = executablePath.lowercased()
+        return qoderIDEBundlePrefixes.contains { path.contains($0) }
+    }
+
     private nonisolated static func isNativeAppProcess(_ pid: pid_t, source: String) -> Bool {
         guard let executable = executablePath(for: pid) else { return false }
         let path = executable.lowercased()
@@ -623,7 +645,7 @@ final class AppState {
         case "cursor":     return path.contains("/cursor.app/contents/")
         case "trae":       return path.contains("/trae.app/contents/")
         case "traecn":     return path.contains("/trae.app/contents/") || path.contains("/traecn.app/contents/")
-        case "qoder":      return path.contains("/qoder.app/contents/")
+        case "qoder":      return isQoderIDEBundlePath(path)
         // QoderWork desktop app (#249) — bundle id undocumented; the standard
         // /Applications/QoderWork.app layout is assumed, pending real-install
         // verification.
@@ -1371,7 +1393,8 @@ final class AppState {
         // approved in the terminal — resume those (and only those) as approved.
         resolveOrphanPermissionsOnActivity(event)
 
-        let effects = reduceEvent(sessions: &sessions, event: event, maxHistory: maxHistory)
+        let effects = reduceEvent(sessions: &sessions, event: event, maxHistory: maxHistory,
+                                  replyCompletePlaceholder: L10n.shared["reply_complete_placeholder"])
 
         // Cursor Agent Tasks often fire Claude-format hooks without `--source`,
         // leaving ghost Claude cards. Rebrand + fold before the rest of the
@@ -1737,32 +1760,47 @@ final class AppState {
         return (try? JSONSerialization.data(withJSONObject: obj)) ?? plainAllow
     }
 
-    func handleBuddyControlCommand(_ command: BuddyControlCommand) {
+    /// `expectedSessionId` is the session the remote surface was showing when
+    /// the button was pressed. The hardware Buddy has no session identity to
+    /// send and passes nil, keeping its head-of-queue behaviour; the iPhone
+    /// does send one, so a tap resolves against the card the user actually saw
+    /// — the #308 failure mode, which the panel fixed in #310 but this path
+    /// never did. A round trip over Bluetooth makes the race wider here than
+    /// it ever was on the panel.
+    func handleBuddyControlCommand(_ command: BuddyControlCommand, expectedSessionId: String? = nil) {
         switch command {
         case .approveCurrentPermission:
             if !permissionQueue.isEmpty {
-                approvePermission()
+                approvePermission(expectedSessionId: expectedSessionId)
             } else {
                 log.info("Ignored Buddy approve command because permission queue is empty")
             }
         case .denyCurrentPermission:
             if !permissionQueue.isEmpty {
-                denyPermission()
+                denyPermission(expectedSessionId: expectedSessionId)
             } else {
                 log.info("Ignored Buddy deny command because permission queue is empty")
             }
         case .skipCurrentQuestion:
             if !questionQueue.isEmpty {
-                skipQuestion()
+                skipQuestion(expectedSessionId: expectedSessionId)
             } else {
                 log.info("Ignored Buddy skip command because question queue is empty")
             }
         }
     }
 
-    func answerCompanionQuestion(_ answer: String) {
+    /// See `handleBuddyControlCommand` for why `expectedSessionId` matters.
+    func answerCompanionQuestion(_ answer: String, expectedSessionId: String? = nil) {
         guard !questionQueue.isEmpty else {
             log.info("Ignored companion question answer because question queue is empty")
+            return
+        }
+        if let expectedSessionId,
+           questionQueue.first?.event.sessionId ?? "default" != expectedSessionId {
+            // The card the phone was showing is no longer at the head. Route by
+            // identity rather than answering a question the user never read.
+            answerQuestion(answer, expectedSessionId: expectedSessionId)
             return
         }
 
@@ -2810,6 +2848,9 @@ final class AppState {
             snapshot.zellijPaneId = p.zellijPaneId
             snapshot.zellijSessionName = p.zellijSessionName
             snapshot.weztermPaneId = p.weztermPaneId
+            snapshot.herdrPaneId = p.herdrPaneId
+            snapshot.herdrSocketPath = p.herdrSocketPath
+            snapshot.herdrBinaryPath = p.herdrBinaryPath
             snapshot.lastActivity = p.lastActivity
             snapshot.transcriptPath = p.transcriptPath
             if let closed = p.closedSubagentIds, !closed.isEmpty {
@@ -4018,6 +4059,9 @@ final class AppState {
                 child.zellijPaneId = child.zellijPaneId ?? parent.session.zellijPaneId
                 child.zellijSessionName = child.zellijSessionName ?? parent.session.zellijSessionName
                 child.weztermPaneId = child.weztermPaneId ?? parent.session.weztermPaneId
+                child.herdrPaneId = child.herdrPaneId ?? parent.session.herdrPaneId
+                child.herdrSocketPath = child.herdrSocketPath ?? parent.session.herdrSocketPath
+                child.herdrBinaryPath = child.herdrBinaryPath ?? parent.session.herdrBinaryPath
                 child.remoteHostId = child.remoteHostId ?? parent.session.remoteHostId
                 child.remoteHostName = child.remoteHostName ?? parent.session.remoteHostName
                 // Keep the child's own process identity only — the parent Cursor chat
@@ -4416,13 +4460,15 @@ final class AppState {
         )
     }
 
+    /// The IDE's main and helper processes, under either bundle name (#327).
+    /// The executable was renamed alongside the bundle (`Electron` → `Qoder`),
+    /// so the main process is matched by its `MacOS/` directory rather than by
+    /// a binary name that also changed.
     private nonisolated static func findQoderPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
         findPids(
-            matchingPathSubstrings: [
-                "/qoder.app/contents/macos/electron",
-                "/qoder.app/contents/frameworks/qoder helper",
-                "/.qoder/bin/qodercli/",
-            ],
+            matchingPathSubstrings: qoderIDEBundlePrefixes.flatMap {
+                ["\($0)macos/", "\($0)frameworks/qoder helper"]
+            } + ["/.qoder/bin/qodercli/"],
             candidatePids: candidatePids
         )
     }

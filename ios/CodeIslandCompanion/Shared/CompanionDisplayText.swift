@@ -206,3 +206,40 @@ enum CompanionDisplayText {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
+/// Aggregates several sessions into the one status and one number the compact
+/// Dynamic Island has room for (#330).
+///
+/// Pure string-in / string-out so it can be exercised without ActivityKit,
+/// which is unavailable on macOS.
+enum CompanionSessionSummary {
+    static let idleStatus = "idle"
+
+    /// Sessions that are not idle. Matches `ContentState.activeSessionCount`.
+    static func activeCount(statuses: [String]) -> Int {
+        statuses.filter { $0 != idleStatus }.count
+    }
+
+    /// The status a single dot should show for a group of sessions.
+    ///
+    /// Ordered by what the user has to act on: anything blocked on them
+    /// outranks anything merely running, and running outranks idle. Showing
+    /// the featured session's status instead — which is what the compact view
+    /// used to do — hides an approval waiting in a session that isn't the one
+    /// on screen.
+    static func aggregateStatus(statuses: [String]) -> String {
+        let priority = ["waitingApproval", "waitingQuestion", "processing", "running"]
+        for status in priority where statuses.contains(status) {
+            return status
+        }
+        return idleStatus
+    }
+
+    /// `active/total`, e.g. `2/3`. The compact trailing slot previously held
+    /// the literal word "Sessions", which never changed — so a session
+    /// finishing left the whole compact island looking identical, since the
+    /// total on the leading side only drops once the Mac retires the session.
+    static func activityRatio(statuses: [String]) -> String {
+        "\(activeCount(statuses: statuses))/\(statuses.count)"
+    }
+}

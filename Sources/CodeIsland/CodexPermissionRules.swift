@@ -118,15 +118,21 @@ struct CodexPermissionRules {
     private func persistMCPToolApproval(serverID: String, toolName: String) -> Bool {
         let configPath = ConfigInstaller.codexHome() + "/config.toml"
         let configDirectory = (configPath as NSString).deletingLastPathComponent
-        let targetPath = ["mcp_servers", serverID, "tools", toolName]
 
         do {
             try fileManager.createDirectory(atPath: configDirectory, withIntermediateDirectories: true)
             let existing = (try? String(contentsOfFile: configPath, encoding: .utf8)) ?? ""
+            // Codex rejects the whole config.toml when a `mcp_servers.*` table has
+            // no transport, so a tools table under a server we never declared (the
+            // built-in `codex_app` namespace, say) would break every unrelated
+            // setting. Approve the call in-session instead of persisting it.
+            guard let declaredID = Self.declaredMCPServerID(in: existing, forToolNamespace: serverID) else {
+                return false
+            }
             let updated = Self.configWithMCPToolApproval(
                 existing,
-                tablePath: targetPath,
-                comment: #"Added by CodeIsland when "Always Allow" is clicked for a Codex MCP tool."#
+                tablePath: ["mcp_servers", declaredID, "tools", toolName],
+                comment: String(Self.mcpToolApprovalComment.dropFirst(2))
             )
             try updated.write(toFile: configPath, atomically: true, encoding: .utf8)
             return true
@@ -148,6 +154,163 @@ struct CodexPermissionRules {
         let toolName = String(rest[separator.upperBound...])
         guard !serverID.isEmpty, !toolName.isEmpty else { return nil }
         return (serverID, toolName)
+    }
+
+    /// The exact comment CodeIsland stamps above every approval table it writes.
+    /// Only tables carrying it are considered ours to repair.
+    static let mcpToolApprovalComment =
+        #"# Added by CodeIsland when "Always Allow" is clicked for a Codex MCP tool."#
+
+    /// Heals config.toml files already broken by the #316 write.
+    ///
+    /// Versions before this fix wrote `[mcp_servers.<namespace>.tools.<tool>]`
+    /// using the sanitised namespace from the tool name. When no server is
+    /// declared under that exact key, the table is implicitly created without a
+    /// transport and Codex rejects the entire file — so the user stays broken
+    /// after upgrading unless the stale table is cleaned up for them.
+    ///
+    /// Only tables stamped with `mcpToolApprovalComment` are touched: an
+    /// approval the user wrote by hand is theirs, however it is spelled. A table
+    /// whose namespace maps unambiguously onto a declared server is re-pointed
+    /// at the real key rather than dropped, so the approval survives the repair.
+    ///
+    /// Returns nil when there is nothing to change, so callers never rewrite a
+    /// healthy file.
+    static func repairingOrphanedMCPToolTables(_ contents: String) -> String? {
+        var lines = contents.components(separatedBy: .newlines)
+        let hadTrailingNewline = contents.hasSuffix("\n")
+        if hadTrailingNewline { lines.removeLast() }
+
+        var changed = false
+        var index = 0
+        while index < lines.count {
+            guard let segments = tomlTableSegments(from: lines[index]),
+                  segments.count == 4,
+                  segments[0] == "mcp_servers",
+                  segments[2] == "tools",
+                  index > 0,
+                  isOurApprovalComment(lines[index - 1]),
+                  !configDeclaresMCPServerTransport(contents, serverID: segments[1]) else {
+                index += 1
+                continue
+            }
+
+            let namespace = segments[1]
+            let candidates = declaredMCPServerIDs(in: contents)
+                .filter { sanitizedToolNamespace($0) == namespace }
+
+            if candidates.count == 1 {
+                lines[index] = "[" + ([ "mcp_servers", candidates[0], "tools", segments[3] ])
+                    .map(tomlKeySegment)
+                    .joined(separator: ".") + "]"
+                changed = true
+                index += 1
+                continue
+            }
+
+            // Nothing to re-point it at: drop the comment, the header, and the
+            // table body up to the next header.
+            var end = index + 1
+            while end < lines.count, tomlTableSegments(from: lines[end]) == nil {
+                end += 1
+            }
+            lines.removeSubrange((index - 1)..<end)
+            index -= 1
+            changed = true
+        }
+
+        guard changed else { return nil }
+        // Collapse the blank runs a removal can leave behind, without touching
+        // spacing the user wrote elsewhere.
+        var collapsed: [String] = []
+        for line in lines {
+            if line.trimmingCharacters(in: .whitespaces).isEmpty,
+               collapsed.last?.trimmingCharacters(in: .whitespaces).isEmpty == true {
+                continue
+            }
+            collapsed.append(line)
+        }
+        while collapsed.last?.trimmingCharacters(in: .whitespaces).isEmpty == true {
+            collapsed.removeLast()
+        }
+        return collapsed.joined(separator: "\n") + "\n"
+    }
+
+    private static func isOurApprovalComment(_ line: String?) -> Bool {
+        guard let line else { return false }
+        return line.trimmingCharacters(in: .whitespaces) == mcpToolApprovalComment
+    }
+
+    /// The config.toml table key to write a tool approval under, for the server
+    /// namespace that appears in an `mcp__<namespace>__<tool>` tool name.
+    ///
+    /// The namespace is not always the server key. A tool name uses `__` as its
+    /// separator, so Codex sanitises the server name into it — `davinci-resolve`
+    /// arrives as `davinci_resolve` (#316). Writing the namespace verbatim then
+    /// creates a *second*, transport-less `[mcp_servers.davinci_resolve]` table
+    /// and Codex refuses to load the file at all, which surfaces as unrelated
+    /// settings failing to save days after the click that caused it.
+    ///
+    /// Returns nil when nothing declared matches, so the caller approves in
+    /// session rather than persisting a table that would invalidate the config.
+    static func declaredMCPServerID(in contents: String, forToolNamespace namespace: String) -> String? {
+        if configDeclaresMCPServerTransport(contents, serverID: namespace) {
+            return namespace
+        }
+
+        // Only a sanitisation difference is worth recovering. An ambiguous match
+        // (two declared servers collapsing to the same namespace) is left alone:
+        // approving the wrong server is worse than not persisting.
+        let candidates = declaredMCPServerIDs(in: contents)
+            .filter { sanitizedToolNamespace($0) == namespace }
+        return candidates.count == 1 ? candidates[0] : nil
+    }
+
+    /// Every `[mcp_servers.<id>]` that declares a transport.
+    static func declaredMCPServerIDs(in contents: String) -> [String] {
+        let lines = contents.components(separatedBy: .newlines)
+        var ids: [String] = []
+        for (index, line) in lines.enumerated() {
+            guard let segments = tomlTableSegments(from: line),
+                  segments.count == 2,
+                  segments[0] == "mcp_servers" else {
+                continue
+            }
+            let endIndex = lines[(index + 1)...].firstIndex(where: { tomlTableSegments(from: $0) != nil })
+                ?? lines.endIndex
+            let declaresTransport = lines[(index + 1)..<endIndex].contains { body in
+                guard let key = tomlKey(from: body) else { return false }
+                return key == "command" || key == "url"
+            }
+            if declaresTransport, !ids.contains(segments[1]) {
+                ids.append(segments[1])
+            }
+        }
+        return ids
+    }
+
+    /// How a server name reaches us inside a tool name: anything that isn't a
+    /// TOML bare-key character becomes `_`, since `__` is the field separator.
+    static func sanitizedToolNamespace(_ serverID: String) -> String {
+        String(serverID.map { character in
+            character.isLetter || character.isNumber || character == "_" ? character : "_"
+        })
+    }
+
+    static func configDeclaresMCPServerTransport(_ contents: String, serverID: String) -> Bool {
+        let lines = contents.components(separatedBy: .newlines)
+        guard let headerIndex = lines.firstIndex(where: {
+            tomlTableSegments(from: $0) == ["mcp_servers", serverID]
+        }) else {
+            return false
+        }
+
+        let endIndex = lines[(headerIndex + 1)...].firstIndex(where: { tomlTableSegments(from: $0) != nil })
+            ?? lines.endIndex
+        return lines[(headerIndex + 1)..<endIndex].contains { line in
+            guard let key = tomlKey(from: line) else { return false }
+            return key == "command" || key == "url"
+        }
     }
 
     static func configWithMCPToolApproval(_ contents: String, tablePath: [String], comment: String) -> String {

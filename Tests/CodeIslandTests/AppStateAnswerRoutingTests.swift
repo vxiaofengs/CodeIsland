@@ -443,6 +443,83 @@ final class AppStateAnswerRoutingTests: XCTestCase {
         XCTAssertNil(IslandSurface.completionCard(sessionId: "c").questionSessionId)
     }
 
+    // MARK: - iPhone Buddy
+
+    /// #320/#308 — the phone names the session its card was showing. Without
+    /// that, a tap resolved against the head of the queue, and a Bluetooth
+    /// round trip makes the window for another request to arrive far wider
+    /// than it ever was on the panel: you approve something you never saw.
+    func testCompanionApproveTargetsTheSessionThePhoneWasShowing() async throws {
+        let appState = AppState()
+        let first = try makePermissionRequestEvent(sessionId: "s-first", command: "rm -rf /")
+        let second = try makePermissionRequestEvent(sessionId: "s-second", command: "echo 2")
+
+        _ = Task<Data, Never> {
+            await withCheckedContinuation { appState.handlePermissionRequest(first, continuation: $0) }
+        }
+        await Task.yield()
+        let secondResponse = Task<Data, Never> {
+            await withCheckedContinuation { appState.handlePermissionRequest(second, continuation: $0) }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.permissionQueue.count, 2)
+
+        appState.handleBuddyControlCommand(.approveCurrentPermission, expectedSessionId: "s-second")
+
+        guard assertQueue(
+            appState.permissionQueue.map { $0.event.sessionId },
+            ["s-first"],
+            "the phone's approve must dequeue the session it named, not the queue head"
+        ) else { return }
+        let behavior = try extractPermissionBehavior(from: await secondResponse.value)
+        XCTAssertEqual(behavior, "allow")
+    }
+
+    /// The hardware Buddy shows whatever is featured and puts no session id on
+    /// the wire, so it keeps acting on the head of the queue. Passing nil must
+    /// stay equivalent to the old behaviour.
+    func testHardwareBuddyWithoutASessionIdStillActsOnTheQueueHead() async throws {
+        let appState = AppState()
+        let first = try makePermissionRequestEvent(sessionId: "s-first", command: "echo 1")
+
+        let firstResponse = Task<Data, Never> {
+            await withCheckedContinuation { appState.handlePermissionRequest(first, continuation: $0) }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.permissionQueue.count, 1)
+
+        appState.handleBuddyControlCommand(.approveCurrentPermission)
+
+        guard assertQueue(appState.permissionQueue.map { $0.event.sessionId }, [], "head of queue") else { return }
+        let headBehavior = try extractPermissionBehavior(from: await firstResponse.value)
+        XCTAssertEqual(headBehavior, "allow")
+    }
+
+    func testCompanionAnswerTargetsTheSessionThePhoneWasShowing() async throws {
+        let appState = AppState()
+        let first = try makeNotificationQuestionEvent(sessionId: "s-first", text: "First?")
+        let second = try makeNotificationQuestionEvent(sessionId: "s-second", text: "Second?")
+
+        _ = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleQuestion(first, continuation: $0) }
+        }
+        await Task.yield()
+        let secondResponse = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleQuestion(second, continuation: $0) }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.questionQueue.count, 2)
+
+        appState.answerCompanionQuestion("from the phone", expectedSessionId: "s-second")
+
+        guard assertQueue(
+            appState.questionQueue.map { $0.event.sessionId },
+            ["s-first"],
+            "the phone's answer must dequeue the session it named"
+        ) else { return }
+        _ = await secondResponse.value
+    }
+
     // MARK: - Helpers
 
     /// Assert the post-action queue, and report whether it held. Every await in

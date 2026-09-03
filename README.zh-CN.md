@@ -26,13 +26,13 @@ CodeIsland 住在你 MacBook 的刘海区域，实时展示 AI 编码 Agent 的�
 ## 功能特性
 
 - **刘海原生 UI** — 从 MacBook 刘海处展开，空闲时自动收起
-- **支持 14 种 AI 工具** — Claude Code、Codex、Grok CLI、Gemini CLI、Cursor、Copilot、Trae/Traecli、Qoder、Factory、CodeBuddy、OpenCode、Kimi Code CLI、Cline、Pi / Oh My Pi
+- **支持 15 种 AI 工具** — Claude Code、Codex、Grok CLI、Gemini CLI、Cursor、Copilot、Trae/Traecli、Qoder、Factory、CodeBuddy、OpenCode、Kimi Code CLI、Cline、Pi / Oh My Pi、DeepSeek Harness
 - **实时状态追踪** — 查看活跃会话、工具调用和 AI 回复
 - **权限管理** — 直接在面板上审批/拒绝工具权限请求
 - **问题回答** — 无需离开当前应用即可回答 Agent 的问题
 - **像素风角色** — 每个 AI 工具都有专属的像素动画角色
-- **一键跳转** — 点击会话直接跳转到对应的终端标签页或 IDE 窗口
-- **智能通知抑制** — 标签页级终端检测：只在你正在看该会话的标签页时抑制通知，而不是整个终端应用
+- **一键跳转** — 点击会话直接跳转到对应的终端标签页、IDE 窗口或 Herdr Agent 面板
+- **智能通知抑制** — 标签页与 Herdr 面板级检测：只在你正在看该会话时抑制通知，而不是整个终端应用
 - **音效提示** — 可选的 8-bit 风格音效通知
 - **自动安装 Hook** — 自动为所有检测到的 CLI 工具配置 hooks，支持自动修复和版本追踪
 - **iPhone 与 Apple Watch Buddy** — 将会话状态同步到灵动岛、锁屏、StandBy 和 Apple Watch
@@ -57,6 +57,7 @@ CodeIsland 住在你 MacBook 的刘海区域，实时展示 AI 编码 Agent 的�
 | <img src="docs/images/mascots/opencode.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/opencode.png" width="16"> OpenCode | All | APP/终端 | 完整 |
 | <img src="docs/images/mascots/cline.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/cline.png" width="16"> Cline | 5 | VSCode | 完整 |
 | | <img src="Sources/CodeIsland/Resources/cli-icons/pi.png" width="16"> Pi / Oh My Pi | 8 | 终端 | 完整 |
+| | <img src="Sources/CodeIsland/Resources/cli-icons/dsh.png" width="16"> DeepSeek Harness | 9 | 终端 | 完整 |
 
 ## 安装
 
@@ -85,6 +86,14 @@ Code Island Buddy 已在 App Store 上架：
 iPhone App 可以把 Mac 上的会话状态同步到灵动岛、锁屏、StandBy 和 Apple Watch。它的工作方式很轻量：iPhone App 前台打开时，Mac 端通过本地网络发送会话快照；需要后台刷新实时活动和手表状态时，则通过蓝牙发送压缩后的状态摘要。
 
 Code Island Buddy 完全免费，并且开源。它不需要账号，也不依赖外部服务器；伴随端源码就在本仓库的 `ios/CodeIslandCompanion` 和 `apple-companion` 目录中。
+
+**开始使用：** Mac 端打开 **设置 → Buddy → iPhone Buddy**，勾选「允许 iPhone Buddy 发现这台 Mac」。同一 Wi-Fi 下打开手机 App 即可配对，配对成功后 Mac 端这里会显示已连接的设备名。首次连接时 macOS 会请求本地网络与蓝牙权限，两个都要允许——本地网络负责前台的完整快照，蓝牙负责 App 退到后台后刷新实时活动和手表状态。同一区块的「同步间隔」控制推送频率。
+
+### 硬件桌宠 Buddy（ESP32）
+
+除了手机端，CodeIsland 还支持一颗放在桌上的 ESP32 小屏幕，通过 BLE 实时播放当前 Agent 状态对应的像素动画（空闲睡觉 / 敲代码 / 等审批 / 等回答）。
+
+完整的硬件清单、固件烧录和配对步骤见 **[hardware/README.md](hardware/README.md)**（中文，含开发板型号与购买参考）。Mac 端的开关在 **设置 → Buddy** 的硬件 Buddy 区块。
 
 ### 从源码构建
 
@@ -117,6 +126,16 @@ AI 工具 (Claude/Codex/Gemini/Cursor/...)
 CodeIsland 在每个 AI 工具的配置中安装轻量级 hooks。当工具触发事件（会话开始、工具调用、权限请求等）时，hook 通过 Unix socket 发送 JSON 消息。CodeIsland 监听此 socket 并即时更新刘海面板。
 
 **OpenCode** 使用 JS 插件直接连接 socket，无需 bridge 二进制。
+
+**Codex** 多一步，而且这一步只能你自己做：Codex 不会执行没给它过目的 hook。装好之后启动 Codex，它会提示 `1 hook needs review before it can run.`，执行 `/hooks` 把 CodeIsland 的条目 review 并信任即可。在此之前 Codex 对这些 hook 不做任何事，也不报错——看起来就跟 CodeIsland 不支持 Codex 一模一样。Codex 会在 `~/.codex/config.toml` 的 `[hooks.state]` 里按内容哈希记录信任状态，所以 CodeIsland 更新重写了 `~/.codex/hooks.json` 之后，需要再 review 一次。
+
+**DeepSeek Harness（DSH）** 通过 [dsh-island](https://github.com/cdxiaodong/dsh-island) cordis 插件接入：插件监听 DSH 内置事件（`session/created`、`tools/pre-execute`、`approval/request` 等），把同样的 JSON 写入 Unix socket。在 DSH 内安装：
+
+```bash
+dsh plugin --profile <profile> add github:cdxiaodong/dsh-island
+```
+
+DSH 是插件原生运行时，因此无需安装任何 hook 配置 —— CodeIsland 只需识别 `dsh` source 即可渲染它的会话卡片。
 
 ## 设置
 
@@ -151,12 +170,12 @@ CodeIsland 提供 7 个标签页的设置面板：
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=wxtsky%2FCodeIsland&type=date&legend=bottom-right">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=wxtsky/CodeIsland&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
- </picture>
+<a href="https://star-history.dera.page/#wxtsky/CodeIsland&type=date&legend=bottom-right">
+   <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
+   </picture>
 </a>
 
 ## 许可证

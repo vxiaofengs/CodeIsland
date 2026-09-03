@@ -20,9 +20,13 @@ final class AppleCompanionPublisher: NSObject, ObservableObject {
     var bluetoothAdvertising: Bool { bluetooth.advertising }
     var bluetoothSubscribed: Bool { bluetooth.hasSubscribers }
 
-    var onControlCommand: ((BuddyControlCommand) -> Void)?
+    /// The phone names the session its card was showing. Passing it on keeps a
+    /// tap acting on what the user actually saw rather than on whatever reached
+    /// the head of the queue in the meantime (#308/#310, still live on this
+    /// path). Nil only when an older companion build sends no session id.
+    var onControlCommand: ((BuddyControlCommand, String?) -> Void)?
     var onFocusRequest: ((MascotID) -> Void)?
-    var onQuestionAnswer: ((String) -> Void)?
+    var onQuestionAnswer: ((String, String?) -> Void)?
 
     private weak var appState: AppState?
     private let peerID: MCPeerID
@@ -125,15 +129,15 @@ final class AppleCompanionPublisher: NSObject, ObservableObject {
         case .requestCurrentState:
             flush(reason: "requested")
         case .approveCurrentPermission:
-            onControlCommand?(.approveCurrentPermission)
+            onControlCommand?(.approveCurrentPermission, command.sessionId)
         case .denyCurrentPermission:
-            onControlCommand?(.denyCurrentPermission)
+            onControlCommand?(.denyCurrentPermission, command.sessionId)
         case .skipCurrentQuestion:
-            onControlCommand?(.skipCurrentQuestion)
+            onControlCommand?(.skipCurrentQuestion, command.sessionId)
         case .answerQuestion:
             if let answer = command.answer?.trimmingCharacters(in: .whitespacesAndNewlines),
                !answer.isEmpty {
-                onQuestionAnswer?(answer)
+                onQuestionAnswer?(answer, command.sessionId)
             }
         case .focus:
             onFocusRequest?(MascotID(sourceName: command.source) ?? .claude)

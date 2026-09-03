@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+## [v1.0.33] - 2026-09-01
+
+### English
+- Qoder IDE is recognised again after its rename — 1.25.1 renamed the bundle to `Qoder IDE.app` and its executable from `Electron` to `Qoder`, and every path CodeIsland identified the IDE by still spelled the old name, so an updated install stopped being detected at all. Both names are matched, since the rename doesn't reach installs that haven't updated (#327, thanks @JackThinking)
+- Codex: "Always Allow" on an MCP tool no longer invalidates the entire `config.toml`. Writing a tools table under a server with no declared transport — the built-in `codex_app` namespace, say — made Codex reject the whole file, which surfaced days later as unrelated settings failing to save. Such calls are now approved in-session and never persisted (#328, thanks @ArminStoic)
+- Codex: MCP approvals are written under the *declared* server key. `__` is the tool-name separator, so a hyphenated server arrives as `davinci_resolve` and writing that back created a second, transport-less table. Configs already broken by this are repaired at launch — CodeIsland only touches tables carrying its own stamp, and re-points one onto its real server rather than dropping the approval (#316, thanks @unaisshemim)
+- Herdr: click-to-jump focuses the exact live agent pane before raising its hosting terminal, and both jump validation and smart suppression ask Herdr instead of the outer terminal. Falls back to ordinary terminal activation when Herdr routing is unavailable or stale (#239/#323, thanks @erikh3)
+- Add DeepSeek Harness (DSH). It ships no shell hooks — the [dsh-island](https://github.com/cdxiaodong/dsh-island) cordis plugin forwards DSH's built-in events over the socket, and CodeIsland renders them as their own session card (#317/#315, thanks @cdxiaodong)
+- The question card's session row is now a jump target: click it and the terminal that asked comes to the front, so you can read the conversation before answering. Unlike Skip, the question stays queued and answerable (#325, thanks @mutoe)
+- The terminal badge names the multiplexer a session runs in — a CLI under tmux inside iTerm2 reads as both, so several sessions in one terminal window are finally distinguishable. Herdr reads the same way (#326, thanks @mutoe)
+- iPhone Buddy: an approval or answer from the phone now acts on the session whose card you were looking at, not on whatever reached the head of the queue. The phone always sent the session id; the Mac was discarding it, and a Bluetooth round trip leaves a wide window for another request to arrive first (#320, thanks @huangfengjing)
+- The "reply complete" placeholder is localized instead of being a hardcoded Chinese string — non-Chinese users saw 回复完成 in the session panel (#322, thanks @erikh3)
+- Docs: the Codex hook-review step is finally written down. Codex won't run a hook it hasn't been shown and says so only in its own TUI (`1 hook needs review before it can run.`), which from CodeIsland's side is indistinguishable from Codex not being supported (#324, thanks @nogeek-net)
+- Docs: Buddy setup is findable — which switch to use, that macOS asks for both Local Network *and* Bluetooth and why each matters, and a link to the hardware Buddy build guide that nothing pointed at before (#318, thanks @nevermorewei)
+- Docs: the star-history chart renders again; GitHub's stargazer API restriction had left it showing a placeholder (#319, thanks @FaintFlower)
+- Code Island Buddy (iPhone): with several sessions, the compact Dynamic Island was static on both sides — the leading total only drops after cleanup, and the trailing slot held the literal word "Sessions". It now shows `active/total`, and its dot shows the most demanding status in the group rather than the featured session's, so an approval waiting in another session is no longer invisible. Ships with the next Buddy App Store update, not with this one (#330, thanks @caishengwei)
+
+### 中文
+- Qoder IDE 改名后重新能被识别——1.25.1 把 bundle 改成 `Qoder IDE.app`、可执行文件从 `Electron` 改成 `Qoder`，而 CodeIsland 用来认这个 IDE 的路径全是旧名字，升级后完全认不出来。现在两个名字都匹配，因为改名不会自动传播到还没升级的安装（#327，感谢 @JackThinking）
+- Codex：对 MCP 工具点「Always Allow」不再让整份 `config.toml` 失效。往一个没有声明 transport 的 server 下面写 tools 表（比如内置的 `codex_app` 命名空间）会让 Codex 判定整份配置无效，症状却是几天后某个毫不相干的设置保存不了。这类调用现在只在当前会话内放行，不写盘（#328，感谢 @ArminStoic）
+- Codex：MCP 授权写到**真正声明过的** server key 下面。`__` 是工具名分隔符，带连字符的 server 到我们手上变成 `davinci_resolve`，照原样写回去会造出第二张没有 transport 的表。已经被写坏的配置**在启动时自动修复**——只动 CodeIsland 自己盖了注释戳的表，能对应上真实 server 的会改指过去而不是删掉（#316，感谢 @unaisshemim）
+- Herdr：点击跳转会先精确聚焦到对应的 Agent 面板，再唤起宿主终端；跳转校验和智能通知抑制也改为询问 Herdr 而不是外层终端。Herdr 路由不可用或过期时回落到原有的终端跳转（#239/#323，感谢 @erikh3）
+- 新增 DeepSeek Harness（DSH）。它没有 shell hook——由 [dsh-island](https://github.com/cdxiaodong/dsh-island) cordis 插件把 DSH 的内置事件转发到 socket，CodeIsland 渲染成独立的会话卡片（#317/#315，感谢 @cdxiaodong）
+- 提问卡片的会话行现在可以点击跳转：点一下就把提问的那个终端唤到前台，可以先读完对话再回答。和 Skip 不同，问题仍然排在队列里、仍然可以回答（#325，感谢 @mutoe）
+- 终端徽章会标出会话所在的复用器——iTerm2 里跑在 tmux 中的 CLI 两个都显示，同一个终端窗口里的多个会话终于能区分开。Herdr 同理（#326，感谢 @mutoe）
+- iPhone Buddy：手机上的批准或作答现在作用于你当时看着的那张卡片对应的会话，而不是队列头。手机一直在发会话 id，是 Mac 端把它丢掉了；而蓝牙一个来回留给其它请求插队的窗口相当大（#320，感谢 @huangfengjing）
+- 「回复完成」占位文案改走本地化，不再是硬编码中文——非中文用户之前会在会话面板里看到中文（#322，感谢 @erikh3）
+- 文档：终于把 Codex 的 hook review 这一步写下来了。Codex 不会执行没给它过目的 hook，而且只在自己的 TUI 里提示（`1 hook needs review before it can run.`）——从 CodeIsland 这边看，跟「不支持 Codex」一模一样（#324，感谢 @nogeek-net）
+- 文档：Buddy 的用法能找到了——开关在哪、macOS 会同时要**本地网络和蓝牙**权限以及各自负责什么，还有之前没有任何入口的硬件 Buddy 制作指南链接（#318，感谢 @nevermorewei）
+- 文档：star history 图恢复显示；GitHub 限制 stargazer API 之后它一直是一张占位图（#319，感谢 @FaintFlower）
+- Code Island Buddy（iPhone）：多会话时，缩小状态的灵动岛两边都是死的——左边的总数要等回收才减，右边是写死的「会话」二字。现在右边显示 `活跃/总数`，圆点显示整组里最需要处理的状态而不是主推会话的状态，别的会话里等待批准不再看不见。**随下一次 Buddy 的 App Store 更新发布，不在本次更新内**（#330，感谢 @caishengwei）
+
 ## [v1.0.32] - 2026-08-15
 
 ### English

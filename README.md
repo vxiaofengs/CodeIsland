@@ -26,13 +26,13 @@ It connects to **14 AI coding tools** via Unix socket IPC, displaying session st
 ## Features
 
 - **Notch-native UI** — Expands from the MacBook notch, collapses when idle
-- **14 AI tools supported** — Claude Code, Codex, Grok CLI, Gemini CLI, Cursor, Copilot, Trae/Traecli, Qoder, Factory, CodeBuddy, OpenCode, Kimi Code CLI, Cline, Pi / Oh My Pi
+- **15 AI tools supported** — Claude Code, Codex, Grok CLI, Gemini CLI, Cursor, Copilot, Trae/Traecli, Qoder, Factory, CodeBuddy, OpenCode, Kimi Code CLI, Cline, Pi / Oh My Pi, DeepSeek Harness
 - **Live status tracking** — See active sessions, tool calls, and AI responses in real time
 - **Permission management** — Approve/deny tool permissions directly from the panel
 - **Question answering** — Respond to agent questions without leaving your current app
 - **Pixel-art mascots** — Each AI tool has its own animated character
-- **One-click jump** — Click a session to jump to its terminal tab or IDE window
-- **Smart suppress** — Tab-level terminal detection: only suppresses notifications when you're looking at the specific session tab, not just the terminal app
+- **One-click jump** — Click a session to jump to its terminal tab, IDE window, or exact Herdr agent pane
+- **Smart suppress** — Tab-level terminal and Herdr pane detection: only suppresses notifications when you're looking at the specific session, not just the terminal app
 - **Sound effects** — Optional 8-bit sound notifications for session events
 - **Auto hook install** — Automatically configures hooks for all detected CLI tools, with auto-repair and version tracking
 - **iPhone & Apple Watch Buddy** — Mirror session status to Dynamic Island, Lock Screen, StandBy, and Apple Watch
@@ -57,6 +57,7 @@ It connects to **14 AI coding tools** via Unix socket IPC, displaying session st
 | <img src="docs/images/mascots/opencode.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/opencode.png" width="16"> OpenCode | All | APP/Terminal | Full |
 | <img src="docs/images/mascots/cline.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/cline.png" width="16"> Cline | 5 | VSCode | Full |
 | | <img src="Sources/CodeIsland/Resources/cli-icons/pi.png" width="16"> Pi / Oh My Pi | 8 | Terminal | Full |
+| | <img src="Sources/CodeIsland/Resources/cli-icons/dsh.png" width="16"> DeepSeek Harness | 9 | Terminal | Full |
 
 ## Installation
 
@@ -85,6 +86,14 @@ Code Island Buddy is available on the App Store:
 The iPhone app mirrors your Mac sessions to Dynamic Island, Lock Screen, StandBy, and Apple Watch. The Mac app publishes lightweight session snapshots over your local network while the iPhone app is open, and sends compact Bluetooth summaries for background refreshes such as Live Activities and Watch updates.
 
 Code Island Buddy is completely free and open source. It does not require an account or an external server; the companion source code lives in this repository under `ios/CodeIslandCompanion` and `apple-companion`.
+
+**Getting started:** on the Mac, open **Settings → Buddy → iPhone Buddy** and turn on *Allow iPhone Buddy to discover this Mac*. Open the iPhone app on the same Wi-Fi to pair; connected devices are listed right below the toggle. macOS asks for Local Network and Bluetooth permission on first connect — grant both: Local Network carries the full snapshots while the app is in front, Bluetooth carries the summaries that refresh the Live Activity and the Watch once it is backgrounded. *Sync interval* in the same section controls how often those go out.
+
+### Hardware Buddy (ESP32)
+
+Beyond the phone, CodeIsland drives a small ESP32 screen on your desk over BLE, playing the pixel mascot animation for the current agent state — asleep when idle, typing while it works, calling you when it needs an approval or an answer.
+
+Parts list, firmware flashing, and pairing steps are in **[hardware/README.md](hardware/README.md)** (written in Chinese, including the exact dev board and where to buy it). The Mac-side switch is in the hardware Buddy section of **Settings → Buddy**.
 
 ### Build from Source
 
@@ -117,6 +126,16 @@ AI Tool (Claude/Codex/Gemini/Cursor/...)
 CodeIsland installs lightweight hooks into each AI tool's config. When the tool triggers an event (session start, tool call, permission request, etc.), the hook sends a JSON message through a Unix socket. CodeIsland listens on this socket and updates the notch panel instantly.
 
 For **OpenCode**, a JS plugin connects directly to the socket — no bridge binary needed.
+
+For **Codex**, one extra step is yours and not something CodeIsland can do for you: Codex will not run a hook it has not been shown. After installing, start Codex and it reports `1 hook needs review before it can run.` — run `/hooks`, review the CodeIsland entries and trust them. Until then Codex simply does nothing with them, with no error, which looks exactly like CodeIsland not supporting Codex. Codex records a content hash per trusted hook in `~/.codex/config.toml` under `[hooks.state]`, so if a CodeIsland update rewrites `~/.codex/hooks.json`, the review is needed once more.
+
+For **DeepSeek Harness (DSH)**, the [dsh-island](https://github.com/cdxiaodong/dsh-island) cordis plugin listens to DSH's built-in events (`session/created`, `tools/pre-execute`, `approval/request`, …) and writes the same JSON over the Unix socket. Install it inside DSH:
+
+```bash
+dsh plugin --profile <profile> add github:cdxiaodong/dsh-island
+```
+
+DSH is plugin-native, so no hook configuration is installed — CodeIsland only needs to know the `dsh` source name to render its session card.
 
 ## Settings
 
@@ -151,12 +170,12 @@ This project was inspired by [claude-island](https://github.com/farouqaldori/cla
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=wxtsky%2FCodeIsland&type=date&legend=bottom-right">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=wxtsky/CodeIsland&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
- </picture>
+<a href="https://star-history.dera.page/#wxtsky/CodeIsland&type=date&legend=bottom-right">
+   <picture>
+     <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
+   </picture>
 </a>
 
 ## License

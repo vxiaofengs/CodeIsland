@@ -398,6 +398,7 @@ final class L10n: ObservableObject {
         "scroll_for_more": "Scroll for more",
         "scroll_hidden": "more below",
         "lines": "lines",
+        "reply_complete_placeholder": "Reply complete",
     ]
 
     private static let de: [String: String] = en.merging([
@@ -751,6 +752,7 @@ final class L10n: ObservableObject {
         "scroll_for_more": "Für mehr scrollen",
         "scroll_hidden": "weitere unten",
         "lines": "Zeilen",
+        "reply_complete_placeholder": "Antwort abgeschlossen",
     ]) { _, localized in localized }
 
     private static let zh: [String: String] = [
@@ -1108,6 +1110,7 @@ final class L10n: ObservableObject {
         "scroll_for_more": "向下滚动查看更多",
         "scroll_hidden": "个未显示",
         "lines": "行",
+        "reply_complete_placeholder": "回复完成",
     ]
 
     private static let zhHant: [String: String] = [
@@ -1465,6 +1468,7 @@ final class L10n: ObservableObject {
         "scroll_for_more": "向下捲動查看更多",
         "scroll_hidden": "個未顯示",
         "lines": "行",
+        "reply_complete_placeholder": "回覆完成",
     ]
 
     private static let ja: [String: String] = [
@@ -1822,6 +1826,7 @@ final class L10n: ObservableObject {
         "scroll_for_more": "さらに表示するにはスクロール",
         "scroll_hidden": "下にさらにあります",
         "lines": "行",
+        "reply_complete_placeholder": "返信完了",
     ]
 
     private static let ko: [String: String] = [
@@ -2179,6 +2184,7 @@ final class L10n: ObservableObject {
         "scroll_for_more": "더 보려면 스크롤",
         "scroll_hidden": "아래에 더 있음",
         "lines": "줄",
+        "reply_complete_placeholder": "답변 완료",
     ]
 
     private static let tr: [String: String] = [
@@ -2536,5 +2542,6 @@ final class L10n: ObservableObject {
         "scroll_for_more": "Daha fazla için kaydır",
         "scroll_hidden": "aşağıda",
         "lines": "satır",
+        "reply_complete_placeholder": "Yanıt tamamlandı",
     ]
 }

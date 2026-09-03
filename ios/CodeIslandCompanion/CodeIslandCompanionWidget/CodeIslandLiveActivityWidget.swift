@@ -364,15 +364,38 @@ private struct ExpandedTrailingStatus: View {
 private struct CompactStatusView: View {
     let state: CodeIslandActivityAttributes.ContentState
 
+    /// With several sessions, both halves of the compact island used to be
+    /// static: the leading count only drops once the Mac retires a session,
+    /// and the trailing slot held the literal word "Sessions". Finishing one
+    /// of three sessions changed nothing on screen (#330). It now carries
+    /// `active/total` and a dot for the most demanding status in the group.
+    private var statuses: [String] {
+        displaySessions(state).map(\.status)
+    }
+
     var body: some View {
+        let isMultiSession = displaySessions(state).count > 1
         HStack(spacing: 3) {
-            StatusDot(status: state.status, size: 6)
-            Text(displaySessions(state).count > 1 ? L10n.t(zh: "会话", en: "Sessions") : state.compactStatusLabel)
+            StatusDot(
+                status: isMultiSession
+                    ? CompanionSessionSummary.aggregateStatus(statuses: statuses)
+                    : state.status,
+                size: 6
+            )
+            Text(isMultiSession
+                ? CompanionSessionSummary.activityRatio(statuses: statuses)
+                : state.compactStatusLabel)
                 .font(.system(size: 9, weight: .black, design: .rounded))
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.74)
         }
+        .accessibilityLabel(isMultiSession
+            ? L10n.t(
+                zh: "\(CompanionSessionSummary.activeCount(statuses: statuses)) 个活跃，共 \(statuses.count) 个会话",
+                en: "\(CompanionSessionSummary.activeCount(statuses: statuses)) active of \(statuses.count) sessions"
+            )
+            : state.statusLabel)
     }
 }
 
