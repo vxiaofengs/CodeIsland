@@ -40,6 +40,7 @@ enum SettingsKey {
     static let hapticOnHover = "hapticOnHover"
     static let hapticIntensity = "hapticIntensity"      // 1=light, 2=medium, 3=strong
     static let hoverExpandDelay = "hoverExpandDelay"    // seconds; 0 = expand immediately
+    static let sessionWideAlwaysAllow = "sessionWideAlwaysAllow"
     static let sessionTimeout = "sessionTimeout"
 
     // Display
@@ -151,6 +152,7 @@ struct SettingsDefaults {
     static let hapticOnHover = false
     static let hapticIntensity = 1          // 1=light
     static let hoverExpandDelay = 0.5       // seconds
+    static let sessionWideAlwaysAllow = true
     static let sessionTimeout = 30
 
     static let maxPanelHeight = 560
@@ -238,6 +240,7 @@ class SettingsManager {
             SettingsKey.hapticOnHover: SettingsDefaults.hapticOnHover,
             SettingsKey.hapticIntensity: SettingsDefaults.hapticIntensity,
             SettingsKey.hoverExpandDelay: SettingsDefaults.hoverExpandDelay,
+            SettingsKey.sessionWideAlwaysAllow: SettingsDefaults.sessionWideAlwaysAllow,
             SettingsKey.sessionTimeout: SettingsDefaults.sessionTimeout,
             SettingsKey.maxPanelHeight: SettingsDefaults.maxPanelHeight,
             SettingsKey.maxVisibleSessions: SettingsDefaults.maxVisibleSessions,
@@ -407,6 +410,14 @@ class SettingsManager {
         ("EnterPlanMode", "Enter plan mode"),
         ("ExitPlanMode", "Exit plan mode"),
     ]
+
+    /// When on, "Always Allow" trusts the whole session: CodeIsland answers its
+    /// later approvals itself, so the user is not asked again — except for the
+    /// operations HighRiskCommand screens out.
+    var sessionWideAlwaysAllow: Bool {
+        get { defaults.bool(forKey: SettingsKey.sessionWideAlwaysAllow) }
+        set { defaults.set(newValue, forKey: SettingsKey.sessionWideAlwaysAllow) }
+    }
 
     var autoApproveTools: Set<String> {
         get {

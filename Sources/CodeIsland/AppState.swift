@@ -293,6 +293,24 @@ final class AppState {
     private var modelReadRetryAt: [String: Date] = [:]
 
     private var dismissedPermissionSessionIds: Set<String> = []
+
+    /// Sessions the user trusted for the rest of their life by pressing "Always
+    /// Allow" while `sessionWideAlwaysAllow` is on. Deliberately in-memory: the
+    /// grant dies with the session and with the app, so it can never outlive the
+    /// work it was given for. HighRiskCommand still gets a card.
+    private(set) var sessionWideAllowIds: Set<String> = []
+
+    func trustSessionForRestOfSession(_ sessionId: String) {
+        sessionWideAllowIds.insert(sessionId)
+    }
+
+    /// Whether this event can skip its card because its session is trusted.
+    func isSessionWideAllowed(_ event: HookEvent) -> Bool {
+        guard let sessionId = event.sessionId, sessionWideAllowIds.contains(sessionId) else { return false }
+        // A question is not a permission — never answer one on the user's behalf.
+        guard event.toolName != "AskUserQuestion" else { return false }
+        return !HighRiskCommand.isHighRisk(toolName: event.toolName, toolInput: event.toolInput)
+    }
     private func nextVisiblePermissionIndex() -> Int? {
         permissionQueue.firstIndex { request in
             let sid = request.event.sessionId ?? "default"
@@ -790,6 +808,9 @@ final class AppState {
         // Resume ALL pending continuations for this session
         drainPermissions(forSession: sessionId, reason: "removeSession")
         drainQuestions(forSession: sessionId, reason: "removeSession")
+        // The session-wide grant dies with the session; a later session that
+        // happens to reuse the id must start from asking again.
+        sessionWideAllowIds.remove(sessionId)
 
         if surface.sessionId == sessionId {
             autoCollapseTask?.cancel()
@@ -1671,6 +1692,15 @@ final class AppState {
         let pending = permissionQueue.remove(at: index)
         let sessionId = pending.event.sessionId ?? "default"
         dismissedPermissionSessionIds.remove(sessionId)
+        // "Always Allow" that actually holds. The rule we hand back only lives as
+        // long as the provider's own session, and an IDE hands out a fresh session
+        // id every time the user reopens a past conversation, so the grant kept
+        // evaporating and the next command asked again. Remember it here too,
+        // where nothing can invalidate it but ending the session.
+        if always, SettingsManager.shared.sessionWideAlwaysAllow {
+            trustSessionForRestOfSession(sessionId)
+            log.notice("session \(sessionId, privacy: .public) trusted for the rest of the session")
+        }
         let responseData: Data
         if always, CodexPermissionRules.isCodexEvent(pending.event) {
             _ = CodexPermissionRules().persistAlwaysAllowRule(for: pending.event)

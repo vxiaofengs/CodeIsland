@@ -1002,6 +1002,89 @@ final class AppStatePermissionFlowTests: XCTestCase {
         XCTAssertEqual(try extractPermissionBehavior(from: bResponse), "allow")
     }
 
+    /// "Always Allow" has to hold for the rest of the session. The rule handed
+    /// back to the provider is scoped to the provider's own session and expires
+    /// under the user (an IDE mints a new session id whenever a past
+    /// conversation is reopened), so the grant is remembered here as well.
+    func testAlwaysAllowTrustsTheWholeSessionExceptHighRiskCommands() async throws {
+        let previous = UserDefaults.standard.object(forKey: SettingsKey.sessionWideAlwaysAllow)
+        UserDefaults.standard.set(true, forKey: SettingsKey.sessionWideAlwaysAllow)
+        defer {
+            if let previous {
+                UserDefaults.standard.set(previous, forKey: SettingsKey.sessionWideAlwaysAllow)
+            } else {
+                UserDefaults.standard.removeObject(forKey: SettingsKey.sessionWideAlwaysAllow)
+            }
+        }
+
+        let appState = AppState()
+        let sessionId = "s-session-wide"
+        let first = try makePermissionRequestEvent(sessionId: sessionId, toolName: "Bash")
+
+        let responseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(first, continuation: continuation)
+            }
+        }
+        await Task.yield()
+        appState.approvePermission(always: true)
+        _ = await responseTask.value
+
+        // An ordinary follow-up needs no card…
+        let ordinary = try makePermissionRequestEvent(
+            sessionId: sessionId, toolName: "Bash", toolInput: ["command": "swift build"]
+        )
+        XCTAssertTrue(appState.isSessionWideAllowed(ordinary))
+
+        // …a destructive one still does…
+        let destructive = try makePermissionRequestEvent(
+            sessionId: sessionId, toolName: "Bash", toolInput: ["command": "sudo rm -rf /tmp/x"]
+        )
+        XCTAssertFalse(appState.isSessionWideAllowed(destructive), "high-risk commands must still ask")
+
+        // …a question is never answered on the user's behalf…
+        let question = try makePermissionRequestEvent(sessionId: sessionId, toolName: "AskUserQuestion")
+        XCTAssertFalse(appState.isSessionWideAllowed(question))
+
+        // …and another session is unaffected.
+        let elsewhere = try makePermissionRequestEvent(sessionId: "s-other", toolName: "Bash")
+        XCTAssertFalse(appState.isSessionWideAllowed(elsewhere))
+
+        // The grant dies with the session.
+        appState.removeSession(sessionId)
+        XCTAssertFalse(appState.isSessionWideAllowed(ordinary))
+    }
+
+    func testAlwaysAllowLeavesTheSessionUntrustedWhenTheSwitchIsOff() async throws {
+        let previous = UserDefaults.standard.object(forKey: SettingsKey.sessionWideAlwaysAllow)
+        UserDefaults.standard.set(false, forKey: SettingsKey.sessionWideAlwaysAllow)
+        defer {
+            if let previous {
+                UserDefaults.standard.set(previous, forKey: SettingsKey.sessionWideAlwaysAllow)
+            } else {
+                UserDefaults.standard.removeObject(forKey: SettingsKey.sessionWideAlwaysAllow)
+            }
+        }
+
+        let appState = AppState()
+        let sessionId = "s-switch-off"
+        let event = try makePermissionRequestEvent(sessionId: sessionId, toolName: "Bash")
+
+        let responseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(event, continuation: continuation)
+            }
+        }
+        await Task.yield()
+        appState.approvePermission(always: true)
+        _ = await responseTask.value
+
+        let next = try makePermissionRequestEvent(
+            sessionId: sessionId, toolName: "Bash", toolInput: ["command": "swift build"]
+        )
+        XCTAssertFalse(appState.isSessionWideAllowed(next))
+    }
+
     private func makePermissionRequestEvent(
         sessionId: String,
         toolName: String,

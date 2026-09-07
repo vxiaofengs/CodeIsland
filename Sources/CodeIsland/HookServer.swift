@@ -749,6 +749,17 @@ class HookServer {
                 return
             }
 
+            // Sessions the user trusted with "Always Allow". Answer here rather
+            // than relying on the rule we hand the provider: that rule is scoped
+            // to the provider's session and kept expiring under the user, which
+            // is what made "Always Allow" feel like it did nothing. High-risk
+            // commands still get a card — see HighRiskCommand.
+            if appState.isSessionWideAllowed(event) {
+                let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+                sendResponse(connection: connection, data: Data(response.utf8))
+                return
+            }
+
             // Agents the user has already put in an always-proceed mode
             // (Antigravity Turbo, Cursor YOLO, …). Re-asking on the island is the
             // exact interruption that mode exists to remove (#283). Questions are

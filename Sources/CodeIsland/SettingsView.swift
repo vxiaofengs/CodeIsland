@@ -388,6 +388,7 @@ private struct BehaviorPage: View {
     @AppStorage(SettingsKey.pluginSessionMode) private var pluginSessionMode = SettingsDefaults.pluginSessionMode
     @AppStorage(SettingsKey.hapticOnHover) private var hapticOnHover = SettingsDefaults.hapticOnHover
     @AppStorage(SettingsKey.hoverExpandDelay) private var hoverExpandDelay = SettingsDefaults.hoverExpandDelay
+    @AppStorage(SettingsKey.sessionWideAlwaysAllow) private var sessionWideAlwaysAllow = SettingsDefaults.sessionWideAlwaysAllow
     @AppStorage(SettingsKey.hapticIntensity) private var hapticIntensity = SettingsDefaults.hapticIntensity
     @AppStorage(SettingsKey.sessionTimeout) private var sessionTimeout = SettingsDefaults.sessionTimeout
     @AppStorage(SettingsKey.rotationInterval) private var rotationInterval = SettingsDefaults.rotationInterval
@@ -513,6 +514,12 @@ private struct BehaviorPage: View {
             }
 
             Section(l10n["auto_approve_tools"]) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle(l10n["session_wide_always_allow"], isOn: $sessionWideAlwaysAllow)
+                    Text(l10n["session_wide_always_allow_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
                 Text(l10n["auto_approve_tools_desc"])
                     .font(.caption)
                     .foregroundStyle(.secondary)
