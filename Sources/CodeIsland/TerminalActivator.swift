@@ -55,7 +55,9 @@ struct TerminalActivator {
         "codex": "com.openai.codex",
         "cursor": "com.todesktop.230313mzl4w4u92",
         "trae": "com.trae.app",
-        "traecn": "com.trae.app",
+        // Trae CN is its own install with its own bundle id (Homebrew trae-cn
+        // cask; TraeCode CN 3.3.104 Info.plist), not the international Trae.app.
+        "traecn": "cn.trae.app",
         "qoder": "com.qoder.ide",
         "droid": "com.factory.app",
         "codebuddy": "com.tencent.codebuddy",
@@ -63,6 +65,10 @@ struct TerminalActivator {
         "stepfun": "com.stepfun.app",
         "opencode": "ai.opencode.desktop",
         "workbuddy": "com.workbuddy.workbuddy",
+        // AiWork GUI only. `aiwork-cli` is deliberately absent: a TUI session runs
+        // in a terminal, so it must fall through to terminal tab-matching instead
+        // of raising — or launching — the IDE.
+        "aiwork": "com.alipay.dtcoder.ide",
     ]
 
     /// Bundle IDs of apps that have both APP and CLI modes.
@@ -72,6 +78,7 @@ struct TerminalActivator {
         "com.openai.codex": "Codex",
         "com.todesktop.230313mzl4w4u92": "Cursor",
         "com.trae.app": "Trae",
+        "cn.trae.app": "Trae CN",
         "com.qoder.ide": "Qoder",
         "com.factory.app": "Factory",
         "com.tencent.codebuddy": "CodeBuddy",
@@ -79,6 +86,7 @@ struct TerminalActivator {
         "com.stepfun.app": "StepFun",
         "ai.opencode.desktop": "OpenCode",
         "com.workbuddy.workbuddy": "WorkBuddy",
+        "com.alipay.dtcoder.ide": "AiWork",
         // Claude Code Desktop (#211). Deliberately NOT in sourceToNativeAppBundleId:
         // most "claude" sessions are terminal CLI runs, and that fallback would
         // steal their click-to-jump whenever the desktop app happens to be open.
@@ -91,6 +99,26 @@ struct TerminalActivator {
         allowHerdr: Bool = true
     ) {
         guard !session.isRemote else { return }
+        // Every caller is a user action (click, shortcut, Buddy button): the
+        // user is now dealing with this session, so its follow-ups stop.
+        if let sessionId {
+            NotificationCenter.default.post(
+                name: .codeIslandDidJumpToSession, object: nil, userInfo: ["sessionId": sessionId]
+            )
+        }
+        // Claude Desktop Cowork/Chat cards come from Claude's session store, not
+        // a terminal: open that exact conversation in Claude Desktop.
+        if let sessionId, AppState.openCoworkSession(sessionKey: sessionId) {
+            return
+        }
+        // A UI harness (T3 Code) owns the conversation: the terminal/multiplexer
+        // env the CLI inherited belongs to wherever the harness server was
+        // started, so jump to the harness instead — before Herdr/tmux routing,
+        // which would otherwise aim at that unrelated pane (#321).
+        if let harness = session.hostHarness {
+            HostHarnessSupport.activate(harness: harness, session: session, sessionId: sessionId)
+            return
+        }
         if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {
             return
         }
@@ -408,6 +436,7 @@ struct TerminalActivator {
         // already off-main — match the rest of the activator and run it on a
         // userInitiated background queue so a stuck `tmux display-message`
         // can't freeze the UI. See #139.
+        let scriptRunner = AppleScriptRunner.current
         DispatchQueue.global(qos: .userInitiated).async {
         // Resolve tmux title prefix (most reliable for tmux sessions in Ghostty).
         // Example Ghostty title often contains: "<session>:<winIdx>:<winName> - ..."
@@ -604,11 +633,10 @@ struct TerminalActivator {
             end tell
         end try
         """
-        // Use /usr/bin/osascript to run AppleScript out-of-process (tmuxcc uses the same approach).
-        // This avoids relying on NSAppleScript execution inside the app process.
-        // Already on a background queue (see DispatchQueue.global wrap above) — call the
-        // _Sync variant to skip an extra dispatch hop.
-        runOsaScriptSync(script)
+        // Out of process like every other activation script (see AppleScriptRunner).
+        // Already on a background queue (see DispatchQueue.global wrap above), so
+        // launch directly instead of paying runAppleScript's extra dispatch hop.
+        scriptRunner.launch(script, "ghostty")
         } // end DispatchQueue.global async
     }
 
@@ -1353,53 +1381,24 @@ struct TerminalActivator {
         return "Terminal"
     }
 
-    /// Window- and tab-level targeting all runs through here, and every caller
-    /// used to discard the error. When System Events is refused — no Accessibility
-    /// grant is error -1728 — the precise jump silently became a plain app
-    /// activation, which lands on whatever window was last used. That is
-    /// indistinguishable from "the jump is just inaccurate", so name it.
+    /// Fire-and-forget, off the caller's queue as before, so a click on the main
+    /// thread never waits for osascript to spawn. Out of process rather than
+    /// NSAppleScript, which is main-thread-only — see AppleScriptRunner. The
+    /// runner is read here, not on the queue, so a test that swaps it around a
+    /// call sees that call's script.
+    ///
+    /// `purpose` names the jump this script belongs to. The runner reports a
+    /// failed script against it, because every caller used to discard the error:
+    /// a refused System Events call turned the precise jump into a plain app
+    /// activation, which lands on whatever window was last used and is
+    /// indistinguishable from "the jump is just inaccurate".
     private static func runAppleScript(_ source: String, purpose: String = "applescript") {
+        let runner = AppleScriptRunner.current
         DispatchQueue.global(qos: .userInitiated).async {
-            guard let script = NSAppleScript(source: source) else {
-                log.error("\(purpose, privacy: .public): could not compile the script")
-                return
-            }
-            var error: NSDictionary?
-            let result = script.executeAndReturnError(&error)
-            guard let error else {
-                // Scripts that pick a window report which rule matched. Only the
-                // miss is worth a line: it is the one outcome that looks like a
-                // working jump to the wrong place.
-                if result.stringValue == "no-match" {
-                    log.notice("\(purpose, privacy: .public): no window matched the session's folder")
-                }
-                return
-            }
-            let code = (error[NSAppleScript.errorNumber] as? Int) ?? 0
-            let message = (error[NSAppleScript.errorMessage] as? String) ?? "unknown error"
-            let reason: String
-            switch code {
-            case Self.errAXNotTrusted, Self.errAXAPIDisabled:
-                reason = "System Events refused: no Accessibility grant (toggle it off and on — "
-                    + "replacing the app bundle leaves the entry looking enabled but stale)"
-            case Self.errAppleEventsNotAllowed:
-                reason = "Apple Events to System Events not allowed: approve it under "
-                    + "Privacy & Security → Automation → CodeIsland"
-            default:
-                reason = message
-            }
-            log.error("\(purpose, privacy: .public): failed (\(code)) \(reason, privacy: .public)")
+            runner.launch(source, purpose)
         }
     }
 
-    /// "not allowed assistive access" — the Accessibility grant is missing.
-    /// Both codes mean that: -1728 comes from AppleScript itself, -25211
-    /// (kAXErrorAPIDisabled) is what System Events forwards, and that is the one
-    /// actually seen in the field.
-    private static let errAXNotTrusted = -1728
-    private static let errAXAPIDisabled = -25211
-    /// "Not authorized to send Apple events" — the Automation grant is missing.
-    private static let errAppleEventsNotAllowed = -1743
 
     private static func runOsaScript(_ source: String) {
         DispatchQueue.global(qos: .userInitiated).async {

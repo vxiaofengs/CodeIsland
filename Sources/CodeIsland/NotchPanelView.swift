@@ -56,16 +56,29 @@ enum NotchHoverInteraction {
     static let prehoverWidthDelta: CGFloat = 7
     static let prehoverScale: CGFloat = 1.004
 
-    /// Bounds for the setting's slider, shared with the width math so the UI and
-    /// the timer can't drift apart. Zero means expand on the same run-loop turn.
-    static let minExpandDelay: TimeInterval = 0
-    static let maxExpandDelay: TimeInterval = 2
-    static let expandDelayStep: TimeInterval = 0.1
+    /// User-tunable range for `expandDelay` (Settings → Behavior). Below 0.1s
+    /// every pass of the pointer toward the menu bar would pop the panel open;
+    /// past 1s the island stops feeling like it responds to hover at all.
+    static let expandDelayRange: ClosedRange<TimeInterval> = 0.1...1.0
+    static let expandDelayStep: TimeInterval = 0.05
 
-    /// Clamp whatever is in defaults — a stale or hand-edited value must not be
-    /// able to strand the panel behind a 30-second delay.
-    static func clampedExpandDelay(_ value: TimeInterval) -> TimeInterval {
-        Swift.min(Swift.max(value, minExpandDelay), maxExpandDelay)
+    /// The stored preference, clamped into `expandDelayRange`. A value written
+    /// by hand (`defaults write`) or a corrupt one must never yield a zero or
+    /// negative timer interval, so non-finite input falls back to the default.
+    static func expandDelay(forSetting raw: Double) -> TimeInterval {
+        guard raw.isFinite else { return expandDelay }
+        return min(max(raw, expandDelayRange.lowerBound), expandDelayRange.upperBound)
+    }
+
+    /// Whether an elapsed hover delay may still open the session list. A card
+    /// the island opened during the delay (an approval, or a question the user
+    /// just clicked open) is waiting on the user; swapping it for the list
+    /// would hide the one thing that needs an answer.
+    static func hoverExpansionMayReplace(_ surface: IslandSurface) -> Bool {
+        switch surface {
+        case .approvalCard, .questionCard: return false
+        default: return true
+        }
     }
 
     static func nextPhase(from phase: NotchHoverPhase, event: NotchHoverEvent) -> NotchHoverPhase {
@@ -122,7 +135,9 @@ struct NotchPanelView: View {
     @AppStorage(SettingsKey.collapsedWidthScale) private var collapsedWidthScale = SettingsDefaults.collapsedWidthScale
     @AppStorage(SettingsKey.hapticOnHover) private var hapticOnHover = SettingsDefaults.hapticOnHover
     @AppStorage(SettingsKey.hapticIntensity) private var hapticIntensity = SettingsDefaults.hapticIntensity
+    @AppStorage(SettingsKey.showSessionRecap) private var showSessionRecap = SettingsDefaults.showSessionRecap
     @AppStorage(SettingsKey.hoverExpandDelay) private var hoverExpandDelay = SettingsDefaults.hoverExpandDelay
+    @AppStorage(SettingsKey.showProjectName) private var showProjectName = SettingsDefaults.showProjectName
 
     /// Delayed hover: prevents accidental expansion when mouse passes through
     @State private var hoverTimer: Timer?
@@ -136,6 +151,8 @@ struct NotchPanelView: View {
     @State private var curtainOffset: CGFloat = 0
     @State private var curtainOpacity: Double = 1
     @State private var displayedToolStatus: Bool = SettingsDefaults.showToolStatus
+    /// Window and panel heights for the completion card's reply area.
+    @State private var cardSpace = CompletionCardSpace()
 
     private var isActive: Bool { !appState.sessions.isEmpty }
     /// First launch / no-session state should still render a visible marker so the app
@@ -157,6 +174,15 @@ struct NotchPanelView: View {
     /// once the surface expands (from hover or any other path) it disappears.
     private var shouldShowPrehover: Bool {
         showBar && !shouldShowExpanded && hoverPhase == .prehover
+    }
+
+    private var collapsedRecapTooltip: String {
+        guard showSessionRecap, !shouldShowExpanded else { return "" }
+        let sid = appState.rotatingSessionId ?? appState.activeSessionId ?? appState.sessions.keys.sorted().first
+        return SessionMetadataStyle.collapsedRecapTooltip(
+            for: sid.flatMap { appState.sessions[$0] },
+            showProjectName: showProjectName
+        )
     }
 
     /// Mascot size — fits within the menu bar height
@@ -214,6 +240,23 @@ struct NotchPanelView: View {
                                 .padding(.horizontal, compactWingWidth + 6)
                         }
                     }
+                    // Recap on hover while collapsed — shows whenever hover
+                    // doesn't expand the panel (smart suppress with the
+                    // terminal frontmost); expanded cards show it inline.
+                    .help(collapsedRecapTooltip)
+                    // With a question waiting off-screen, a click on the collapsed
+                    // bar opens its card. Otherwise the gesture is off entirely so
+                    // the bar keeps behaving exactly as before.
+                    .contentShape(Rectangle())
+                    .gesture(
+                        TapGesture().onEnded {
+                            hoverTimer?.invalidate()
+                            hoverTimer = nil
+                            appState.openPendingQuestionCard()
+                        },
+                        including: !shouldShowExpanded && appState.hiddenPendingQuestionSessionId != nil
+                            ? .all : .subviews
+                    )
                 } else if showIdleIndicator {
                     IdleIndicatorBar(
                         mascotSize: mascotSize,
@@ -265,6 +308,7 @@ struct NotchPanelView: View {
                                 options: q.question.options,
                                 descriptions: q.question.descriptions,
                                 allQuestions: q.askUserQuestionState?.items ?? [],
+                                requestId: q.id,
                                 sessionSource: session?.source,
                                 sessionContext: session?.cwd,
                                 session: session,
@@ -276,6 +320,12 @@ struct NotchPanelView: View {
                                 onAnswerMulti: { appState.answerQuestionMulti($0, expectedSessionId: sid) },
                                 onSkip: { appState.skipQuestion(expectedSessionId: sid) }
                             )
+                            // One view per request. Answering a card promotes the
+                            // next session's request into this same slot, and
+                            // without a new identity SwiftUI hands it the previous
+                            // card's @State — answers, selection and typed text
+                            // included. (#333)
+                            .id(q.id)
                             .transition(.blurFade.combined(with: .scale(scale: 0.96, anchor: .top)))
                         } else if let preview = appState.previewQuestionPayload {
                             QuestionBar(
@@ -283,6 +333,7 @@ struct NotchPanelView: View {
                                 options: preview.options,
                                 descriptions: preview.descriptions,
                                 allQuestions: [],
+                                requestId: nil,
                                 sessionSource: session?.source,
                                 sessionContext: session?.cwd,
                                 session: session,
@@ -307,6 +358,7 @@ struct NotchPanelView: View {
                     }
                 }
             }
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { cardSpace.recordPanelHeight($0) }
             .frame(width: panelWidth)
             .clipped()
             .background(
@@ -341,6 +393,10 @@ struct NotchPanelView: View {
             .scaleEffect(shouldShowPrehover ? NotchHoverInteraction.prehoverScale : 1, anchor: .top)
             .contentShape(Rectangle())
             .onHover { hovering in
+                // The pointer is on the island itself — what follow-up
+                // reminders count as "reading this card" — whatever the
+                // hover then does to the surface below.
+                appState.followUps.pointerOverIsland = hovering
                 // Idle indicator hover — delay un-hover to prevent oscillation when
                 // the animated width change crosses the mouse position (#52). Its
                 // own timer: the shared one below drives the expand delay, and the
@@ -399,15 +455,16 @@ struct NotchPanelView: View {
                     // is the user's call: a long one makes passing the pointer over
                     // the island safe, zero makes it feel instant.
                     hoverTimer?.invalidate()
-                    let delay = NotchHoverInteraction.clampedExpandDelay(hoverExpandDelay)
-                    guard delay > 0 else {
-                        expandFromHover()
-                        return
-                    }
-                    hoverTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
+                    hoverTimer = Timer.scheduledTimer(
+                        withTimeInterval: NotchHoverInteraction.expandDelay(forSetting: hoverExpandDelay),
+                        repeats: false
+                    ) { _ in
                         Task { @MainActor in
                             // Guard: mouse may have left during the delay
                             guard isHovered else { return }
+                            // A card opened while we waited is the one thing on
+                            // screen needing an answer — leave it alone.
+                            guard NotchHoverInteraction.hoverExpansionMayReplace(appState.surface) else { return }
                             expandFromHover()
                         }
                     }
@@ -443,7 +500,15 @@ struct NotchPanelView: View {
             Spacer()
                 .allowsHitTesting(false)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // minHeight 0: the frame is the window's height even when the content
+        // runs taller (without it the frame grows with its content), so the
+        // measurement below is the window, and any overflow runs off the
+        // bottom instead of pushing the notch bar off the top.
+        .frame(maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .top)
+        // The hosting view fills the panel window, whose height is already
+        // clamped to the screen.
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { cardSpace.recordWindowHeight($0) }
+        .environment(cardSpace)
         .animation(NotchAnimation.open, value: appState.surface)
         // Forced heartbeat frame while the island is static (see
         // AppState.repaintNonce). The difference has to be real for SwiftUI to
@@ -633,8 +698,27 @@ private struct CompactRightWing: View {
                         .shadow(color: Color(red: 0.4, green: 1.0, blue: 0.5).opacity(0.7), radius: 3)
                 }
 
-                // Pending approval/question badge
-                if appState.status == .waitingApproval || appState.status == .waitingQuestion {
+                // A question the island is not showing (auto-expand off, or
+                // Smart Suppress) gets its own badge: clicking the collapsed bar
+                // opens that card. A follow-up reminder bounces it like the bell.
+                if appState.hiddenPendingQuestionSessionId != nil {
+                    Image(systemName: "questionmark.bubble.fill")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(Color(red: 1.0, green: 0.7, blue: 0.28))
+                        .symbolEffect(.pulse, options: .repeating)
+                        .symbolEffect(.bounce, value: appState.followUps.hintPulse)
+                        .help(l10n["question_waiting_hint"])
+                } else if appState.followUps.hintActive {
+                    // Follow-up reminder fired while collapsed (auto-expand off, or
+                    // an unseen completion): badge the bell and bounce it on each
+                    // reminder, until the island is opened or the item resolves.
+                    Image(systemName: "bell.badge.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Color(red: 1.0, green: 0.7, blue: 0.28))
+                        .symbolEffect(.bounce, value: appState.followUps.hintPulse)
+                        .help(l10n["follow_up_hint"])
+                } else if appState.status == .waitingApproval || appState.status == .waitingQuestion {
+                    // Pending approval/question badge
                     Image(systemName: "bell.fill")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(Color(red: 1.0, green: 0.7, blue: 0.28))
@@ -667,16 +751,70 @@ private struct CompactRightWing: View {
 /// Accent color for each tool category — shared between notch and non-notch views
 private func toolStatusColor(_ tool: String) -> Color {
     switch tool.lowercased() {
-    case "bash": return Color(red: 0.4, green: 1.0, blue: 0.5)
-    case "edit", "write": return Color(red: 0.5, green: 0.7, blue: 1.0)
-    case "read": return Color(red: 0.9, green: 0.8, blue: 0.4)
-    case "grep", "glob": return Color(red: 0.8, green: 0.6, blue: 1.0)
-    case "agent": return Color(red: 1.0, green: 0.6, blue: 0.4)
+    case "bash", "running command": return Color(red: 0.4, green: 1.0, blue: 0.5)
+    case "edit", "write", "editing": return Color(red: 0.5, green: 0.7, blue: 1.0)
+    case "read", "reading": return Color(red: 0.9, green: 0.8, blue: 0.4)
+    case "grep", "glob", "searching", "calling mcp": return Color(red: 0.8, green: 0.6, blue: 1.0)
+    case "agent", "delegating": return Color(red: 1.0, green: 0.6, blue: 0.4)
+    case "compacting": return Color(red: 0.4, green: 0.85, blue: 0.9)
     default: return .white.opacity(0.7)
     }
 }
 
+enum SessionLiveOutputDisplay {
+    static func summary(for session: SessionSnapshot?, maxCharacters: Int = 160) -> String? {
+        guard maxCharacters > 0,
+              let session,
+              session.status != .idle,
+              SessionSnapshot.normalizedSupportedSource(session.source) == "codex",
+              let liveOutput = session.liveCodexOutput else { return nil }
+
+        // Streamed replies are Markdown; flatten it so the one-line bar shows
+        // words, not `##`, `**` or table pipes. Cached: the bar re-renders
+        // far more often than the output changes.
+        let flattened = ChatMessageTextFormatter.markdownPreview(liveOutput, singleLine: true)
+        let normalized = String(flattened.characters)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !normalized.isEmpty else { return nil }
+        guard normalized.count > maxCharacters else { return normalized }
+        if maxCharacters == 1 { return "\u{2026}" }
+        return String(normalized.prefix(maxCharacters - 1)) + "\u{2026}"
+    }
+}
+
 // MARK: - Compact Tool Status (non-notch center area)
+
+/// What the collapsed bar's centre leads with: the project folder, or the
+/// session title when "Show project name" is off. Capped in width — an
+/// AI-generated title runs to dozens of characters and would otherwise push
+/// the tool and its description out of the bar. A short label still hugs its
+/// text.
+struct CompactContextLabel: View {
+    let text: String
+
+    static let fontSize: CGFloat = 11
+    static let maxWidth: CGFloat = 120
+
+    /// The label's widest extent: its text's width, up to `maxWidth`.
+    static func width(for text: String) -> CGFloat {
+        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .medium)
+        // A point of slack: Text truncates a label measured to the exact width.
+        let ideal = (text as NSString).size(withAttributes: [.font: font]).width.rounded(.up) + 1
+        return min(ideal, maxWidth)
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: Self.fontSize, weight: .medium, design: .monospaced))
+            .foregroundStyle(.white.opacity(0.8))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            // minWidth 0 keeps it shrinkable when the bar is narrower still.
+            .frame(minWidth: 0, maxWidth: Self.width(for: text), alignment: .leading)
+    }
+}
 
 /// Shows the current tool activity in the center of the bar on non-notch screens.
 /// Keeps the last tool visible for a short linger period to avoid flashing.
@@ -693,10 +831,16 @@ private struct CompactToolStatus: View {
     }
     private var liveTool: String? { displaySession?.currentTool }
     private var liveDesc: String? { displaySession?.toolDescription }
+    private var liveOutput: String? { SessionLiveOutputDisplay.summary(for: displaySession) }
     private var displayStatus: AgentStatus { displaySession?.status ?? .idle }
+    @AppStorage(SettingsKey.showProjectName) private var showProjectName = SettingsDefaults.showProjectName
     private var projectName: String? {
-        guard let cwd = displaySession?.cwd, !cwd.isEmpty else { return nil }
-        return (cwd as NSString).lastPathComponent
+        let folder = displaySession?.cwd.flatMap { $0.isEmpty ? nil : ($0 as NSString).lastPathComponent }
+        return SessionHeadline.contextLabel(
+            projectName: folder,
+            sessionLabel: displaySession?.sessionLabel,
+            showProjectName: showProjectName
+        )
     }
 
     @State private var shownTool: String?
@@ -719,8 +863,7 @@ private struct CompactToolStatus: View {
         HStack(spacing: 5) {
             // Project name — shown whenever the session is not idle
             if isWorking, let project = projectName {
-                Text(project)
-                    .foregroundStyle(.white.opacity(0.8))
+                CompactContextLabel(text: project)
                     .id("center-project-\(displaySessionId ?? "")")
                     .transition(.opacity)
             }
@@ -734,10 +877,24 @@ private struct CompactToolStatus: View {
                     MorphText(
                         text: shortDesc(desc),
                         font: .system(size: 11, weight: .medium, design: .monospaced),
-                        color: .white.opacity(0.7)
+                        color: .white.opacity(0.7),
+                        streamsRapidly: displaySession.map {
+                            SessionSnapshot.rapidStreamingSources.contains($0.source)
+                        } ?? false
                     )
                     .truncationMode(.tail)
                 }
+            } else if let liveOutput {
+                Text("$")
+                    .fontWeight(.bold)
+                    .foregroundStyle(Color(red: 0.85, green: 0.47, blue: 0.34))
+                MorphText(
+                    text: liveOutput,
+                    font: .system(size: 11, weight: .medium, design: .monospaced),
+                    color: .white.opacity(0.78)
+                )
+                .truncationMode(.tail)
+                .help(liveOutput)
             } else if displayStatus == .processing {
                 TypingIndicator(fontSize: 11, label: "thinking", bright: true)
                     .id("thinking-\(appState.rotatingSessionId ?? "")")
@@ -1155,14 +1312,98 @@ func makeQuestionBarFreeTextAnswer(
     )
 }
 
+/// Answer state of one question card: which question of the wizard is up,
+/// the answers given so far, and the in-progress selection or text.
+///
+/// It belongs to one `QuestionRequest`. SwiftUI keeps a view's `@State` for
+/// as long as the view keeps its identity, and the card slot keeps its
+/// identity when one request replaces another in place — answering session
+/// A's card promotes session B's straight into the same `QuestionBar`. The
+/// answers collected for A then led B's submission, and since answers are
+/// mapped onto questions by position, B's question was sent A's answer.
+/// Recording against a different request therefore starts over. (#333)
+struct QuestionWizardState {
+    private(set) var requestId: UUID?
+    private(set) var currentQuestionIndex = 0
+    private(set) var collectedAnswers: [AskUserQuestionAnswer] = []
+    var selectedIndex: Int?
+    var selectedIndices: Set<Int> = []
+    var showOtherInput = false
+    var otherText = ""
+    var textInput = ""
+
+    init(requestId: UUID? = nil) {
+        self.requestId = requestId
+    }
+
+    /// Drop everything collected for any other request.
+    mutating func bind(to requestId: UUID?) {
+        guard self.requestId != requestId else { return }
+        self = QuestionWizardState(requestId: requestId)
+    }
+
+    /// Record the answer to the current question of the request `requestId`,
+    /// which asks `questionCount` questions. Returns the submission — one
+    /// answer per question, all given on that request — once the last one is
+    /// answered, and nil while more remain.
+    ///
+    /// The final answer is not kept: if the submission is refused, answering
+    /// again must not append a second copy.
+    mutating func record(
+        _ answer: AskUserQuestionAnswer,
+        for requestId: UUID?,
+        questionCount: Int
+    ) -> [AskUserQuestionAnswer]? {
+        bind(to: requestId)
+        guard currentQuestionIndex + 1 < questionCount else {
+            return collectedAnswers + [answer]
+        }
+        collectedAnswers.append(answer)
+        currentQuestionIndex += 1
+        resetInput()
+        return nil
+    }
+
+    mutating func goBack() {
+        guard currentQuestionIndex > 0, !collectedAnswers.isEmpty else { return }
+        collectedAnswers.removeLast()
+        currentQuestionIndex -= 1
+        resetInput()
+    }
+
+    mutating func resetInput() {
+        selectedIndex = nil
+        selectedIndices = []
+        showOtherInput = false
+        otherText = ""
+        textInput = ""
+    }
+}
+
+/// When a notch card may pull keyboard focus into its own text field (#297).
+enum NotchCardFocusPolicy {
+    /// The island is a non-activating overlay: a question card usually appears
+    /// while the user is typing in their editor, or opens under a mouse that is
+    /// only passing over to read it. Focusing the answer field then took the
+    /// keystrokes meant for the editor. Only do it when the user is already
+    /// working in the panel (it is key because they clicked into it); otherwise
+    /// the field takes focus when clicked, like any text field.
+    static func shouldFocusQuestionFieldOnAppear(panelIsKeyWindow: Bool) -> Bool {
+        panelIsKeyWindow
+    }
+}
+
 private struct QuestionBar: View {
     let question: String
     let options: [String]?
     let descriptions: [String]?
     /// All AskUserQuestion items (1-4). Empty for legacy Notification questions.
     let allQuestions: [AskUserQuestionItem]
+    /// The `QuestionRequest` this card answers; nil for the debug preview.
+    let requestId: UUID?
     let sessionSource: String?
     let sessionContext: String?
+    @AppStorage(SettingsKey.showProjectName) private var showProjectName = SettingsDefaults.showProjectName
     /// Owning session, so the card can focus its terminal on click the same way
     /// ApprovalBar does. Optional: the session may be gone while the card is
     /// still on screen.
@@ -1175,9 +1416,7 @@ private struct QuestionBar: View {
     let onAnswerMulti: ([AskUserQuestionAnswer]) -> Void
     let onSkip: () -> Void
 
-    @State private var textInput = ""
     @FocusState private var isFocused: Bool
-    @State private var selectedIndex: Int? = nil
 
     // Click-to-jump state, mirroring ApprovalBar
     @State private var failureShakeOffset: CGFloat = 0
@@ -1185,26 +1424,23 @@ private struct QuestionBar: View {
     @State private var jumpRowHovering = false
     @AppStorage(SettingsKey.autoCollapseAfterSessionJump) private var autoCollapseAfterSessionJump = SettingsDefaults.autoCollapseAfterSessionJump
 
-    // Multi-question wizard state
-    @State private var currentQuestionIndex: Int = 0
-    @State private var collectedAnswers: [AskUserQuestionAnswer] = []
-    @State private var selectedIndices: Set<Int> = []
-    @State private var showOtherInput: Bool = false
-    @State private var otherText: String = ""
+    // Multi-question wizard state, bound to `requestId` (#333)
+    @State private var wizard = QuestionWizardState()
     @FocusState private var otherFocused: Bool
 
     private let cyan = Color(red: 0.4, green: 0.7, blue: 1.0)
 
     private var currentItem: AskUserQuestionItem? {
-        guard !allQuestions.isEmpty, currentQuestionIndex < allQuestions.count else { return nil }
-        return allQuestions[currentQuestionIndex]
+        guard !allQuestions.isEmpty, wizard.currentQuestionIndex < allQuestions.count else { return nil }
+        return allQuestions[wizard.currentQuestionIndex]
     }
 
     /// Remote sessions run on another machine — there is no local terminal to
-    /// focus, so the affordance stays hidden rather than dead.
+    /// focus, so the affordance stays hidden rather than dead. Same for a
+    /// harness-hosted session (T3 Code) whose harness URL is unknown (#321).
     private var canJumpToTerminal: Bool {
         guard let session else { return false }
-        return !session.isRemote
+        return session.canJumpFromNotch
     }
 
     var body: some View {
@@ -1231,7 +1467,17 @@ private struct QuestionBar: View {
         }
         .padding(.vertical, 10)
         .offset(x: failureShakeOffset)
-        .onAppear { isFocused = true }
+        .onAppear {
+            let panelIsKey = (NSApp.delegate as? AppDelegate)?.panelController?.isPanelKeyWindow ?? false
+            if NotchCardFocusPolicy.shouldFocusQuestionFieldOnAppear(panelIsKeyWindow: panelIsKey) {
+                isFocused = true
+            }
+        }
+        .onChange(of: requestId, initial: true) { _, newId in
+            // The caller keys this view by request, so a new request normally
+            // gets a fresh view; this keeps the wizard honest if it does not.
+            wizard.bind(to: newId)
+        }
         .onDisappear {
             jumpValidationTask?.cancel()
             jumpValidationTask = nil
@@ -1248,13 +1494,18 @@ private struct QuestionBar: View {
                     .resizable()
                     .frame(width: 12, height: 12)
             }
-            if let cwd = sessionContext {
-                Image(systemName: "folder.fill")
+            if let label = SessionHeadline.contextLabel(
+                projectName: sessionContext.map { ($0 as NSString).lastPathComponent },
+                sessionLabel: session?.sessionLabel,
+                showProjectName: showProjectName
+            ) {
+                Image(systemName: showProjectName ? "folder.fill" : "text.bubble.fill")
                     .font(.system(size: 8))
                     .foregroundStyle(.white.opacity(0.5))
-                Text((cwd as NSString).lastPathComponent)
+                Text(label)
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(.white.opacity(0.6))
+                    .lineLimit(1)
             }
             if canJumpToTerminal {
                 Image(systemName: "arrow.up.forward.app")
@@ -1319,7 +1570,7 @@ private struct QuestionBar: View {
                 .lineLimit(3)
             Spacer()
             if allQuestions.count > 1 {
-                Text("\(currentQuestionIndex + 1)/\(allQuestions.count)")
+                Text("\(wizard.currentQuestionIndex + 1)/\(allQuestions.count)")
                     .font(.system(size: 9, weight: .bold))
                     .foregroundStyle(.white.opacity(0.5))
                     .padding(.horizontal, 4)
@@ -1342,18 +1593,18 @@ private struct QuestionBar: View {
                     let desc = item.payload.descriptions?.indices.contains(idx) == true ? item.payload.descriptions?[idx] : nil
                     if item.multiSelect {
                         MultiSelectRow(index: idx + 1, label: option, description: desc,
-                                       isChecked: selectedIndices.contains(idx), accent: cyan) {
-                            if selectedIndices.contains(idx) {
-                                selectedIndices.remove(idx)
+                                       isChecked: wizard.selectedIndices.contains(idx), accent: cyan) {
+                            if wizard.selectedIndices.contains(idx) {
+                                wizard.selectedIndices.remove(idx)
                             } else {
-                                selectedIndices.insert(idx)
+                                wizard.selectedIndices.insert(idx)
                             }
                         }
                     } else {
                         OptionRow(index: idx + 1, label: option, description: desc,
-                                  isSelected: selectedIndex == idx, accent: cyan) {
-                            selectedIndex = idx
-                            showOtherInput = false
+                                  isSelected: wizard.selectedIndex == idx, accent: cyan) {
+                            wizard.selectedIndex = idx
+                            wizard.showOtherInput = false
                             advanceWithAnswer(option, selectedOptions: [option])
                         }
                     }
@@ -1363,19 +1614,19 @@ private struct QuestionBar: View {
                 otherOptionRow(isMultiSelect: item.multiSelect)
 
                 // "Other" text input
-                if showOtherInput {
+                if wizard.showOtherInput {
                     HStack(spacing: 6) {
                         Text(">")
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
                             .foregroundStyle(Color(red: 0.3, green: 0.85, blue: 0.4))
-                        TextField(L10n.shared["type_answer"], text: $otherText)
+                        TextField(L10n.shared["type_answer"], text: $wizard.otherText)
                             .textFieldStyle(.plain)
                             .font(.system(size: 10.5))
                             .foregroundStyle(.white)
                             .focused($otherFocused)
                             .onSubmit {
-                                if !item.multiSelect && !otherText.isEmpty {
-                                    advanceWithAnswer(otherText, customInput: otherText)
+                                if !item.multiSelect && !wizard.otherText.isEmpty {
+                                    advanceWithAnswer(wizard.otherText, customInput: wizard.otherText)
                                 }
                             }
                     }
@@ -1398,7 +1649,7 @@ private struct QuestionBar: View {
                 Text(">")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundStyle(Color(red: 0.3, green: 0.85, blue: 0.4))
-                TextField(L10n.shared["type_answer"], text: $textInput)
+                TextField(L10n.shared["type_answer"], text: $wizard.textInput)
                     .textFieldStyle(.plain)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.white)
@@ -1418,7 +1669,7 @@ private struct QuestionBar: View {
 
         // Buttons
         HStack(spacing: 6) {
-            if currentQuestionIndex > 0 {
+            if wizard.currentQuestionIndex > 0 {
                 PixelButton(
                     label: L10n.shared["back"],
                     fg: .white.opacity(0.6),
@@ -1450,13 +1701,13 @@ private struct QuestionBar: View {
                     border: Color(red: 0.28, green: 0.62, blue: 0.32),
                     action: confirmMultiSelect
                 )
-            } else if showOtherInput && !item.multiSelect {
+            } else if wizard.showOtherInput && !item.multiSelect {
                 PixelButton(
                     label: L10n.shared["submit"],
                     fg: .white.opacity(0.95),
                     bg: Color(red: 0.16, green: 0.38, blue: 0.18),
                     border: Color(red: 0.28, green: 0.62, blue: 0.32),
-                    action: { if !otherText.isEmpty { advanceWithAnswer(otherText, customInput: otherText) } }
+                    action: { if !wizard.otherText.isEmpty { advanceWithAnswer(wizard.otherText, customInput: wizard.otherText) } }
                 )
             }
         }
@@ -1469,15 +1720,15 @@ private struct QuestionBar: View {
     private func otherOptionRow(isMultiSelect: Bool) -> some View {
         if isMultiSelect {
             MultiSelectRow(index: -1, label: L10n.shared["other"], description: nil,
-                           isChecked: showOtherInput, accent: cyan) {
-                showOtherInput.toggle()
-                if !showOtherInput { otherText = "" }
+                           isChecked: wizard.showOtherInput, accent: cyan) {
+                wizard.showOtherInput.toggle()
+                if !wizard.showOtherInput { wizard.otherText = "" }
             }
         } else {
             OptionRow(index: -1, label: L10n.shared["other"], description: nil,
-                      isSelected: showOtherInput, accent: cyan) {
-                showOtherInput = true
-                selectedIndex = nil
+                      isSelected: wizard.showOtherInput, accent: cyan) {
+                wizard.showOtherInput = true
+                wizard.selectedIndex = nil
             }
         }
     }
@@ -1488,7 +1739,7 @@ private struct QuestionBar: View {
         guard let item = currentItem,
               let answer = makeQuestionBarFreeTextAnswer(
                   question: item.payload.question,
-                  text: textInput
+                  text: wizard.textInput
               ) else { return }
         advance(with: answer)
     }
@@ -1508,24 +1759,23 @@ private struct QuestionBar: View {
     }
 
     private func advance(with answer: AskUserQuestionAnswer) {
-        collectedAnswers.append(answer)
-
-        if currentQuestionIndex + 1 < allQuestions.count {
-            withAnimation(NotchAnimation.micro) {
-                currentQuestionIndex += 1
-                resetQuestionState()
-            }
+        var next = wizard
+        if let submission = next.record(answer, for: requestId, questionCount: allQuestions.count) {
+            wizard = next
+            onAnswerMulti(submission)
         } else {
-            onAnswerMulti(collectedAnswers)
+            withAnimation(NotchAnimation.micro) {
+                wizard = next
+            }
         }
     }
 
     private func confirmMultiSelect() {
         guard let item = currentItem, let opts = item.payload.options else { return }
-        let selectedOptions = selectedIndices.sorted().compactMap { idx in
+        let selectedOptions = wizard.selectedIndices.sorted().compactMap { idx in
             opts.indices.contains(idx) ? opts[idx] : nil
         }
-        let customInput = showOtherInput && !otherText.isEmpty ? otherText : nil
+        let customInput = wizard.showOtherInput && !wizard.otherText.isEmpty ? wizard.otherText : nil
         let parts = selectedOptions + (customInput.map { [$0] } ?? [])
         guard !parts.isEmpty else { return }
         advanceWithAnswer(
@@ -1536,20 +1786,9 @@ private struct QuestionBar: View {
     }
 
     private func goBack() {
-        guard currentQuestionIndex > 0, !collectedAnswers.isEmpty else { return }
-        collectedAnswers.removeLast()
         withAnimation(NotchAnimation.micro) {
-            currentQuestionIndex -= 1
-            resetQuestionState()
+            wizard.goBack()
         }
-    }
-
-    private func resetQuestionState() {
-        selectedIndex = nil
-        selectedIndices = []
-        showOtherInput = false
-        otherText = ""
-        textInput = ""
     }
 
     // MARK: - Legacy single-question content (Notification-based)
@@ -1581,8 +1820,8 @@ private struct QuestionBar: View {
             VStack(spacing: 4) {
                 ForEach(Array(options.enumerated()), id: \.offset) { idx, option in
                     let desc = descriptions?.indices.contains(idx) == true ? descriptions?[idx] : nil
-                    OptionRow(index: idx + 1, label: option, description: desc, isSelected: selectedIndex == idx, accent: cyan) {
-                        selectedIndex = idx
+                    OptionRow(index: idx + 1, label: option, description: desc, isSelected: wizard.selectedIndex == idx, accent: cyan) {
+                        wizard.selectedIndex = idx
                         onAnswer(option)
                     }
                 }
@@ -1593,13 +1832,13 @@ private struct QuestionBar: View {
                 Text(">")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundStyle(Color(red: 0.3, green: 0.85, blue: 0.4))
-                TextField(L10n.shared["type_answer"], text: $textInput)
+                TextField(L10n.shared["type_answer"], text: $wizard.textInput)
                     .textFieldStyle(.plain)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.white)
                     .focused($isFocused)
                     .onSubmit {
-                        if !textInput.isEmpty { onAnswer(textInput) }
+                        if !wizard.textInput.isEmpty { onAnswer(wizard.textInput) }
                     }
             }
             .padding(.horizontal, 10)
@@ -1627,7 +1866,7 @@ private struct QuestionBar: View {
                     fg: .white.opacity(0.95),
                     bg: Color(red: 0.16, green: 0.38, blue: 0.18),
                     border: Color(red: 0.28, green: 0.62, blue: 0.32),
-                    action: { if !textInput.isEmpty { onAnswer(textInput) } }
+                    action: { if !wizard.textInput.isEmpty { onAnswer(wizard.textInput) } }
                 )
             }
         }
@@ -1846,6 +2085,7 @@ private struct SessionListView: View {
     /// Grace expiry is a wall-clock deadline, not a state change — without a tick
     /// a finished card would sit there until the next session event.
     @State private var graceTick = Date()
+    @AppStorage(SettingsKey.showClaudeQuota) private var showClaudeQuota = SettingsDefaults.showClaudeQuota
 
     /// How many cards the full list would show — used by the completion card's
     /// "show all" link so it never advertises sessions the list won't render.
@@ -1958,7 +2198,133 @@ private struct SessionListView: View {
                !(usage.last5h.isEmpty && usage.today.isEmpty) {
                 UsageFooterLine(usage: usage)
             }
+            if showClaudeQuota, onlySessionId == nil {
+                if let snapshot = appState.claudeQuota.snapshot {
+                    QuotaFooterLine(snapshot: snapshot, error: appState.claudeQuota.lastError)
+                } else if let error = appState.claudeQuota.lastError {
+                    QuotaFooterMessage(error: error)
+                }
+            }
         }
+    }
+}
+
+// MARK: - Plan limits (Anthropic subscription windows)
+
+private enum QuotaStyle {
+    static let normal = Color.white.opacity(0.85)
+    static let warning = Color(red: 1.0, green: 0.7, blue: 0.28)
+    static let critical = Color(red: 1.0, green: 0.4, blue: 0.4)
+
+    static func color(_ level: ClaudeQuotaLimit.Level) -> Color {
+        switch level {
+        case .normal: return normal
+        case .warning: return warning
+        case .critical: return critical
+        }
+    }
+
+    static func label(_ limit: ClaudeQuotaLimit, l10n: L10n) -> String {
+        switch limit.kind {
+        case .session: return "5h"
+        case .weeklyAll: return l10n["quota_week"]
+        case .weeklyScoped: return limit.scopeLabel ?? l10n["quota_week"]
+        }
+    }
+
+    /// One line per window for tooltips: "5h 3% · resets in 1h20m".
+    static func tooltip(_ snapshot: ClaudeQuotaSnapshot, stale: Bool, l10n: L10n, now: Date = Date()) -> String {
+        var lines = snapshot.ordered.map { limit -> String in
+            var line = "\(label(limit, l10n: l10n)) \(ClaudeQuotaFormat.percent(limit.percent))"
+            if let resetsAt = limit.resetsAt, let cd = ClaudeQuotaFormat.countdown(until: resetsAt, now: now) {
+                line += " · ↻ \(cd)"
+            }
+            return line
+        }
+        if stale { lines.append(l10n["quota_stale"]) }
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// Expanded footer: every window with a mini bar, percent, and reset countdown.
+private struct QuotaFooterLine: View {
+    let snapshot: ClaudeQuotaSnapshot
+    let error: ClaudeQuotaClientError?
+    @ObservedObject private var l10n = L10n.shared
+
+    var body: some View {
+        // Countdowns tick once a minute; the panel is only open briefly.
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            HStack(spacing: 6) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(l10n["quota_label"])
+                    .fontWeight(.semibold)
+                ForEach(Array(snapshot.ordered.enumerated()), id: \.offset) { index, limit in
+                    if index > 0 {
+                        Text("·").foregroundStyle(.white.opacity(0.25))
+                    }
+                    segment(limit, now: context.date)
+                }
+                Spacer()
+                if error != nil {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(QuotaStyle.warning)
+                        .help(l10n["quota_stale"])
+                }
+            }
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundStyle(.white.opacity(0.45))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 5)
+            .help(QuotaStyle.tooltip(snapshot, stale: error != nil, l10n: l10n, now: context.date))
+        }
+    }
+
+    private func segment(_ limit: ClaudeQuotaLimit, now: Date) -> some View {
+        let color = QuotaStyle.color(limit.level)
+        return HStack(spacing: 4) {
+            Text(QuotaStyle.label(limit, l10n: l10n))
+            ZStack(alignment: .leading) {
+                Capsule().fill(.white.opacity(0.12))
+                Capsule().fill(color)
+                    .frame(width: 30 * min(limit.percent / 100, 1))
+            }
+            .frame(width: 30, height: 4)
+            Text(ClaudeQuotaFormat.percent(limit.percent))
+                .foregroundStyle(color)
+            if let resetsAt = limit.resetsAt, let cd = ClaudeQuotaFormat.countdown(until: resetsAt, now: now) {
+                Text("↻\(cd)")
+                    .foregroundStyle(.white.opacity(0.3))
+            }
+        }
+    }
+}
+
+/// Footer fallback when there is no snapshot yet but the fetch failed.
+private struct QuotaFooterMessage: View {
+    let error: ClaudeQuotaClientError
+    @ObservedObject private var l10n = L10n.shared
+
+    private var text: String {
+        switch error {
+        case .unauthorized, .noCredential: return l10n["quota_login_needed"]
+        default: return l10n["quota_unreachable"]
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 9, weight: .semibold))
+            Text(text)
+            Spacer()
+        }
+        .font(.system(size: 10, weight: .medium, design: .monospaced))
+        .foregroundStyle(.white.opacity(0.35))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
     }
 }
 
@@ -2062,19 +2428,32 @@ private struct SessionIdentityLine: View {
     let sessionColor: Color
     let dividerColor: Color
     @AppStorage(SettingsKey.showGitBranch) private var showGitBranch = SettingsDefaults.showGitBranch
+    @AppStorage(SettingsKey.showProjectName) private var showProjectName = SettingsDefaults.showProjectName
 
     private var displaySessionId: String { session.displaySessionId(sessionId: sessionId) }
 
     var body: some View {
+        let headline = session.headline(showProjectName: showProjectName)
         HStack(spacing: 4) {
-            ProjectNameLink(
-                name: session.projectDisplayName,
-                cwd: session.cwd,
-                isInteractive: !session.isRemote,
-                fontSize: projectFontSize,
-                color: projectColor
-            )
-            .layoutPriority(2)
+            if headline.kind == .project {
+                ProjectNameLink(
+                    name: headline.text,
+                    cwd: session.cwd,
+                    isInteractive: !session.isRemote,
+                    fontSize: projectFontSize,
+                    color: projectColor
+                )
+                .layoutPriority(2)
+            } else {
+                // Project name hidden: no folder link and no path tooltip either,
+                // or hovering the card would still reveal it.
+                Text(headline.text)
+                    .font(.system(size: projectFontSize, weight: .bold, design: .monospaced))
+                    .foregroundStyle(projectColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(2)
+            }
 
             if showGitBranch, let branch = session.gitBranch {
                 HStack(spacing: 2) {
@@ -2089,7 +2468,7 @@ private struct SessionIdentityLine: View {
                 .layoutPriority(1)
             }
 
-            if let sessionLabel = session.sessionLabel {
+            if let sessionLabel = headline.trailingSessionLabel {
                 Text("#\(sessionLabel)")
                     .font(.system(size: sessionFontSize, weight: .medium, design: .monospaced))
                     .foregroundStyle(sessionColor)
@@ -2275,8 +2654,9 @@ func startNotchCardJump(
         }
     }
 
-    // Remote sessions have no local terminal to focus
-    guard !session.isRemote else { return nil }
+    // Remote sessions have no local terminal to focus; an unverified harness
+    // (T3 Code server whose URL is unknown) has nowhere to go either.
+    guard session.canJumpFromNotch else { return nil }
 
     TerminalActivator.activate(session: session, sessionId: sessionId)
 
@@ -2345,6 +2725,9 @@ private struct SessionCard: View {
     @AppStorage(SettingsKey.aiMessageLines) private var aiMessageLines = SettingsDefaults.aiMessageLines
     @AppStorage(SettingsKey.showAgentDetails) private var showAgentDetails = SettingsDefaults.showAgentDetails
     @AppStorage(SettingsKey.autoCollapseAfterSessionJump) private var autoCollapseAfterSessionJump = SettingsDefaults.autoCollapseAfterSessionJump
+    @AppStorage(SettingsKey.showTaskProgress) private var showTaskProgress = SettingsDefaults.showTaskProgress
+    @AppStorage(SettingsKey.showSessionRecap) private var showSessionRecap = SettingsDefaults.showSessionRecap
+    @AppStorage(SettingsKey.showModelLabel) private var showModelLabel = SettingsDefaults.showModelLabel
     private var fontSize: CGFloat { CGFloat(contentFontSize) }
     private var aiLineLimit: Int? { aiMessageLines > 0 ? aiMessageLines : nil }
     private var approvalQueueIndex: Int? {
@@ -2410,7 +2793,7 @@ private struct SessionCard: View {
                             HStack(spacing: 1) {
                                 ForEach(row, id: \.agentId) { sub in
                                     MiniAgentIcon(active: sub.status != .idle, size: 8)
-                                        .help(subagentTooltipText(sub))
+                                        .help(subagentTooltipText(sub, showModel: showModelLabel))
                                 }
                             }
                         }
@@ -2447,6 +2830,11 @@ private struct SessionCard: View {
                         if session.isYoloMode == true {
                             SessionTag("YOLO", color: Color(red: 1.0, green: 0.35, blue: 0.35))
                         }
+                        if showModelLabel, let modelLabel = session.modelLabel {
+                            SessionTag(modelLabel, color: SessionMetadataStyle.modelTagColor)
+                                .lineLimit(1)
+                                .help(session.model ?? modelLabel)
+                        }
                         SessionTag(timeAgo(session.startTime))
                         TerminalBadge(session: session)
                     }
@@ -2454,7 +2842,9 @@ private struct SessionCard: View {
 
                 // Inline approval controls (when user keeps panel in session list)
                 if session.status == .waitingApproval, let idx = approvalQueueIndex {
-                    let tool = session.currentTool ?? (appState.permissionQueue[idx].event.toolName ?? "Unknown")
+                    // Approval details require the provider's raw tool name; the
+                    // session itself may hold a friendly Codex activity label.
+                    let tool = appState.permissionQueue[idx].event.toolName ?? session.currentTool ?? "Unknown"
                     let input = appState.permissionQueue[idx].event.toolInput
                     HStack(spacing: 8) {
                         Text(String(format: L10n.shared["approval_queue_label"], idx + 1, appState.permissionQueue.count, tool))
@@ -2556,6 +2946,35 @@ private struct SessionCard: View {
                     }
                 }
 
+                // Agent checklist progress (TaskCreate / TodoWrite / update_plan).
+                if showTaskProgress && !session.agentTasks.isEmpty {
+                    AgentTaskProgressView(tasks: session.agentTasks, fontSize: fontSize, agentIsIdle: session.status == .idle)
+                }
+
+                // A question waiting on this session that is not on screen
+                // (auto-expand off, Smart Suppress, or queued behind another
+                // card): the session card itself cannot answer it, so offer the
+                // way to its card rather than only a jump to the terminal.
+                if session.status == .waitingQuestion,
+                   !showsExternalCursorQuestion,
+                   appState.pendingQuestion(forSession: sessionId) != nil,
+                   appState.surface.questionSessionId != sessionId {
+                    HStack(spacing: 8) {
+                        Text(L10n.shared["question_waiting_inline"])
+                            .font(.system(size: fontSize, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Color(red: 1.0, green: 0.6, blue: 0.2).opacity(0.85))
+                            .lineLimit(1)
+                        Spacer(minLength: 8)
+                        inlineActionButton(
+                            L10n.shared["question_answer"],
+                            fg: .white,
+                            bg: Color(red: 0.25, green: 0.55, blue: 0.85),
+                            enabled: true,
+                            action: { appState.openPendingQuestionCard(sessionId: sessionId) }
+                        )
+                    }
+                }
+
                 // Session title: first user prompt (hide when detailed mode shows chat history)
                 if let prompt = session.lastUserPrompt,
                    session.recentMessages.isEmpty {
@@ -2580,6 +2999,12 @@ private struct SessionCard: View {
                     // the message it sits under.
                     let liveStatusShown = session.status != .idle && !showsExternalCursorQuestion
                     let blockCount = visibleMessages.count
+                    let fullReplyId = CompletionReplyMetrics.fullReplyId(in: visibleMessages, isCompletionCard: isCompletion)
+                    let olderReplyLimit = isCompletion
+                        ? CompletionReplyMetrics.olderReplyLineLimit(aiLineLimit)
+                        : aiLineLimit
+                    // enumerated() for the ramp: the row needs its distance from
+                    // the bottom, which its identity alone does not carry.
                     ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { idx, msg in
                         // Extracted to separate view so SwiftUI skips re-rendering
                         // when only the parent's hover state changes (#52 perf).
@@ -2587,7 +3012,9 @@ private struct SessionCard: View {
                             text: msg.text,
                             isUser: msg.isUser,
                             fontSize: fontSize,
-                            aiLineLimit: aiLineLimit
+                            aiLineLimit: olderReplyLimit,
+                            isCompletionReply: msg.id == fullReplyId,
+                            pinsHeight: isCompletion
                         )
                         .opacity(SessionMessageFocus.opacity(indexFromBottom: blockCount - 1 - idx))
                     }
@@ -2606,7 +3033,9 @@ private struct SessionCard: View {
                                 MorphText(
                                     text: session.toolDescription ?? tool,
                                     font: .system(size: fontSize, design: .monospaced),
-                                    color: .white.opacity(0.75)
+                                    color: .white.opacity(0.75),
+                                    streamsRapidly: SessionSnapshot.rapidStreamingSources
+                                        .contains(session.source)
                                 )
                                 .truncationMode(.tail)
                             } else {
@@ -2615,6 +3044,24 @@ private struct SessionCard: View {
                         }
                     }
                 }
+                .padding(.leading, 4)
+            }
+
+            // Claude Code's idle recap — the newest thing in an idle session,
+            // so it sits under the chat rows. visibleRecap is nil while working.
+            if showSessionRecap, let recap = session.visibleRecap {
+                SessionRecapRow(
+                    text: recap.text,
+                    fontSize: fontSize,
+                    lineLimit: isCompletion
+                        ? CompletionReplyMetrics.recapLineLimit
+                        : aiLineLimit.map { max($0, 2) }
+                )
+                .equatable()
+                // On the completion card the reply's scroll area is sized
+                // around this row; squeezed to one line it would be measured
+                // short and never get its second line back.
+                .fixedSize(horizontal: false, vertical: isCompletion)
                 .padding(.leading, 4)
             }
             } // end Column 2 VStack
@@ -2639,7 +3086,7 @@ private struct SessionCard: View {
     private func handleSessionClick() {
         TerminalActivator.activate(session: session, sessionId: sessionId)
 
-        guard autoCollapseAfterSessionJump, !session.isRemote else { return }
+        guard autoCollapseAfterSessionJump, session.canJumpFromNotch else { return }
 
         jumpValidationTask?.cancel()
         jumpValidationTask = Task {
@@ -2888,7 +3335,7 @@ private struct TerminalBadge: View {
     private static let sourceBundleIds: [String: String] = [
         "cursor": "com.todesktop.230313mzl4w4u92",
         "trae": "com.trae.app",
-        "traecn": "com.trae.app",
+        "traecn": "cn.trae.app",
         "qoder": "com.qoder.ide",
         "droid": "com.factory.app",
         "codebuddy": "com.tencent.codebuddy",
@@ -2896,6 +3343,8 @@ private struct TerminalBadge: View {
         "stepfun": "com.stepfun.app",
         "codex": "com.openai.codex",
         "opencode": "ai.opencode.desktop",
+        "aiwork": "com.alipay.dtcoder.ide",
+        "aiwork-cli": "com.alipay.dtcoder.ide",
     ]
     private static var termIconCache: [String: NSImage] = [:]
 
@@ -2937,6 +3386,23 @@ private struct TerminalBadge: View {
         }
     }
 
+    /// Same chip for the UI harness that spawned the CLI (T3 Code): the
+    /// terminal badge still names where the harness server runs, the chip
+    /// says the conversation itself lives in the harness (#321).
+    @ViewBuilder
+    private func hostHarnessChip(fg: Color, bg: Color) -> some View {
+        if let harness = session.hostHarnessLabel {
+            Text(harness)
+                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .foregroundStyle(fg)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(bg)
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .help(String(format: L10n.shared["hosted_by_harness_hint"], harness))
+        }
+    }
+
     var body: some View {
         Group {
             if session.isRemote {
@@ -2970,6 +3436,7 @@ private struct TerminalBadge: View {
                             .foregroundStyle(.white.opacity(0.5))
                     }
                     multiplexerChip(fg: .white.opacity(0.5), bg: .white.opacity(0.1))
+                    hostHarnessChip(fg: .white.opacity(0.5), bg: .white.opacity(0.1))
                 }
             }
         }
@@ -3018,6 +3485,11 @@ private let cliIconFiles: [String: String] = [
     "opencode": "opencode",
     "cline": "cline",
     "dsh": "dsh",
+    // AiWork (formerly DTCoder). GUI and CLI share one asset, as qoder/qoder-cli
+    // and cursor/cursor-cli do; the NSWorkspace branch in cliIcon() prefers the
+    // installed app's own icon and falls back to this when AiWork is absent.
+    "aiwork": "aiwork",
+    "aiwork-cli": "aiwork",
     // Rendered from the in-house pixel mascots via
     // MascotRenderHarness/testRenderCliIcons (MASCOT_ICON_DIR=…).
     "kiro": "kiro",
@@ -3029,6 +3501,17 @@ private var cliIconCache: [String: NSImage] = [:]
 func cliIcon(source: String, size: CGFloat = 16) -> NSImage? {
     let key = "\(source)_\(Int(size))"
     if let cached = cliIconCache[key] { return cached }
+
+    // AiWork (formerly DTCoder): prefer the installed app's own icon, falling
+    // back to the bundled aiwork.png below when AiWork is not installed.
+    if source == "aiwork" || source == "aiwork-cli",
+       let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.alipay.dtcoder.ide") {
+        let icon = NSWorkspace.shared.icon(forFile: appURL.path)
+        icon.size = NSSize(width: size, height: size)
+        cliIconCache[key] = icon
+        return icon
+    }
+
     guard let filename = cliIconFiles[source],
           let url = Bundle.appModule.url(forResource: filename, withExtension: "png", subdirectory: "Resources/cli-icons"),
           let image = NSImage(contentsOf: url)
@@ -3200,25 +3683,6 @@ struct MiniAgentIcon: View {
 
 // MARK: - Shared Helpers
 
-/// Inline markdown rendering (bold, italic, code, links)
-private var markdownCache: [String: AttributedString] = [:]
-private let markdownCacheLimit = 128
-
-private func inlineMarkdown(_ text: String) -> AttributedString {
-    if let cached = markdownCache[text] { return cached }
-    let result: AttributedString
-    if let attr = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-        result = attr
-    } else {
-        result = AttributedString(text)
-    }
-    if markdownCache.count >= markdownCacheLimit {
-        markdownCache.removeAll(keepingCapacity: true)
-    }
-    markdownCache[text] = result
-    return result
-}
-
 /// Generate a short session ID with better disambiguation.
 private func shortSessionId(_ id: String) -> String {
     let clean = id.replacingOccurrences(of: "-", with: "")
@@ -3232,8 +3696,12 @@ private func shortSessionId(_ id: String) -> String {
 /// the SwiftUI ViewBuilder so the body stays trivial — complex inline
 /// expressions in ForEach were measurably slowing the hover-expand
 /// animation per #141 review.
-private func subagentTooltipText(_ sub: SubagentState) -> String {
-    let typeLabel = sub.agentType.isEmpty ? "Subagent" : sub.agentType
+private func subagentTooltipText(_ sub: SubagentState, showModel: Bool = false) -> String {
+    var typeLabel = sub.agentType.isEmpty ? "Subagent" : sub.agentType
+    // The subagent's own model — it often differs from the parent card's tag.
+    if showModel, let model = sub.modelLabel {
+        typeLabel += " · \(model)"
+    }
     var detail = ""
     if let tool = sub.currentTool, !tool.isEmpty {
         detail = tool
@@ -3242,6 +3710,47 @@ private func subagentTooltipText(_ sub: SubagentState) -> String {
         }
     }
     return detail.isEmpty ? typeLabel : "\(typeLabel) — \(detail)"
+}
+
+// MARK: - Session metadata (recap + model tag)
+
+enum SessionMetadataStyle {
+    static let modelTagColor = Color(red: 0.55, green: 0.82, blue: 0.78)
+    /// Recap glyph tint — distinct from the green ">" user and orange "$"
+    /// reply markers so a recap never reads as the agent speaking.
+    static let recapAccent = Color(red: 0.6, green: 0.68, blue: 1.0)
+
+    /// Tooltip for the collapsed bar: the displayed idle session's recap,
+    /// headed like its card — so with "Show project name" off it names the
+    /// session title (or the agent), never the folder.
+    static func collapsedRecapTooltip(for session: SessionSnapshot?, showProjectName: Bool) -> String {
+        guard let session, let recap = session.visibleRecap else { return "" }
+        return "↻ \(session.headline(showProjectName: showProjectName).text)\n\(recap.text)"
+    }
+}
+
+/// Claude Code's "while you were away" recap on an idle card: a ↻ marker and
+/// secondary-colored text, set apart from the "$" last-reply rows.
+private struct SessionRecapRow: View, Equatable {
+    let text: String
+    let fontSize: CGFloat
+    let lineLimit: Int?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 4) {
+            Text("↻")
+                .font(.system(size: fontSize, weight: .bold, design: .monospaced))
+                .foregroundStyle(SessionMetadataStyle.recapAccent)
+            Text(text)
+                .font(.system(size: fontSize, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.55))
+                .lineLimit(lineLimit)
+                .truncationMode(.tail)
+        }
+        .help(text)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(L10n.shared["session_recap"]): \(text)")
+    }
 }
 
 /// Strip internal directives (::code-comment{}, ::git-*{}, etc.) from message text
@@ -3255,10 +3764,18 @@ private struct ChatMessageRow: View, Equatable {
     let isUser: Bool
     let fontSize: CGFloat
     let aiLineLimit: Int?
+    /// The finished reply on the completion card: rendered in full, ignoring
+    /// aiLineLimit.
+    var isCompletionReply = false
+    /// Keep a capped reply at its full height (up to the cap) instead of
+    /// letting a crowded card squeeze it — on the completion card, where the
+    /// reply's scroll area is sized around these rows.
+    var pinsHeight = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.text == rhs.text && lhs.isUser == rhs.isUser
         && lhs.fontSize == rhs.fontSize && lhs.aiLineLimit == rhs.aiLineLimit
+        && lhs.isCompletionReply == rhs.isCompletionReply && lhs.pinsHeight == rhs.pinsHeight
     }
 
     var body: some View {
@@ -3278,24 +3795,18 @@ private struct ChatMessageRow: View, Equatable {
                 Text("$")
                     .font(.system(size: fontSize, weight: .bold, design: .monospaced))
                     .foregroundStyle(Color(red: 0.85, green: 0.47, blue: 0.34))
-                Text(ChatMessageTextFormatter.inlineMarkdown(compactText(stripDirectives(text))))
-                    .font(.system(size: fontSize, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.85))
-                    .lineLimit(aiLineLimit)
-                    .truncationMode(.tail)
+                // Block Markdown when uncapped or on the completion card, a
+                // marker-free preview under the reply-line cap
+                // (MarkdownReplyView.swift).
+                AssistantReplyText(
+                    text: stripDirectives(text),
+                    fontSize: fontSize,
+                    lineLimit: aiLineLimit,
+                    isCompletionReply: isCompletionReply
+                )
+                .fixedSize(horizontal: false, vertical: pinsHeight && !isCompletionReply)
             }
         }
-    }
-
-    private func compactText(_ text: String) -> String {
-        text.components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .reduce(into: [String]()) { result, line in
-                if line.isEmpty && (result.last?.isEmpty ?? true) { return }
-                result.append(line)
-            }
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

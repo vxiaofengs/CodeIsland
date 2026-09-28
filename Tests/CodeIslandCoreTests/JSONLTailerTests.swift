@@ -160,6 +160,91 @@ final class JSONLTailerTests: XCTestCase {
         XCTAssertFalse(result.delta.isEmpty)
     }
 
+    func testScanLinesExtractsCodexPublicAgentMessage() {
+        let line = #"{"type":"event_msg","payload":{"type":"agent_message","message":"Checking the affected call sites now."}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertEqual(result.delta.lastAssistantMessage, "Checking the affected call sites now.")
+        XCTAssertTrue(result.delta.hasActivity)
+    }
+
+    func testScanLinesExtractsCodexAssistantOutputText() {
+        let line = #"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The focused tests now pass."}]}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertEqual(result.delta.lastAssistantMessage, "The focused tests now pass.")
+        XCTAssertTrue(result.delta.hasActivity)
+    }
+
+    /// Shape copied from a real Codex 0.155 rollout: model output carries a
+    /// Responses API `id` between the payload `type` and `role`, plus trailing
+    /// `phase` / metadata keys. Paginated rollouts (the TUI/exec default) no
+    /// longer persist `event_msg` `agent_message`, so this record is the only
+    /// place public assistant text appears.
+    func testScanLinesExtractsCodexAssistantOutputTextWithResponseId() {
+        let line = #"{"timestamp":"2026-09-22T10:30:08.122Z","ordinal":12,"type":"response_item","payload":{"type":"message","id":"msg_06d3529cdc545225016ab258ae4a9487d0b31be86b7c8d5a90","role":"assistant","content":[{"type":"output_text","text":"Checking the parser first."}],"phase":"commentary","internal_chat_message_metadata_passthrough":{"turn_id":"t1"}}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertEqual(result.delta.lastAssistantMessage, "Checking the parser first.")
+        XCTAssertTrue(result.delta.hasActivity)
+    }
+
+    func testScanLinesIgnoresCodexUserAndDeveloperMessagesWithResponseId() {
+        let lines = [
+            #"{"type":"response_item","payload":{"type":"message","id":"msg_1","role":"developer","content":[{"type":"input_text","text":"<app-context>"}]}}"#,
+            #"{"type":"response_item","payload":{"type":"message","id":"msg_2","role":"user","content":[{"type":"input_text","text":"say \"role\":\"assistant\" and \"type\":\"output_text\""}]}}"#,
+        ].joined(separator: "\n")
+        let result = JSONLTailer.scanLines(Data((lines + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+    }
+
+    func testScanLinesIgnoresPaginatedCodexReasoningItems() {
+        let line = #"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"t","turn_id":"u","item":{"type":"Reasoning","id":"rs_1","summary_text":["private summary"],"raw_content":["private reasoning"]}}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+    }
+
+    func testScanLinesIgnoresCodexReasoningEvenWhenItHasASummary() {
+        let line = #"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Reviewing transcript parsing"}],"content":[{"type":"text","text":"hidden chain of thought"}],"encrypted_content":"secret"}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+    }
+
+    func testScanLinesIgnoresCodexResponseItemAgentMessageWithMessageField() {
+        let line = #"{"type":"response_item","payload":{"type":"agent_message","message":"private delegation","author":"/root","recipient":"/root/worker"}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+        XCTAssertFalse(result.delta.hasActivity)
+    }
+
+    func testScanLinesIgnoresCodexPrivateReasoningAndInterAgentMessages() {
+        let lines = [
+            #"{"type":"response_item","payload":{"type":"reasoning","summary":[],"content":[{"type":"text","text":"hidden chain of thought"}],"encrypted_content":"secret"}}"#,
+            #"{"type":"response_item","payload":{"type":"agent_message","author":"/root","recipient":"/root/worker","content":[{"type":"input_text","text":"private delegation"}]}}"#
+        ].joined(separator: "\n")
+        let result = JSONLTailer.scanLines(Data((lines + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+        XCTAssertFalse(result.delta.hasActivity)
+    }
+
+    func testScanLinesClearsPreviousCodexOutputAtNewTurnBoundary() {
+        let lines = [
+            #"{"type":"event_msg","payload":{"type":"agent_message","message":"Old answer"}}"#,
+            #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            #"{"type":"event_msg","payload":{"type":"user_message","message":"New task"}}"#,
+        ].joined(separator: "\n")
+        let result = JSONLTailer.scanLines(Data((lines + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+        XCTAssertEqual(result.delta.lastUserPrompt, "New task")
+        XCTAssertEqual(result.delta.turnStatus, .processing)
+    }
+
     func testScanLinesExtractsGrokChatHistoryRows() {
         let lines = [
             #"{"type":"user","content":[{"type":"text","text":"build it"}]}"#,
@@ -456,6 +541,119 @@ final class JSONLTailerTests: XCTestCase {
 
         wait(for: [fresh], timeout: 2)
         tailer.detach(sessionId: "s1")
+    }
+
+    func testReplacedFileHistoryIsDeliveredOnceAsAReplayThenLiveAgain() throws {
+        let url = temporaryFileURL()
+        let backup = url.deletingLastPathComponent()
+            .appendingPathComponent(url.lastPathComponent + ".old")
+        try Data("".utf8).write(to: url)
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: backup)
+        }
+
+        let replay = expectation(description: "history replayed")
+        let live = expectation(description: "next append is live")
+        let deltas = LockedValue<[ConversationTailDelta]>([])
+        let tailer = JSONLTailer(
+            queue: DispatchQueue(label: "tailer-test"),
+            replacementReattachDelay: .milliseconds(50),
+            onDelta: { delta in
+                deltas.update { $0.append(delta) }
+                if delta.lastAssistantMessage == "history" { replay.fulfill() }
+                if delta.lastAssistantMessage == "news" { live.fulfill() }
+            }
+        )
+        tailer.attach(sessionId: "s1", filePath: url.path)
+        XCTAssertTrue(waitUntil { tailer.activeSessionCount == 1 })
+
+        // Replaced by a file that already has history; no further write.
+        try FileManager.default.moveItem(at: url, to: backup)
+        try Data((assistantLine(text: "history") + "\n").utf8).write(to: url)
+        wait(for: [replay], timeout: 2)
+
+        try appendToFile(url: url, content: assistantLine(text: "news") + "\n")
+        wait(for: [live], timeout: 2)
+        tailer.detach(sessionId: "s1")
+
+        XCTAssertEqual(deltas.value.map(\.replaysWholeFile), [true, false])
+    }
+
+    // MARK: - Attach offset shared with the backfill
+
+    /// Lines written after the caller's backfill stopped but before the watch
+    /// was armed must be read at once — no later write may ever come (a
+    /// Codex turn that already ended).
+    func testAttachAtAnOffsetReadsWhatFollowsItWithoutWaitingForAWrite() throws {
+        let url = temporaryFileURL()
+        let seen = userLine(text: "already backfilled") + "\n"
+        let missed = assistantLine(text: "written in the gap") + "\n"
+        try Data((seen + missed).utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let delivered = expectation(description: "gap line delivered")
+        let captured = LockedValue<ConversationTailDelta?>(nil)
+        let tailer = JSONLTailer(
+            queue: DispatchQueue(label: "tailer-test"),
+            onDelta: { delta in
+                captured.set(delta)
+                delivered.fulfill()
+            }
+        )
+        tailer.attach(sessionId: "s1", filePath: url.path, initialOffset: UInt64(seen.utf8.count))
+
+        wait(for: [delivered], timeout: 2)
+        XCTAssertEqual(captured.value?.lastAssistantMessage, "written in the gap")
+        XCTAssertNil(captured.value?.lastUserPrompt, "bytes before the offset belong to the backfill")
+        tailer.detach(sessionId: "s1")
+    }
+
+    func testAttachAtAnOffsetCompletesARowThatWasStillBeingWritten() throws {
+        let url = temporaryFileURL()
+        let full = assistantLine(text: "finished later") + "\n"
+        let cut = full.index(full.startIndex, offsetBy: full.count / 2)
+        let head = userLine(text: "q") + "\n"
+        try Data((head + String(full[..<cut])).utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let scan = try XCTUnwrap(JSONLTailer.scanTailForAttach(path: url.path))
+        XCTAssertEqual(scan.endOffset, UInt64(head.utf8.count), "the tailer starts at the row being written")
+        XCTAssertEqual(scan.delta.lastUserPrompt, "q")
+        XCTAssertNil(scan.delta.lastAssistantMessage)
+
+        let delivered = expectation(description: "completed row delivered")
+        let tailer = JSONLTailer(
+            queue: DispatchQueue(label: "tailer-test"),
+            onDelta: { delta in
+                if delta.lastAssistantMessage == "finished later" { delivered.fulfill() }
+            }
+        )
+        tailer.attach(sessionId: "s1", filePath: url.path, initialOffset: scan.endOffset)
+        XCTAssertTrue(waitUntil { tailer.activeSessionCount == 1 })
+        try appendToFile(url: url, content: String(full[cut...]))
+
+        wait(for: [delivered], timeout: 2)
+        tailer.detach(sessionId: "s1")
+    }
+
+    func testScanTailForAttachSkipsTheCutFirstRowAndReadsAnUnterminatedLastRow() throws {
+        let url = temporaryFileURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let early = userLine(text: String(repeating: "e", count: 400)) + "\n"
+        let prompt = userLine(text: "in window") + "\n"
+        // Cursor never ends its last row with a newline.
+        let last = #"{"role":"assistant","message":{"content":[{"type":"text","text":"cursor reply"}]}}"#
+        try Data((early + prompt + last).utf8).write(to: url)
+
+        let scan = try XCTUnwrap(JSONLTailer.scanTailForAttach(path: url.path, maxBytes: prompt.utf8.count + last.utf8.count + 10))
+        XCTAssertEqual(scan.delta.lastUserPrompt, "in window", "the cut first row is dropped, not misparsed")
+        XCTAssertEqual(scan.delta.lastAssistantMessage, "cursor reply")
+        XCTAssertEqual(scan.endOffset, UInt64(early.utf8.count + prompt.utf8.count))
+
+        // A window that starts exactly on a row boundary keeps that row.
+        let exact = try XCTUnwrap(JSONLTailer.scanTailForAttach(path: url.path, maxBytes: prompt.utf8.count + last.utf8.count))
+        XCTAssertEqual(exact.delta.lastUserPrompt, "in window")
     }
 
     // MARK: - Fixtures

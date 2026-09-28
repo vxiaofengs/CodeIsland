@@ -1,5 +1,6 @@
 import XCTest
 @testable import CodeIsland
+import CodeIslandCore
 
 final class NotchPanelViewTests: XCTestCase {
     func testEffectiveNotchWidthAppliesCollapsedWidthScaleOnNonNotchScreens() {
@@ -75,6 +76,42 @@ final class NotchPanelViewTests: XCTestCase {
         XCTAssertTrue(compact.hasPrefix("mcp"))
         XCTAssertTrue(compact.hasSuffix("document_page"))
         XCTAssertTrue(compact.contains("..."))
+    }
+
+    func testCodexLiveOutputSummaryNormalizesAndTruncatesPublicText() {
+        var session = SessionSnapshot()
+        session.source = "codex"
+        session.status = .processing
+        session.liveCodexOutput = "  Checking\n  the affected call sites now.  "
+
+        XCTAssertEqual(
+            SessionLiveOutputDisplay.summary(for: session, maxCharacters: 24),
+            "Checking the affected c\u{2026}"
+        )
+    }
+
+    func testCodexLiveOutputSummaryDoesNotFallBackToStaleHistory() {
+        var session = SessionSnapshot()
+        session.source = "codex"
+        session.status = .processing
+        session.recentMessages = [
+            ChatMessage(isUser: false, text: "Old answer"),
+            ChatMessage(isUser: true, text: "New task")
+        ]
+
+        XCTAssertNil(SessionLiveOutputDisplay.summary(for: session))
+    }
+
+    func testLiveOutputSummaryIsLimitedToActiveCodexSessions() {
+        var session = SessionSnapshot()
+        session.source = "claude"
+        session.status = .processing
+        session.liveCodexOutput = "Claude output"
+        XCTAssertNil(SessionLiveOutputDisplay.summary(for: session))
+
+        session.source = "codex"
+        session.status = .idle
+        XCTAssertNil(SessionLiveOutputDisplay.summary(for: session))
     }
 
     func testShouldTriggerJumpFailureFeedbackWhenAllAttemptsFail() {
@@ -231,22 +268,6 @@ final class NotchHoverInteractionTests: XCTestCase {
     func testCollapseDelayWhileNotExpandedIsANoOp() {
         XCTAssertEqual(NotchHoverInteraction.nextPhase(from: .collapsed, event: .collapseDelayElapsed), .collapsed)
         XCTAssertEqual(NotchHoverInteraction.nextPhase(from: .prehover, event: .collapseDelayElapsed), .prehover)
-    }
-
-    func testHoverExpandDelayClampsToSliderBounds() {
-        XCTAssertEqual(NotchHoverInteraction.clampedExpandDelay(0.3), 0.3, accuracy: 0.0001)
-        // Zero is a valid choice — it means expand without waiting.
-        XCTAssertEqual(NotchHoverInteraction.clampedExpandDelay(0), 0, accuracy: 0.0001)
-        // A stale or hand-edited value must not strand the panel.
-        XCTAssertEqual(NotchHoverInteraction.clampedExpandDelay(-5), NotchHoverInteraction.minExpandDelay, accuracy: 0.0001)
-        XCTAssertEqual(NotchHoverInteraction.clampedExpandDelay(30), NotchHoverInteraction.maxExpandDelay, accuracy: 0.0001)
-    }
-
-    func testHoverExpandDelayDefaultSitsInsideTheBounds() {
-        XCTAssertGreaterThanOrEqual(SettingsDefaults.hoverExpandDelay, NotchHoverInteraction.minExpandDelay)
-        XCTAssertLessThanOrEqual(SettingsDefaults.hoverExpandDelay, NotchHoverInteraction.maxExpandDelay)
-        // Unchanged default keeps the behaviour users are used to.
-        XCTAssertEqual(SettingsDefaults.hoverExpandDelay, NotchHoverInteraction.expandDelay, accuracy: 0.0001)
     }
 
     func testWidthScaleQuantizesAndClampsSliderValues() {
@@ -421,5 +442,17 @@ final class NotchHoverInteractionTests: XCTestCase {
 
     func testSessionJumpValidationUsesThreeIncreasingDelays() {
         XCTAssertEqual(sessionJumpValidationDelays, [120_000_000, 320_000_000, 640_000_000])
+    }
+
+    /// #297 — a question card popping up (or opening under a passing mouse)
+    /// must not pull the caret out of the editor the user is typing in.
+    func testQuestionFieldDoesNotTakeFocusWhileTheUserIsElsewhere() {
+        XCTAssertFalse(NotchCardFocusPolicy.shouldFocusQuestionFieldOnAppear(panelIsKeyWindow: false))
+    }
+
+    /// Once the user has clicked into the island it already holds the keyboard,
+    /// so landing the caret in the answer field only saves them a second click.
+    func testQuestionFieldTakesFocusWhenTheUserIsAlreadyInThePanel() {
+        XCTAssertTrue(NotchCardFocusPolicy.shouldFocusQuestionFieldOnAppear(panelIsKeyWindow: true))
     }
 }

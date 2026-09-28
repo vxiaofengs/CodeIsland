@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CodeIslandCore
 import Yams
 
@@ -23,8 +24,9 @@ enum HookFormat {
     case nested
     /// Cursor style: [{command: "..."}]
     case flat
-    /// Trae IDE / Trae CN style:
+    /// Trae IDE / Trae CN (TraeCode desktop) style:
     /// {version, hooks: {event: [{matcher, loop_limit, hooks: [{type, command, timeout}]}]}}
+    /// with Claude-style PascalCase event names.
     case traeIDE
     /// TraeCli style: YAML managed block in ~/.trae/traecli.yaml
     case traecli
@@ -121,6 +123,11 @@ struct CLIConfig {
     var displayPathOverride: (@Sendable () -> String)? = nil
     /// Optional override for the `--source` value passed to the bridge.
     var bridgeSourceOverride: String? = nil
+    /// Set on the copies `ConfigInstaller.extraConfigDirCLI(for:)` makes of the
+    /// Claude / Codex / Grok entries for an extra config root registered in
+    /// Settings; `rootOverride` then points at that root. Nil for every
+    /// built-in and custom entry.
+    var extraConfigDir: String? = nil
 
     var fullPath: String {
         if let override = rootOverride {
@@ -271,6 +278,10 @@ struct ConfigInstaller {
                 ("PostToolUseFailure", 5, true),
                 ("PermissionRequest", 86400, false),
                 ("Stop", 5, true),
+                // Fires *instead of* Stop when the turn ends on an API error
+                // (rate limit, overload, auth, billing…). It is the only
+                // turn-level failure signal, so it owns the error sound.
+                ("StopFailure", 5, true),
                 ("SubagentStart", 5, true),
                 ("SubagentStop", 5, true),
                 ("SessionStart", 5, false),
@@ -280,6 +291,10 @@ struct ConfigInstaller {
             ],
             versionedEvents: [
                 "PostToolUseFailure": "2.1.89",
+                // Added in Claude Code 2.1.78 (CHANGELOG: "Added `StopFailure`
+                // hook event…"); gated like PostToolUseFailure so an older
+                // build never sees a hook key it does not know.
+                "StopFailure": "2.1.78",
             ],
             rootOverride: { ClaudeConfigPaths.configDir() },
             displayPathOverride: { ClaudeConfigPaths.displayPath(ClaudeConfigPaths.settingsPath()) }
@@ -300,7 +315,12 @@ struct ConfigInstaller {
                 // stays in "running" and the approval sound never plays —
                 // see issue #145 and developers.openai.com/codex/hooks.
                 ("PermissionRequest", 86400, false),
+                ("PreCompact", 5, false),
+                ("PostCompact", 5, false),
+                ("SubagentStart", 5, false),
+                ("SubagentStop", 5, false),
                 ("Stop", 5, false),
+                ("Interrupt", 5, false),
             ],
             rootOverride: { ConfigInstaller.codexHome() },
             displayPathOverride: { ConfigInstaller.displayCodexPath(filename: "hooks.json") }
@@ -663,7 +683,7 @@ struct ConfigInstaller {
                 ("PostToolUse", 5, false),
                 ("Stop", 5, false),
             ]
-        case .flat, .traeIDE:
+        case .flat:
             return [
                 ("beforeSubmitPrompt", 5, false),
                 ("beforeShellExecution", 5, false),
@@ -675,6 +695,22 @@ struct ConfigInstaller {
                 ("afterAgentThought", 5, false),
                 ("afterAgentResponse", 5, false),
                 ("stop", 5, false),
+            ]
+        case .traeIDE:
+            // TraeCode (Trae / Trae CN desktop) fires exactly these six
+            // Claude-style events; both editions document the same list
+            // (docs.trae.ai/ide/hook-configuration-reference,
+            // docs.trae.cn/ide_hook-configuration-reference). The Cursor-style
+            // camelCase names we used to share with `.flat` never fire there.
+            // Notification runs async and TRAE ignores its stdout, so it gets
+            // the same short timeout as the status events.
+            return [
+                ("SessionStart", 5, false),
+                ("UserPromptSubmit", 5, false),
+                ("PreToolUse", 5, false),
+                ("PostToolUse", 5, false),
+                ("Stop", 5, false),
+                ("Notification", 5, false),
             ]
         case .traecli:
             return [
@@ -751,11 +787,15 @@ struct ConfigInstaller {
             return []
         case .antigravityNamed:
             // Antigravity hooks.json uses Claude-style PascalCase event names.
-            // We install the three actionable events for status/permission.
+            // We install the three actionable events for status.
             // PreInvocation/PostInvocation are pass-through with no internal
             // meaning, so they're omitted. Timeout is in SECONDS (docs default 30).
+            // PreToolUse no longer waits on an island card — the bridge answers
+            // `ask` at once (#339) — and a hook Antigravity has to kill counts
+            // as a denial, so it keeps the documented default rather than a
+            // day-long ceiling nothing should ever reach.
             return [
-                ("PreToolUse", 86400, false),
+                ("PreToolUse", 30, false),
                 ("PostToolUse", 5, false),
                 ("Stop", 5, false),
             ]
@@ -955,6 +995,13 @@ struct ConfigInstaller {
             }
         }
 
+        // Extra config roots registered in Settings → Hooks. A root that is gone
+        // or no longer looks like the CLI's is skipped (its row says why) and
+        // does not fail the reinstall; only a failed write does.
+        for cli in extraConfigDirCLIs() where isEnabled(source: cli.source) {
+            if installHooks(inExtraDir: cli, fm: fm) == .failed { ok = false }
+        }
+
         // Codex requires hooks = true in config.toml
         if isEnabled(source: "codex"),
            fm.fileExists(atPath: codexHome()) {
@@ -1012,6 +1059,10 @@ struct ConfigInstaller {
                 uninstallHooks(cli: cli, fm: fm)
             }
         }
+        // Every registered extra root, paused ones included.
+        for cli in extraConfigDirCLIs(includeDisabled: true) {
+            uninstallHooks(cli: cli, fm: fm)
+        }
 
         uninstallOpencodePlugin(fm: fm)
     }
@@ -1025,6 +1076,11 @@ struct ConfigInstaller {
 
     /// Check if a specific CLI's hooks are installed
     static func isInstalled(source: String) -> Bool {
+        if source == "aiwork" || source == "aiwork-cli" {
+            // No hooks to install — "activated" means monitoring is enabled and
+            // the matching AiWork surface is present on this machine.
+            return isEnabled(source: source) && cliExists(source: source)
+        }
         if source == "opencode" { return isOpencodePluginInstalled(fm: FileManager.default) }
         if source == "pi" { return isPiExtensionInstalled(fm: FileManager.default) }
         if source == "omp" { return isOmpExtensionInstalled(fm: FileManager.default) }
@@ -1043,6 +1099,8 @@ struct ConfigInstaller {
 
     /// Check if CLI directory exists (tool is installed on this machine)
     static func cliExists(source: String) -> Bool {
+        if source == "aiwork" { return aiworkGuiIsPresent() }
+        if source == "aiwork-cli" { return aiworkCliIsPresent() }
         if source == "opencode" { return FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.config/opencode") }
         if source == "pi" { return FileManager.default.fileExists(atPath: piAgentDir) }
         if source == "omp" { return FileManager.default.fileExists(atPath: ompAgentDir) }
@@ -1088,6 +1146,54 @@ struct ConfigInstaller {
         return FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.dsh")
     }
 
+    /// AiWork GUI (formerly DTCoder). Bundle id is still `com.alipay.dtcoder.ide`.
+    static func aiworkGuiIsPresent(fileManager fm: FileManager = .default) -> Bool {
+        if NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.alipay.dtcoder.ide") != nil {
+            return true
+        }
+        let names = ["AiWork.app", "DTCoder.app"]
+        let roots = [NSHomeDirectory() + "/Applications", "/Applications"]
+        return names.contains { name in
+            roots.contains { root in
+                fm.fileExists(atPath: (root as NSString).appendingPathComponent(name))
+            }
+        }
+    }
+
+    /// AiWork CLI (`aiwork` / legacy `dtcoder` on PATH, or Agentix state).
+    static func aiworkCliIsPresent(fileManager fm: FileManager = .default) -> Bool {
+        let pathDirs = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        let binaries = ["aiwork", "dtcoder"]
+        for dir in pathDirs {
+            for binary in binaries where fm.isExecutableFile(atPath: (dir as NSString).appendingPathComponent(binary)) {
+                return true
+            }
+        }
+        // TUI brings up the Agentix daemon under ~/.agentix even without the GUI app.
+        // A GUI-launched CodeIsland inherits launchd's minimal PATH, so this state
+        // directory — the same root the watcher discovers sockets under — is the
+        // check that actually decides in practice.
+        return fm.fileExists(atPath: AiWorkWatchClient.defaultStateDir() + "/run")
+    }
+
+    /// Either GUI or CLI/TUI is available.
+    static func aiworkIsPresent(fileManager fm: FileManager = .default) -> Bool {
+        aiworkGuiIsPresent(fileManager: fm) || aiworkCliIsPresent(fileManager: fm)
+    }
+
+    /// Monitoring is on for GUI and/or CLI.
+    static func isAnyAiWorkMonitoringEnabled() -> Bool {
+        isEnabled(source: "aiwork") || isEnabled(source: "aiwork-cli")
+    }
+
+    static var aiworkDisplayConfigPath: String { "~/.agentix/run/coder/agent.sock" }
+    static var aiworkCliDisplayConfigPath: String { "aiwork tui → agent.sock" }
+    static var aiworkFullConfigPath: String {
+        NSHomeDirectory() + "/.agentix/run/coder/agent.sock"
+    }
+
     // Keep backward compat
     static func isCodexInstalled() -> Bool { isInstalled(source: "codex") }
 
@@ -1103,9 +1209,15 @@ struct ConfigInstaller {
     static func setEnabled(source: String, enabled: Bool) -> Bool {
         UserDefaults.standard.set(enabled, forKey: "cli_enabled_\(source)")
         let fm = FileManager.default
+        // Claude / Codex / Grok: the switch covers the extra config roots too.
+        applySourceToggleToExtraConfigDirs(source: source, enabled: enabled, fm: fm)
         if enabled {
             installHookScript(fm: fm)
             installBridgeBinary(fm: fm)
+            if source == "aiwork" || source == "aiwork-cli" {
+                // Daemon session watch — no hook files; AppState starts the watcher.
+                return true
+            }
             if source == "opencode" {
                 return installOpencodePlugin(fm: fm)
             }
@@ -1130,7 +1242,9 @@ struct ConfigInstaller {
                 return isHooksInstalled(for: cli, fm: fm)
             }
         } else {
-            if source == "opencode" {
+            if source == "aiwork" || source == "aiwork-cli" {
+                return true
+            } else if source == "opencode" {
                 uninstallOpencodePlugin(fm: fm)
             } else if source == "pi" {
                 uninstallPiExtension(fm: fm)
@@ -1236,6 +1350,7 @@ struct ConfigInstaller {
            fm.fileExists(atPath: codexHome()) {
             enableCodexHooksConfig(fm: fm)
         }
+        repaired.append(contentsOf: repairExtraConfigDirs(fm: fm))
         // OpenCode plugin
         if isEnabled(source: "opencode"),
            fm.fileExists(atPath: (opencodeConfigPath as NSString).deletingLastPathComponent),
@@ -1324,6 +1439,14 @@ struct ConfigInstaller {
 
     // MARK: - CLI Version Detection
 
+    /// How `compatibleEvents` learns the installed Claude Code's version.
+    /// Detecting it starts the user's real `claude`, so a test process gets
+    /// "unknown" — what a machine without Claude Code gets — unless a test
+    /// installs a version of its own.
+    static var claudeVersionProvider: () -> String? = {
+        RuntimeEnvironment.isRunningTests ? nil : detectClaudeVersion()
+    }
+
     /// Detect installed Claude Code version by running `claude --version`.
     /// Cache is guarded by a lock because `install()` and `verifyAndRepair()`
     /// can both call this from `Task.detached` since #139 (#103 review).
@@ -1379,7 +1502,7 @@ struct ConfigInstaller {
 
         // Only Claude Code needs version checking for now
         guard cli.source == "claude" else { return cli.events }
-        let version = detectClaudeVersion()
+        let version = claudeVersionProvider()
 
         return cli.events.filter { (event, _, _) in
             guard let minVer = cli.versionedEvents[event] else { return true }
@@ -1440,6 +1563,8 @@ struct ConfigInstaller {
 
     /// Minimal-diff write of a single top-level key, preserving user comments / key order / escaping.
     /// Creates the file fresh if `originalText` is nil. Returns false on any failure (caller-side #89 guard).
+    /// A symlinked config file (dotfiles, a settings.json shared between
+    /// accounts) is written at its target, so the link survives.
     private static func writeJSONWithKey(
         cli: CLIConfig,
         originalText: String?,
@@ -1454,7 +1579,7 @@ struct ConfigInstaller {
         guard let merged = JSONMinimalEditor.setTopLevelValue(in: source, key: key, value: value) else {
             return false
         }
-        return fm.createFile(atPath: cli.fullPath, contents: Data(merged.utf8))
+        return ConfigPathIdentity.write(Data(merged.utf8), to: cli.fullPath, fileManager: fm)
     }
 
     // MARK: - External CLIs (use bridge binary directly)
@@ -1525,9 +1650,12 @@ struct ConfigInstaller {
 
         let root = parseJSONFile(at: cli.fullPath, fm: fm) ?? [:]
         var hooks = root[cli.configKey] as? [String: Any] ?? [:]
-        if cli.source == "traecli-next" {
-            // Clean up CodeIsland-managed entries written with the old Trae IDE
-            // event names (for example beforeReadFile) at the new Trae CLI path.
+        if cli.source == "traecli-next" || cli.format == .traeIDE {
+            // Clean up CodeIsland-managed entries written with the old
+            // Cursor-style event names (beforeReadFile, stop, …): Trae CLI Next
+            // rejects them, and TraeCode never fires them. The loop below only
+            // replaces entries under the current event names, so without this
+            // an upgraded install would keep the dead keys forever.
             hooks = removeManagedHookEntries(from: hooks)
         }
         // Quote the path in case home directory contains spaces or special characters
@@ -2482,14 +2610,18 @@ struct ConfigInstaller {
               let repaired = CodexPermissionRules.repairingOrphanedMCPToolTables(contents) else {
             return false
         }
-        return (try? repaired.write(toFile: configPath, atomically: true, encoding: .utf8)) != nil
+        return ConfigPathIdentity.write(Data(repaired.utf8), to: configPath, fileManager: fm)
     }
 
     /// Ensure hooks = true under [features] in $CODEX_HOME/config.toml
     /// (or ~/.codex/config.toml when unset) so Codex actually fires hook events.
+    /// `codexHome` is overridden for extra Codex roots registered in Settings —
+    /// each root has its own config.toml, and a hooks.json without the flag
+    /// next to it is never read. A symlinked config.toml is edited at its
+    /// target and stays a symlink.
     @discardableResult
-    static func enableCodexHooksConfig(fm: FileManager) -> Bool {
-        let configPath = codexHome() + "/config.toml"
+    static func enableCodexHooksConfig(fm: FileManager, codexHome: String = ConfigInstaller.codexHome()) -> Bool {
+        let configPath = codexHome + "/config.toml"
         try? fm.createDirectory(
             atPath: (configPath as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true
@@ -2519,7 +2651,7 @@ struct ConfigInstaller {
         // Already set to true (non-commented) — don't touch beyond legacy cleanup.
         if contents.range(of: hooksTruePattern, options: .regularExpression) != nil {
             if hasLegacyHooks {
-                return fm.createFile(atPath: configPath, contents: contents.data(using: .utf8))
+                return ConfigPathIdentity.write(Data(contents.utf8), to: configPath, fileManager: fm)
             }
             return true
         }
@@ -2531,7 +2663,7 @@ struct ConfigInstaller {
                 with: "hooks = true",
                 options: .regularExpression
             )
-            return fm.createFile(atPath: configPath, contents: contents.data(using: .utf8))
+            return ConfigPathIdentity.write(Data(contents.utf8), to: configPath, fileManager: fm)
         }
 
         // Not present — insert into [features] section or create it
@@ -2546,7 +2678,7 @@ struct ConfigInstaller {
             lines.append("hooks = true")
         }
         let result = lines.joined(separator: "\n")
-        return fm.createFile(atPath: configPath, contents: result.data(using: .utf8))
+        return ConfigPathIdentity.write(Data(result.utf8), to: configPath, fileManager: fm)
     }
 
     // MARK: - Kimi Code CLI (TOML hooks)
@@ -2755,7 +2887,8 @@ struct ConfigInstaller {
             merged = JSONMinimalEditor.setTopLevelValue(in: originalText, key: cli.configKey, value: hooks)
         }
         if let merged, let data = merged.data(using: .utf8) {
-            fm.createFile(atPath: cli.fullPath, contents: data)
+            // Through a symlinked config file, not over it.
+            ConfigPathIdentity.write(data, to: cli.fullPath, fileManager: fm)
         }
     }
 
@@ -2997,7 +3130,7 @@ struct ConfigInstaller {
     /// Kept independent of pi (OMP reuses the "CodeIsland pi extension" banner
     /// but ships its own resource file), so a pi-only bump does not false-flag
     /// healthy OMP installs as needing repair.
-    private static let ompExtensionVersion = "v7"
+    private static let ompExtensionVersion = "v8"
 
     private static func piExtensionSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-pi", withExtension: "ts", subdirectory: "Resources"),
@@ -3372,7 +3505,7 @@ struct ConfigInstaller {
     }
 
     /// Current OpenCode plugin version — bump when codeisland-opencode.js changes
-    private static let opencodePluginVersion = "v7"
+    private static let opencodePluginVersion = "v8"
 
     private static func isOpencodePluginInstalled(fm: FileManager) -> Bool {
         guard fm.fileExists(atPath: opencodePluginPath) else { return false }
@@ -3396,5 +3529,362 @@ struct ConfigInstaller {
             }
         }
         return false
+    }
+}
+
+// MARK: - Extra config directories (Settings → Hooks)
+
+/// Hook state of one registered extra config root, for the Hooks page.
+struct ExtraConfigDirStatus: Identifiable, Equatable {
+    let dir: ExtraConfigDir
+    /// Whether the root is still there and still looks like the CLI's.
+    let inspection: ConfigDirInspection
+    let hooksInstalled: Bool
+    /// The CLI's master switch (`cli_enabled_<source>`) — off pauses every root.
+    let sourceEnabled: Bool
+    /// The file the hooks live in, e.g. `~/.claude-work/settings.json`.
+    let displayConfigPath: String
+    let fullConfigPath: String
+    /// The directory *is* the CLI's primary root under another spelling (the
+    /// primary moved onto it, or a symlink). Nothing is managed through it.
+    var sameAsPrimary: Bool = false
+    /// Root whose hooks file is the very same file as this one's (a shared,
+    /// symlinked `settings.json`, a linked Grok `hooks/`): the primary, or an
+    /// extra root registered earlier. The hooks are managed through that root.
+    var sharedHooksWith: String? = nil
+
+    var id: String { dir.id }
+}
+
+enum ExtraConfigDirInstallOutcome: Equatable {
+    case installed
+    /// Nothing written; the inspection says why (missing, not the CLI's, …).
+    case skipped(ConfigDirInspection)
+    /// Nothing written: the hooks file is the same file on disk as that of
+    /// the root given (the primary, or an extra root registered earlier),
+    /// which gets the hooks itself.
+    case shared(with: String)
+    /// Registered, but the CLI's master switch is off — installed once it is on.
+    case sourceDisabled
+    /// The config file could not be written (e.g. unparseable JSON, #89 guard).
+    case failed
+}
+
+extension ConfigInstaller {
+    /// Primary `$CODEX_HOME` followed by the enabled extra Codex roots.
+    static func codexHomes() -> [String] {
+        ExtraConfigDirs.roots(primary: codexHome(), extras: ExtraConfigDirs.enabledPaths(for: .codex))
+    }
+
+    /// Primary `$GROK_HOME` followed by the enabled extra Grok roots.
+    static func grokHomes() -> [String] {
+        ExtraConfigDirs.roots(primary: grokHome(), extras: ExtraConfigDirs.enabledPaths(for: .grok))
+    }
+
+    static func primaryConfigRoot(for cli: ConfigDirCLI) -> String {
+        switch cli {
+        case .claude: return ClaudeConfigPaths.configDir()
+        case .codex: return codexHome()
+        case .grok: return grokHome()
+        }
+    }
+
+    /// The built-in Claude / Codex / Grok entry, re-rooted at an extra root.
+    ///
+    /// Everything else — events, hook format, bridge source — is the built-in
+    /// entry's, so the same install / detect / uninstall code serves every root
+    /// and events from it arrive as ordinary Claude / Codex / Grok sessions.
+    /// (A *custom CLI* is the other extension point, and the wrong one here: it
+    /// registers a new source, so those sessions would not be Claude/Codex/Grok
+    /// sessions at all — no transcripts, no usage, no Codex config.toml flag.)
+    static func extraConfigDirCLI(for dir: ExtraConfigDir) -> CLIConfig? {
+        guard var cli = builtInCLIs.first(where: { $0.source == dir.cli.source }) else { return nil }
+        let root = dir.path
+        let configPath = cli.configPath
+        cli.rootOverride = { root }
+        cli.displayPathOverride = { ClaudeConfigPaths.displayPath(root + "/" + configPath) }
+        cli.extraConfigDir = root
+        return cli
+    }
+
+    /// Hook entries for the registered extra roots. A root that is currently
+    /// the CLI's primary root under another spelling is left out: its hooks
+    /// are the primary's, and installing or removing them through the extra
+    /// entry would act on the primary behind its own switch.
+    static func extraConfigDirCLIs(
+        in dirs: [ExtraConfigDir] = ExtraConfigDirs.load(),
+        includeDisabled: Bool = false,
+        primaryRoot: (ConfigDirCLI) -> String = primaryConfigRoot(for:)
+    ) -> [CLIConfig] {
+        dirs.filter { includeDisabled || $0.enabled }
+            .filter { !ExtraConfigDirs.isSameDirectory($0.path, as: primaryRoot($0.cli)) }
+            .compactMap(extraConfigDirCLI(for:))
+    }
+
+    /// Enabled extra roots of `cli` registered before `root` — when two roots
+    /// share a hooks file, the earlier one manages it, so exactly one writes.
+    static func earlierEnabledPeers(of root: String, cli: ConfigDirCLI, in dirs: [ExtraConfigDir]) -> [String] {
+        let mine = dirs.filter { $0.cli == cli }
+        let index = mine.firstIndex { $0.path == root } ?? mine.endIndex
+        return mine[..<index].filter(\.enabled).map(\.path)
+    }
+
+    /// Install hooks into one extra root. Unlike the primary root, the directory
+    /// is never created: one that has gone missing, or no longer looks like the
+    /// CLI's root, is reported through `.skipped` instead of being written into.
+    /// A hooks file that is the same file as the primary's (or an earlier
+    /// root's) is left to that root — `.shared`. `primaryRoot` / `peers`
+    /// default to the live configuration. Does not touch the shared hook
+    /// script / bridge binary — callers do.
+    @discardableResult
+    static func installHooks(
+        inExtraDir cli: CLIConfig,
+        fm: FileManager,
+        probe: (String) -> ConfigDirEntryKind = ConfigDirEntryKind.probe,
+        primaryRoot: String? = nil,
+        peers: [String]? = nil
+    ) -> ExtraConfigDirInstallOutcome {
+        guard let root = cli.extraConfigDir, let kind = ConfigDirCLI(rawValue: cli.source) else { return .failed }
+        let inspection = ExtraConfigDirs.inspect(path: root, cli: kind, probe: probe)
+        guard inspection == .ready else { return .skipped(inspection) }
+        let primary = primaryRoot ?? primaryConfigRoot(for: kind)
+        let others = peers ?? earlierEnabledPeers(of: root, cli: kind, in: ExtraConfigDirs.load())
+        let hooksOwner = ExtraConfigDirs.sharedFileOwner(cli.configPath, root: root, primary: primary, peers: others)
+
+        let ok: Bool
+        switch kind {
+        case .claude:
+            if let hooksOwner { return .shared(with: hooksOwner) }
+            ok = installClaudeHooks(cli: cli, fm: fm)
+        case .codex:
+            // Without `hooks = true` in *this* root's config.toml, Codex started
+            // with CODEX_HOME=<root> never reads the hooks.json beside it — even
+            // when that hooks.json is a shared one.
+            if let hooksOwner {
+                return enableCodexFeatureFlag(inExtraRoot: root, primaryRoot: primary, peers: others, fm: fm)
+                    ? .shared(with: hooksOwner) : .failed
+            }
+            ok = installExternalHooks(cli: cli, fm: fm)
+                && enableCodexFeatureFlag(inExtraRoot: root, primaryRoot: primary, peers: others, fm: fm)
+        case .grok:
+            if let hooksOwner { return .shared(with: hooksOwner) }
+            ok = installExternalHooks(cli: cli, fm: fm)
+        }
+        return ok ? .installed : .failed
+    }
+
+    /// `hooks = true` in an extra Codex root's config.toml — unless that
+    /// config.toml is the primary's (or an earlier root's) file, which its
+    /// owner flags itself.
+    @discardableResult
+    static func enableCodexFeatureFlag(
+        inExtraRoot root: String,
+        primaryRoot: String,
+        peers: [String],
+        fm: FileManager
+    ) -> Bool {
+        if ExtraConfigDirs.sharedFileOwner("config.toml", root: root, primary: primaryRoot, peers: peers) != nil {
+            return true
+        }
+        return enableCodexHooksConfig(fm: fm, codexHome: root)
+    }
+
+    /// Take CodeIsland's hooks out of one extra root — unless its hooks file
+    /// is the same file as the primary root's or one of `peers` (roots that
+    /// stay hooked), whose hooks would go with it. Returns whether anything
+    /// was touched. The user's own entries always stay.
+    @discardableResult
+    static func uninstallHooks(
+        inExtraDir cli: CLIConfig,
+        fm: FileManager,
+        primaryRoot: String,
+        keeping peers: [String]
+    ) -> Bool {
+        guard let root = cli.extraConfigDir else { return false }
+        if ExtraConfigDirs.sharedFileOwner(cli.configPath, root: root, primary: primaryRoot, peers: peers) != nil {
+            return false
+        }
+        uninstallHooks(cli: cli, fm: fm)
+        return true
+    }
+
+    /// Hook state of one extra root for the Hooks page.
+    static func extraConfigDirStatus(
+        for dir: ExtraConfigDir,
+        in dirs: [ExtraConfigDir]? = nil,
+        fm: FileManager = .default,
+        probe: (String) -> ConfigDirEntryKind = ConfigDirEntryKind.probe,
+        primaryRoot: String? = nil
+    ) -> ExtraConfigDirStatus? {
+        guard let cli = extraConfigDirCLI(for: dir) else { return nil }
+        let inspection = ExtraConfigDirs.inspect(path: dir.path, cli: dir.cli, probe: probe)
+        let primary = primaryRoot ?? primaryConfigRoot(for: dir.cli)
+        let sameAsPrimary = ExtraConfigDirs.isSameDirectory(dir.path, as: primary)
+        let sharedHooksWith = sameAsPrimary ? primary : ExtraConfigDirs.sharedFileOwner(
+            cli.configPath,
+            root: dir.path,
+            primary: primary,
+            peers: earlierEnabledPeers(of: dir.path, cli: dir.cli, in: dirs ?? ExtraConfigDirs.load())
+        )
+        return ExtraConfigDirStatus(
+            dir: dir,
+            inspection: inspection,
+            hooksInstalled: inspection == .ready && isHooksInstalled(for: cli, fm: fm),
+            sourceEnabled: isEnabled(source: dir.cli.source),
+            displayConfigPath: cli.displayConfigPath,
+            fullConfigPath: cli.fullPath,
+            sameAsPrimary: sameAsPrimary,
+            sharedHooksWith: sharedHooksWith
+        )
+    }
+
+    static func extraConfigDirStatuses() -> [ExtraConfigDirStatus] {
+        let dirs = ExtraConfigDirs.load()
+        return dirs.compactMap { extraConfigDirStatus(for: $0, in: dirs) }
+    }
+
+    /// Register a root typed or picked in Settings and, if its CLI is being
+    /// monitored, install the hooks right away.
+    static func addExtraConfigDir(
+        cli: ConfigDirCLI,
+        rawPath: String
+    ) -> Result<(dir: ExtraConfigDir, outcome: ExtraConfigDirInstallOutcome), ExtraConfigDirError> {
+        var dirs = ExtraConfigDirs.load()
+        let validated = ExtraConfigDirs.validateNew(
+            rawPath: rawPath,
+            cli: cli,
+            primary: primaryConfigRoot(for: cli),
+            existing: dirs,
+            homeDir: NSHomeDirectory()
+        )
+        switch validated {
+        case .failure(let error):
+            return .failure(error)
+        case .success(let dir):
+            dirs.append(dir)
+            ExtraConfigDirs.save(dirs)
+            return .success((dir, installRegisteredExtraDir(dir, in: dirs)))
+        }
+    }
+
+    /// Forget a root and take CodeIsland's hooks out of it (user entries stay)
+    /// — unless its hooks file is the primary's or a still-enabled root's.
+    @discardableResult
+    static func removeExtraConfigDir(
+        id: String,
+        defaults: UserDefaults = .standard,
+        primaryRoot: (ConfigDirCLI) -> String = primaryConfigRoot(for:)
+    ) -> ExtraConfigDir? {
+        var dirs = ExtraConfigDirs.load(from: defaults)
+        guard let index = dirs.firstIndex(where: { $0.id == id }) else { return nil }
+        let dir = dirs.remove(at: index)
+        if let cli = extraConfigDirCLI(for: dir) {
+            uninstallHooks(
+                inExtraDir: cli,
+                fm: .default,
+                primaryRoot: primaryRoot(dir.cli),
+                keeping: ExtraConfigDirs.enabledPaths(for: dir.cli, in: dirs)
+            )
+        }
+        ExtraConfigDirs.save(dirs, to: defaults)
+        return dir
+    }
+
+    /// Per-root monitoring switch: installs or removes that root's hooks only
+    /// — never those of a hooks file it shares with the primary or another
+    /// enabled root.
+    @discardableResult
+    static func setExtraConfigDirEnabled(
+        id: String,
+        enabled: Bool,
+        defaults: UserDefaults = .standard,
+        primaryRoot: (ConfigDirCLI) -> String = primaryConfigRoot(for:)
+    ) -> ExtraConfigDirInstallOutcome? {
+        var dirs = ExtraConfigDirs.load(from: defaults)
+        guard let index = dirs.firstIndex(where: { $0.id == id }) else { return nil }
+        dirs[index].enabled = enabled
+        ExtraConfigDirs.save(dirs, to: defaults)
+        let dir = dirs[index]
+        if enabled { return installRegisteredExtraDir(dir, in: dirs, primaryRoot: primaryRoot(dir.cli)) }
+        if let cli = extraConfigDirCLI(for: dir) {
+            uninstallHooks(
+                inExtraDir: cli,
+                fm: .default,
+                primaryRoot: primaryRoot(dir.cli),
+                keeping: dirs.filter { $0.cli == dir.cli && $0.enabled && $0.id != dir.id }.map(\.path)
+            )
+        }
+        return nil
+    }
+
+    private static func installRegisteredExtraDir(
+        _ dir: ExtraConfigDir,
+        in dirs: [ExtraConfigDir],
+        primaryRoot: String? = nil
+    ) -> ExtraConfigDirInstallOutcome {
+        guard isEnabled(source: dir.cli.source) else { return .sourceDisabled }
+        guard let cli = extraConfigDirCLI(for: dir) else { return .failed }
+        let primary = primaryRoot ?? primaryConfigRoot(for: dir.cli)
+        // The primary itself under another spelling: its own entry installs.
+        if ExtraConfigDirs.isSameDirectory(dir.path, as: primary) { return .shared(with: primary) }
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: codeislandDir, withIntermediateDirectories: true)
+        installHookScript(fm: fm)
+        installBridgeBinary(fm: fm)
+        return installHooks(
+            inExtraDir: cli,
+            fm: fm,
+            primaryRoot: primary,
+            peers: earlierEnabledPeers(of: dir.path, cli: dir.cli, in: dirs)
+        )
+    }
+
+    /// The master switch of Claude / Codex / Grok covers their extra roots too:
+    /// turning it on installs into every enabled root, off removes from all.
+    /// A hooks file shared with the primary is left to the primary's own
+    /// entry, which the same switch installs into or removes from next.
+    static func applySourceToggleToExtraConfigDirs(source: String, enabled: Bool, fm: FileManager) {
+        guard let kind = ConfigDirCLI(rawValue: source) else { return }
+        let dirs = ExtraConfigDirs.load().filter { $0.cli == kind }
+        let primary = primaryConfigRoot(for: kind)
+        for cli in extraConfigDirCLIs(in: dirs, includeDisabled: !enabled) {
+            guard let root = cli.extraConfigDir else { continue }
+            if enabled {
+                installHooks(
+                    inExtraDir: cli,
+                    fm: fm,
+                    primaryRoot: primary,
+                    peers: earlierEnabledPeers(of: root, cli: kind, in: dirs)
+                )
+            } else {
+                // Every root goes off together, so no peer keeps its hooks.
+                uninstallHooks(inExtraDir: cli, fm: fm, primaryRoot: primary, keeping: [])
+            }
+        }
+    }
+
+    /// `verifyAndRepair` for extra roots: put back hooks that went missing in a
+    /// root that is still there, with the same respect for hand-pruned events
+    /// (#182) as the primary root. A hooks file shared with the primary (or an
+    /// earlier root) is repaired through that root. Returns labels of the
+    /// repaired roots.
+    static func repairExtraConfigDirs(fm: FileManager) -> [String] {
+        let dirs = ExtraConfigDirs.load()
+        var repaired: [String] = []
+        for cli in extraConfigDirCLIs(in: dirs) where isEnabled(source: cli.source) {
+            guard let root = cli.extraConfigDir,
+                  let kind = ConfigDirCLI(rawValue: cli.source),
+                  ExtraConfigDirs.inspect(path: root, cli: kind) == .ready else { continue }
+            let primary = primaryConfigRoot(for: kind)
+            let peers = earlierEnabledPeers(of: root, cli: kind, in: dirs)
+            if kind == .codex { enableCodexFeatureFlag(inExtraRoot: root, primaryRoot: primary, peers: peers, fm: fm) }
+            if ExtraConfigDirs.sharedFileOwner(cli.configPath, root: root, primary: primary, peers: peers) != nil { continue }
+            if isHooksInstalled(for: cli, fm: fm) { continue }
+            if shouldPreservePartialHooks(for: cli, fm: fm) { continue }
+            if installHooks(inExtraDir: cli, fm: fm, primaryRoot: primary, peers: peers) == .installed {
+                repaired.append("\(cli.name) (\(ClaudeConfigPaths.displayPath(root)))")
+            }
+        }
+        return repaired
     }
 }

@@ -2,8 +2,19 @@ import Foundation
 import CodeIslandCore
 
 struct PermissionRequest {
+    /// Identity of this one request. A session asks again and again — and
+    /// its subagents can each have one queued — so follow-up reminders and
+    /// the card on screen tell requests apart by this, not by session. A
+    /// replay of the same request keeps it (`mergeDuplicatePermissionRequest`).
+    let id: UUID
     let event: HookEvent
     let continuation: CheckedContinuation<Data, Never>
+
+    init(id: UUID = UUID(), event: HookEvent, continuation: CheckedContinuation<Data, Never>) {
+        self.id = id
+        self.event = event
+        self.continuation = continuation
+    }
 
     var toolUseId: String? { event.toolUseId }
 }
@@ -27,6 +38,15 @@ struct AskUserQuestionState {
 
     var canConfirm: Bool {
         items.allSatisfy { answers[$0.answerKey] != nil }
+    }
+
+    /// Whether `submitted` is a complete answer set for exactly these items:
+    /// one answer per question, in item order. Answers are mapped onto items
+    /// by position, so a set collected for a different request would otherwise
+    /// be delivered against this request's questions. (#333)
+    func accepts(_ submitted: [AskUserQuestionAnswer]) -> Bool {
+        submitted.count == items.count
+            && zip(submitted, items).allSatisfy { $0.question == $1.payload.question }
     }
 
     mutating func select(questionIndex: Int, option: String) {
@@ -59,6 +79,11 @@ enum QuestionResolution {
 }
 
 struct QuestionRequest {
+    /// Identity of this one request. A session id does not name a card on its
+    /// own — the same session asks again later, and its subagents can each
+    /// have a question queued — so the question card is keyed by this, and no
+    /// answer state outlives the request it was collected for. (#333)
+    let id = UUID()
     let event: HookEvent
     let question: QuestionPayload
     let resolution: QuestionResolution
