@@ -958,9 +958,8 @@ struct CompactContextLabel: View {
 
     /// The label's widest extent: its text's width, up to `maxWidth`.
     static func width(for text: String) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .medium)
         // A point of slack: Text truncates a label measured to the exact width.
-        let ideal = (text as NSString).size(withAttributes: [.font: font]).width.rounded(.up) + 1
+        let ideal = TextWidth.monospaced(text, size: fontSize, weight: .medium).rounded(.up) + 1
         return min(ideal, maxWidth)
     }
 
@@ -1173,8 +1172,7 @@ struct QuitConfirmButton: View {
     /// The armed pill's width for its (localized) text — kept short enough
     /// to fit beside the notch (see PanelChromeTests).
     static func pillWidth(for text: String) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: pillFontSize, weight: .bold)
-        return (text as NSString).size(withAttributes: [.font: font]).width.rounded(.up) + pillPadding * 2
+        return TextWidth.monospaced(text, size: pillFontSize, weight: .bold).rounded(.up) + pillPadding * 2
     }
 
     init(confirmation: QuitConfirmation) {
@@ -3826,9 +3824,8 @@ enum BranchLabelMetrics {
     /// The branch's full width when it is short, else room for
     /// `minimumCharacters` (middle-truncated).
     static func minimumWidth(for label: String, fontSize: CGFloat) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .medium)
-        let glyph = ("M" as NSString).size(withAttributes: [.font: font]).width
-        let full = (label as NSString).size(withAttributes: [.font: font]).width
+        let glyph = TextWidth.monospaced("M", size: fontSize, weight: .medium)
+        let full = TextWidth.monospaced(label, size: fontSize, weight: .medium)
         return (min(full, glyph * CGFloat(minimumCharacters)) + 1).rounded(.up)
     }
 }
@@ -4833,8 +4830,7 @@ enum SessionGlyph {
     /// One monospaced character: the glyph column's width. `↻` has no glyph
     /// in SF Mono and falls back to a narrower font.
     static func columnWidth(_ fontSize: CGFloat) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .bold)
-        return ("M" as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
+        return TextWidth.monospaced("M", size: fontSize, weight: .bold).rounded(.up)
     }
 
     /// What VoiceOver says for each glyph instead of its Unicode name.
@@ -5516,8 +5512,7 @@ private extension View {
     @ViewBuilder
     func hugWidth(of text: String, fontSize: CGFloat, upTo cap: CGFloat?) -> some View {
         if let cap {
-            let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .medium)
-            let width = min(((text as NSString).size(withAttributes: [.font: font]).width + 1).rounded(.up), cap)
+            let width = min((TextWidth.monospaced(text, size: fontSize, weight: .medium) + 1).rounded(.up), cap)
             frame(minWidth: 0, idealWidth: width, maxWidth: width, alignment: .leading)
         } else {
             self

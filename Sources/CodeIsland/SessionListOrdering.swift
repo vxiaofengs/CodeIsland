@@ -281,9 +281,8 @@ enum CompactSessionRowMetrics {
     /// Width of the status-word column: the widest word in the current
     /// language, so the words line up in a column whatever the language.
     static func statusColumnWidth(fontSize: CGFloat) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .bold)
         let widest = SessionCardStatus.allCases
-            .map { ($0.label as NSString).size(withAttributes: [.font: font]).width }
+            .map { TextWidth.monospaced($0.label, size: fontSize, weight: .bold) }
             .max() ?? 0
         return (widest + 2).rounded(.up)
     }
@@ -298,9 +297,8 @@ enum CompactSessionRowMetrics {
     /// Width of the project column: the widest name on screen, capped so the
     /// activity keeps most of the row.
     static func projectColumnWidth(names: [String], fontSize: CGFloat, cap: CGFloat) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .bold)
         let widest = names
-            .map { ($0 as NSString).size(withAttributes: [.font: font]).width }
+            .map { TextWidth.monospaced($0, size: fontSize, weight: .bold) }
             .max() ?? 0
         return min(max(48, (widest + 2).rounded(.up)), cap)
     }
