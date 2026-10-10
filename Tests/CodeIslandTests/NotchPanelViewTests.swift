@@ -320,7 +320,7 @@ final class NotchHoverInteractionTests: XCTestCase {
         now: Date? = nil,
         neverRan: Set<String> = []
     ) -> [String] {
-        SessionListOrder.visibleIds(
+        SessionListFilter.visibleIds(
             ids: ids,
             graceMinutes: graceMinutes,
             now: now ?? Self.listBase.addingTimeInterval(600),
@@ -355,7 +355,7 @@ final class NotchHoverInteractionTests: XCTestCase {
         )
     }
 
-    func testSessionListKeepsActiveSessionsOldestFirst() {
+    func testSessionListKeepsActiveSessionsHoweverLongTheyHaveRun() {
         let now = Self.listBase.addingTimeInterval(600)
         let activity = [
             "idle-stale": Self.listBase,                        // 10 min idle
@@ -363,14 +363,15 @@ final class NotchHoverInteractionTests: XCTestCase {
             "busy-new": Self.listBase.addingTimeInterval(120),
         ]
 
-        // Working sessions stay however long they have been running, and the
-        // freshest lands last so it renders at the bottom.
+        // A working session stays however long it has been running, and the
+        // caller's order is preserved: ordering belongs to sessionListOrder(),
+        // which puts what waits on the user first.
         XCTAssertEqual(
-            visibleIds(["idle-stale", "busy-new", "busy-old"],
+            visibleIds(["busy-new", "idle-stale", "busy-old"],
                        active: ["busy-old", "busy-new"],
                        activity: activity,
                        now: now),
-            ["busy-old", "busy-new"]
+            ["busy-new", "busy-old"]
         )
     }
 
@@ -401,16 +402,16 @@ final class NotchHoverInteractionTests: XCTestCase {
         XCTAssertEqual(
             visibleIds(["recent", "ancient"], active: [], activity: activity,
                        graceMinutes: 0, now: now),
-            ["ancient", "recent"]
+            ["recent", "ancient"]
         )
     }
 
-    func testSessionListBreaksTimestampTiesByIdForStableOrder() {
+    func testSessionListFilterNeverReordersWhatItWasGiven() {
         XCTAssertEqual(
             visibleIds(["c", "a", "b"],
                        active: ["a", "b", "c"],
                        activity: ["a": Self.listBase, "b": Self.listBase, "c": Self.listBase]),
-            ["a", "b", "c"]
+            ["c", "a", "b"]
         )
     }
 

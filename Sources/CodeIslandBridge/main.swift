@@ -257,13 +257,26 @@ guard stat(socketPath, &statBuf) == 0, (statBuf.st_mode & S_IFMT) == S_IFSOCK el
 alarm(5)
 let input = FileHandle.standardInput.readDataToEndOfFile()
 alarm(0)  // stdin done, cancel preliminary alarm
-if let inputStr = String(data: input, encoding: .utf8) {
+let parsedInput = try? JSONSerialization.jsonObject(with: input) as? [String: Any]
+// Hermes sends the whole conversation (`extra.conversation_history`) with every
+// pre/post_llm_call. Nothing reads it, so it stays out of the log and the event.
+let hermesInput = sourceTag == "hermes" ? parsedInput.map(HermesHookPayload.trimmedForForwarding) : nil
+if let hermesInput,
+   let data = try? JSONSerialization.data(withJSONObject: hermesInput),
+   let inputStr = String(data: data, encoding: .utf8) {
+    debugLog("raw input: \(inputStr)")
+} else if let inputStr = String(data: input, encoding: .utf8) {
     debugLog("raw input: \(inputStr)")
 }
 
-guard !input.isEmpty,
-      var json = try? JSONSerialization.jsonObject(with: input) as? [String: Any] else {
+guard !input.isEmpty, var json = hermesInput ?? parsedInput else {
     exit(0)
+}
+
+// Hermes runs each hook with the firing profile's HERMES_HOME; the island reads
+// that session's title and messages from the store there (`state.db`).
+if sourceTag == "hermes", let hermesHome = nonEmptyString(env["HERMES_HOME"]) {
+    json["_hermes_home"] = (hermesHome as NSString).expandingTildeInPath
 }
 
 // Grok normally includes these camelCase fields on stdin. The environment
@@ -412,20 +425,21 @@ let coreAncestry = ancestry.map { (pid: Int32($0.pid), executablePath: $0.execut
 // the matching desktop IDE, so a `--source cursor` tag from a hook fired by
 // cursor-agent should be promoted to "cursor-cli" (#134). The override only
 // applies when ancestry actually shows a CLI binary.
-let inferredSource = sourceTag ?? CLIProcessResolver.inferSource(ancestry: coreAncestry)
-let cliPromoted = CLIProcessResolver.cliVariantOverride(
-    declaredSource: inferredSource,
+// Events that arrived via a plugin proxy (no declared source but ancestry
+// inferred a real source — e.g. the omo OpenCode plugin firing Claude hooks)
+// are marked `_via_plugin` so the host app can route them per
+// pluginSessionMode (#123). A direct plugin's own `_source` counts as declared,
+// and Claude Code firing its own (source-less) hook is not a proxy.
+let bridgeSource = CLIProcessResolver.bridgeSource(
+    sourceTag: sourceTag,
+    payloadSource: json["_source"] as? String,
     ancestry: coreAncestry
 )
-let effectiveSource = cliPromoted ?? inferredSource
+let effectiveSource = bridgeSource.source
 if let source = effectiveSource {
     json["_source"] = source
 }
-// Mark events that arrived via a plugin proxy (no explicit --source but
-// ancestry inferred a real source — e.g. the omo OpenCode plugin firing
-// Claude hooks) so the host app can route them per pluginSessionMode.
-// See issue #123.
-if sourceTag == nil && effectiveSource != nil {
+if bridgeSource.viaPlugin {
     json["_via_plugin"] = true
 }
 
@@ -603,6 +617,13 @@ if let orcaHandle = env["ORCA_TERMINAL_HANDLE"], !orcaHandle.isEmpty {
 }
 if let orcaWorktree = env["ORCA_WORKTREE_ID"], !orcaWorktree.isEmpty {
     json["_orca_worktree_id"] = orcaWorktree
+}
+
+// Claude Desktop Code tab: Claude Desktop's own id for this session. The hook's
+// session_id is the CLI's id, which Claude Desktop's `claude://code/continue`
+// link does not accept; this one opens that exact session on click.
+if let host = env["CLAUDE_CODE_HOST_SESSION_ID"], !host.isEmpty {
+    json["_claude_desktop_session"] = host
 }
 
 // Inject cwd if not already present. Gemini CLI / Google Antigravity hooks do not

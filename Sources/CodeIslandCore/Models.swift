@@ -19,6 +19,38 @@ public enum CLIProcessResolver {
         return traeCNBundlePathMarkers.contains { lowercasedPath.contains($0) }
     }
 
+    /// The MiMo Code CLI binary, however it was installed: the curl installer
+    /// writes `~/.mimocode/bin/mimo`; npm's `@mimo-ai/cli` keeps the real
+    /// binary at `bin/.mimocode` (its `bin/mimo` is a Node launcher, so the
+    /// process is `node`) or runs `@mimo-ai/mimocode-<os>-<arch>/bin/mimo`.
+    ///
+    /// Deliberately not the Xiaomi MiMo desktop app: it runs the same engine
+    /// inside its Electron main process and has an integrated terminal, so
+    /// claiming its bundle here would pin any agent started in that terminal
+    /// on MiMo during ancestry inference. The desktop reports itself through
+    /// the plugin's `_source` instead.
+    public static func isMimoCLIPath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        let basename = (lowercasedPath as NSString).lastPathComponent
+        return basename == "mimo"
+            || (basename == ".mimocode" && lowercasedPath.contains("/@mimo-ai/cli/"))
+            || lowercasedPath.contains("/@mimo-ai/mimocode-")
+    }
+
+    /// Lowercased bundle markers of the Xiaomi MiMo desktop app: the mainland
+    /// edition (`Xiaomi MiMo.app`, com.xiaomi.mimo.desktop) and the overseas
+    /// one (`Xiaomi MiMo AI.app`, com.xiaomi.mimo.desktop-ai). Read from the
+    /// 26.929 builds' Info.plist and product table.
+    public static let mimoDesktopBundlePathMarkers = [
+        "/xiaomi mimo.app/contents/",
+        "/xiaomi mimo ai.app/contents/",
+    ]
+
+    public static func isMimoDesktopBundlePath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        return mimoDesktopBundlePathMarkers.contains { lowercasedPath.contains($0) }
+    }
+
     public static func sourceMatchesExecutablePath(_ path: String, source: String?) -> Bool {
         guard let normalizedSource = SessionSnapshot.normalizedSupportedSource(source) else { return false }
         let lowercasedPath = path.lowercased()
@@ -38,7 +70,10 @@ public enum CLIProcessResolver {
         case "codex":
             return lowercasedPath.hasSuffix("/codex") || lowercasedPath.contains("/codex ")
         case "claude":
+            // The native installer (Claude Code's default) runs the binary
+            // named by its version: ~/.local/share/claude/versions/2.1.294.
             return lowercasedPath.hasSuffix("/claude") || lowercasedPath.contains("/claude ")
+                || lowercasedPath.contains("/.local/share/claude/versions/")
         case "dsh":
             // DeepSeek Harness CLI ships a `dsh` binary. It has no shell hooks —
             // the dsh-island plugin forwards events over the socket directly.
@@ -81,6 +116,18 @@ public enum CLIProcessResolver {
             return lowercasedPath.hasSuffix("/agy")
                 || lowercasedPath.contains("/agy ")
                 || lowercasedPath.contains("/google-antigravity")
+        case "minimax":
+            // MiniMax Code CLI is `mcode` (npm @minimax-ai/code). The Node
+            // runtime renames the process title to `minimax-code`, so the
+            // renamed spelling shows up in argv where other CLIs carry their
+            // launch path; the npm layout covers launches that keep the
+            // original script path.
+            let basename = (lowercasedPath as NSString).lastPathComponent
+            return basename == "mcode"
+                || basename == "minimax-code"
+                || lowercasedPath.contains("/@minimax-ai/code/")
+        case "mimo":
+            return isMimoCLIPath(lowercasedPath)
         default:
             return lowercasedPath.contains("/\(normalizedSource)")
         }
@@ -111,6 +158,34 @@ public enum CLIProcessResolver {
             break
         }
         return nil
+    }
+
+    /// The source the bridge stamps on an event, and whether it came through
+    /// another agent's hook (`_via_plugin`).
+    ///
+    /// Declared = `--source`, or — for a direct plugin (OpenCode, MiMo Code,
+    /// Pi / OMP, OpenClaw) piping its own blocking request in without the flag
+    /// — the supported `_source` already in its payload. Only an undeclared
+    /// event is attributed by ancestry and marked as proxied. Treating a
+    /// plugin's own request as proxied let ancestry relabel it, and handed its
+    /// approval to Agent Sub-Sessions, whose "hide" mode answers `_via_plugin`
+    /// permission requests with an automatic allow.
+    ///
+    /// The one hook installed without `--source` is Claude Code's
+    /// (`codeisland-hook.sh`, so that another agent firing it — omo — is still
+    /// inferred). When the ancestry says Claude, it is Claude's own hook, not
+    /// a proxy: otherwise "hide" would auto-allow and hide every Claude Code
+    /// session whose binary ends in `/claude` (Homebrew cask, Claude Desktop).
+    public static func bridgeSource(
+        sourceTag: String?,
+        payloadSource: String?,
+        ancestry: [(pid: Int32, executablePath: String?)]
+    ) -> (source: String?, viaPlugin: Bool) {
+        let declared = sourceTag ?? SessionSnapshot.normalizedSupportedSource(payloadSource)
+        let inferred = declared ?? inferSource(ancestry: ancestry)
+        let effective = cliVariantOverride(declaredSource: inferred, ancestry: ancestry) ?? inferred
+        let viaPlugin = declared == nil && effective != nil && effective != "claude"
+        return (effective, viaPlugin)
     }
 
     public static func resolvedTrackedPID(
