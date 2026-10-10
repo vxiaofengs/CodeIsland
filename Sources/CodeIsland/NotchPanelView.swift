@@ -616,7 +616,6 @@ private struct CompactLeftWing: View {
     let mascotSize: CGFloat
     let hasNotch: Bool
     let showToolStatus: Bool
-    @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
     // Bound via @AppStorage so flipping the default mascot in Settings rerenders this view
     // even when AppState.primarySource wasn't recomputed (no session mutations in flight).
     @AppStorage(SettingsKey.defaultSource) private var settingsDefaultSource = SettingsDefaults.defaultSource
@@ -651,12 +650,11 @@ private struct CompactLeftWing: View {
     var body: some View {
         HStack(spacing: 6) {
             if expanded {
-                // Just the logo: the ALL/STA/CLI grouping switch is gone with the
-                // grouping itself (see SessionListView.visibleSessionIds).
+                // Just the logo. The ALL / STATUS / AGENT switch is not offered
+                // here: SessionListFilter already drops idle sessions, so the
+                // status buckets are empty, and a single-CLI setup gets one
+                // constant header. What waits on you heads the flat list anyway.
                 AppLogoView(size: 36, showBackground: false)
-                if appState.sessions.count > 1 {
-                    SessionGroupingTabs(mode: $groupingMode)
-                }
             } else {
                 MascotView(source: displaySource, status: displayStatus, size: mascotSize)
                     .id(displaySource)
@@ -1516,6 +1514,7 @@ enum ApprovalHints {
     static func always(scope: ApprovalAlwaysScope) -> String {
         switch scope {
         case .session: return L10n.shared["always_hint_session"]
+        case .wholeSession: return L10n.shared["always_hint_whole_session"]
         case .codexRules: return L10n.shared["always_hint_saved"]
         case .codexMCPConfig: return L10n.shared["always_hint_saved_mcp"]
         }
@@ -1526,15 +1525,20 @@ enum ApprovalHints {
 enum ApprovalAlwaysScope: Equatable {
     /// Claude-style hooks: a rule for this tool, for the rest of the session.
     case session
+    /// This fork's "Always Allow trusts the session" setting: CodeIsland
+    /// answers the session's later requests itself, whatever the tool, so the
+    /// link must not promise it only covers the one being asked about.
+    /// HighRiskCommand still gets a card.
+    case wholeSession
     /// Codex: a prefix rule in ~/.codex/rules, kept for every session.
     case codexRules
     /// Codex MCP tool: an approval in ~/.codex/config.toml
     /// (CodexPermissionRules.persistAlwaysAllowRule).
     case codexMCPConfig
 
-    init(savesRule: Bool, tool: String) {
+    init(savesRule: Bool, tool: String, trustsWholeSession: Bool = false) {
         if !savesRule {
-            self = .session
+            self = trustsWholeSession ? .wholeSession : .session
         } else {
             self = ApprovalCopy.mcpParts(tool) == nil ? .codexRules : .codexMCPConfig
         }
@@ -1544,7 +1548,7 @@ enum ApprovalAlwaysScope: Equatable {
     /// session rule.
     var savedPath: String? {
         switch self {
-        case .session: return nil
+        case .session, .wholeSession: return nil
         case .codexRules: return "~/.codex/rules"
         case .codexMCPConfig: return "~/.codex/config.toml"
         }
@@ -1652,6 +1656,9 @@ enum ApprovalCopy {
     static func alwaysLink(tool: String, scope: ApprovalAlwaysScope) -> String {
         if let path = scope.savedPath {
             return String(format: L10n.shared["card_always_saved"], path)
+        }
+        if scope == .wholeSession {
+            return L10n.shared["card_always_whole_session"]
         }
         return String(format: L10n.shared["card_always_session"], displayName(tool))
     }
@@ -2011,7 +2018,11 @@ private struct ApprovalBar: View {
     }
 
     private var alwaysScope: ApprovalAlwaysScope {
-        ApprovalAlwaysScope(savesRule: alwaysSavesRule, tool: tool)
+        ApprovalAlwaysScope(
+            savesRule: alwaysSavesRule,
+            tool: tool,
+            trustsWholeSession: SettingsManager.shared.sessionWideAlwaysAllow
+        )
     }
 
     /// Same rule as QuestionBar: no local terminal (remote, unknown harness)
@@ -2877,7 +2888,9 @@ private struct SessionListView: View {
     /// When set, only show this session (auto-expand on completion)
     var onlySessionId: String? = nil
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
-    @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
+    /// Pinned: the grouping tabs are not offered (see CompactLeftWing), and a
+    /// mode stored while they were would otherwise group the list for good.
+    private let groupingMode = "all"
     @AppStorage(SettingsKey.panelIdleGraceMinutes) private var idleGraceMinutes = SettingsDefaults.panelIdleGraceMinutes
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
     @AppStorage(SettingsKey.defaultSource) private var defaultSource = SettingsDefaults.defaultSource

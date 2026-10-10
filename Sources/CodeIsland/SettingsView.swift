@@ -1823,15 +1823,18 @@ private struct SoundPage: View {
                         Image(systemName: "speaker.fill")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
+                        // No `step:` — AppKit draws one tick per step under the
+                        // track, and 101 of them read as a dotted line. The
+                        // setter rounds instead, so the value still moves in
+                        // whole percents: the low end is tapered
+                        // (SoundVolumeCurve), where single percents are audibly
+                        // different.
                         Slider(
                             value: Binding(
                                 get: { Double(soundVolume) },
-                                set: { soundVolume = Int($0) }
+                                set: { soundVolume = Int($0.rounded()) }
                             ),
-                            in: 0...100,
-                            // 1 % steps: the low end is tapered (SoundVolumeCurve),
-                            // so single percents are audibly different there.
-                            step: 1
+                            in: 0...100
                         )
                         Image(systemName: "speaker.wave.3.fill")
                             .font(.system(size: 10))
