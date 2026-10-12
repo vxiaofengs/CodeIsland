@@ -1,5 +1,21 @@
 # Changelog
 
+## [v1.0.38] - 2026-10-11
+
+### English
+- **Codex Desktop threads show up again on current ChatGPT builds.** Newer ChatGPT releases moved Codex's binary from `ChatGPT.app/Contents/Resources/codex` to `Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`, and CodeIsland only knew the old place. Its process scan never found Desktop's app-server, so Desktop threads were never read from Codex's state database, and the live app-server connection could not start (it retried every 10 seconds while ChatGPT ran). Both now find the new binary. Because the same file also runs Codex CLI, discovery tells the two apart by what the process runs and who started it: the `app-server` ChatGPT starts is Desktop; ChatGPT's cloud `exec-server`, one-shot commands like `login`, and CodeIsland's own app-server connection are skipped; a terminal session or the app-server Claude Code's Codex plugin starts is a CLI session
+
+### 中文
+- **新版 ChatGPT 下，Codex 桌面版对话重新显示在刘海上。** 新版 ChatGPT 把 Codex 程序从 `ChatGPT.app/Contents/Resources/codex` 挪到了 `Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`，CodeIsland 只认旧位置：进程扫描找不到桌面版的 app-server，于是从不读 Codex 状态库里的桌面版对话；和 app-server 的实时连接也起不来（ChatGPT 运行期间每 10 秒重试一次）。现在两处都能找到新位置的程序。由于终端里的 Codex 用的也是这个程序，发现流程按进程在跑什么、由谁启动来区分：ChatGPT 启动的 `app-server` 是桌面版；ChatGPT 的云端 `exec-server`、`login` 这类一次性命令，以及 CodeIsland 自己的 app-server 连接都会跳过；终端会话和 Claude Code 的 Codex 插件起的 app-server 按命令行会话处理
+
+## [v1.0.37] - 2026-10-11
+
+### English
+- **One card per Codex conversation with ChatGPT Desktop open.** Two cases showed the same Codex conversation twice. A Codex task started from Claude Code's Codex plugin (`/codex:rescue`) runs its own `codex app-server`, whose transcript carries the same `source` as a Desktop thread; it was taken for one and got a second, Desktop-badged card. Transcripts now count as Desktop only when their `originator` is Desktop's, so the plugin's tasks (and the threads they spawn) stay on the card their hooks build (#368, #369). Separately, newer ChatGPT builds start Codex's app-server from `ChatGPT.app/Contents/Resources/codex-cli/` without a bundle id in its environment, so Desktop threads' hooks were keyed as CLI sessions next to the Desktop card. The bridge now recognises a Codex process running `app-server` directly under ChatGPT and marks its hooks as Desktop; terminal Codex and the plugin's app-server, which use the same binary, are unaffected. With Plugin Sub-Sessions merged, a Desktop thread's own hooks are no longer folded into another thread as its sub-session (#370, #371). Thanks @Junyu06
+
+### 中文
+- **开着 ChatGPT 桌面版时，一个 Codex 对话只显示一张卡。** 有两种情况会让同一个 Codex 对话出现两张卡。一是在 Claude Code 里用 Codex 插件（`/codex:rescue`）起的任务：插件自己起一个 `codex app-server`，对话记录里的 `source` 和桌面版一样，于是被当成桌面版对话，多出一张带桌面版标记的卡。现在只有 `originator` 是桌面版的对话记录才算桌面版，插件的任务（以及它派生的子任务）留在 hook 建的那张卡上（#368、#369）。二是新版 ChatGPT 从 `ChatGPT.app/Contents/Resources/codex-cli/` 启动 Codex 的 app-server，环境变量里没有 bundle id，桌面版对话的 hook 被当成命令行会话，和桌面版那张卡并排出现。现在桥接程序发现 Codex 进程在跑 `app-server` 且父进程就是 ChatGPT 时，把它的 hook 标为桌面版；终端里的 Codex 和插件起的 app-server 用的是同一个程序，不受影响。「插件子会话」设为合并时，桌面版对话自己的 hook 也不会再被当成别的对话的子会话吞掉（#370、#371）。感谢 @Junyu06
+
 ## [v1.0.36] - 2026-10-10
 
 ### English
