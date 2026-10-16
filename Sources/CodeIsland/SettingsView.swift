@@ -402,6 +402,7 @@ private struct BehaviorPage: View {
     @AppStorage(SettingsKey.hapticOnHover) private var hapticOnHover = SettingsDefaults.hapticOnHover
     @AppStorage(SettingsKey.hoverExpandDelay) private var hoverExpandDelay = SettingsDefaults.hoverExpandDelay
     @AppStorage(SettingsKey.sessionWideAlwaysAllow) private var sessionWideAlwaysAllow = SettingsDefaults.sessionWideAlwaysAllow
+    @AppStorage(SettingsKey.planReviewEnabled) private var planReviewEnabled = SettingsDefaults.planReviewEnabled
     @AppStorage(SettingsKey.hapticIntensity) private var hapticIntensity = SettingsDefaults.hapticIntensity
     @AppStorage(SettingsKey.autoExpandOnQuestion) private var autoExpandOnQuestion = SettingsDefaults.autoExpandOnQuestion
     @AppStorage(SettingsKey.sessionTimeout) private var sessionTimeout = SettingsDefaults.sessionTimeout
@@ -557,6 +558,12 @@ private struct BehaviorPage: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Toggle(l10n["session_wide_always_allow"], isOn: $sessionWideAlwaysAllow)
                     Text(l10n["session_wide_always_allow_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle(l10n["plan_review_setting"], isOn: $planReviewEnabled)
+                    Text(l10n["plan_review_setting_hint"])
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
@@ -3000,6 +3007,7 @@ private struct ShortcutsPage: View {
     @State private var recordingAction: ShortcutAction?
     @State private var eventMonitor: Any?
     @State private var refreshKey = 0
+    @AppStorage(SettingsKey.questionOptionShortcuts) private var questionOptionShortcuts = SettingsDefaults.questionOptionShortcuts
 
     var body: some View {
         Form {
@@ -3012,6 +3020,14 @@ private struct ShortcutsPage: View {
                         onClear: { clearBinding(action) }
                     )
                     .id("\(action.rawValue)-\(refreshKey)")
+                }
+            }
+            Section {
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle(l10n["question_option_shortcuts"], isOn: $questionOptionShortcuts)
+                    Text(l10n["question_option_shortcuts_hint"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
                 }
             }
         }

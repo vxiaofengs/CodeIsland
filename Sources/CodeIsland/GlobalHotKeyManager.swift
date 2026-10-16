@@ -17,18 +17,24 @@ final class GlobalHotKeyManager {
         let handler: () -> Void
     }
 
-    /// FourCharCode signature shared by every hotkey we register. The per-hotkey
-    /// `id` field disambiguates which binding fired.
-    private static let signature: OSType = {
-        // "CISL" — CodeISLand
-        let chars: [UInt8] = Array("CISL".utf8)
-        return (OSType(chars[0]) << 24) | (OSType(chars[1]) << 16)
-            | (OSType(chars[2]) << 8) | OSType(chars[3])
-    }()
+    /// FourCharCode signature shared by every hotkey this manager registers.
+    /// The per-hotkey `id` field disambiguates which binding fired. Each
+    /// manager needs its own: they all hear every hotkey of the app, and the
+    /// signature is how one tells its own from another's.
+    fileprivate let signature: OSType
 
     private var entries: [UInt32: Entry] = [:]
     private var nextID: UInt32 = 1
     private var eventHandler: EventHandlerRef?
+
+    /// - Parameter signature: four ASCII characters; "CISL" — CodeISLand —
+    ///   for the user's shortcuts.
+    init(signature: String = "CISL") {
+        let chars = Array(signature.utf8.prefix(4))
+        precondition(chars.count == 4, "a hotkey signature is four ASCII characters")
+        self.signature = (OSType(chars[0]) << 24) | (OSType(chars[1]) << 16)
+            | (OSType(chars[2]) << 8) | OSType(chars[3])
+    }
 
     /// Translate an AppKit keyCode (CG/virtual keycode) + modifier flags into a
     /// Carbon modifier mask. Exposed for unit testing.
@@ -51,7 +57,7 @@ final class GlobalHotKeyManager {
         let id = nextID
         nextID += 1
 
-        let hotKeyID = EventHotKeyID(signature: Self.signature, id: id)
+        let hotKeyID = EventHotKeyID(signature: signature, id: id)
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(
             UInt32(keyCode),
@@ -79,6 +85,11 @@ final class GlobalHotKeyManager {
             RemoveEventHandler(eventHandler)
             self.eventHandler = nil
         }
+    }
+
+    /// Whether a fired hotkey is one of this manager's.
+    fileprivate func owns(_ hotKeyID: EventHotKeyID) -> Bool {
+        hotKeyID.signature == signature && entries[hotKeyID.id] != nil
     }
 
     /// Dispatch a fired hotkey to its handler. Called from the C trampoline.
@@ -134,6 +145,8 @@ private func globalHotKeyEventHandler(
     guard status == noErr else { return status }
 
     let manager = Unmanaged<GlobalHotKeyManager>.fromOpaque(userData).takeUnretainedValue()
+    // Another manager's hotkey: pass it on down the handler chain.
+    guard manager.owns(hotKeyID) else { return OSStatus(eventNotHandledErr) }
     let id = hotKeyID.id
     // Carbon delivers on the main run loop already, but hop explicitly so the
     // handler can touch @MainActor UI state safely.

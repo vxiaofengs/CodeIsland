@@ -40,6 +40,15 @@ extension AnyTransition {
             identity: BlurFadeModifier(active: false)
         )
     }
+
+    /// The session list arriving with the open spring: no transition of its
+    /// own. It is fully drawn from the first frame and the growing panel
+    /// uncovers it. A blur over a list several sessions tall cost an offscreen
+    /// pass every frame, and any fade or drop delays content that should be
+    /// readable as soon as the panel opens.
+    static var listReveal: AnyTransition {
+        .identity
+    }
 }
 
 // MARK: - MorphText — blur morph on text change

@@ -74,6 +74,24 @@ final class NotchCardRedesignTests: XCTestCase {
         XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "Bash", scope: .session), "本会话始终允许 Bash")
     }
 
+    /// This fork's session-wide setting answers the session's later requests
+    /// whatever the tool, so the link must not name one. It has to hold for
+    /// both places that draw the link — the approval card and the session
+    /// card's inline row each used to build their own text, and the inline
+    /// row kept promising "Bash" after the card was fixed.
+    func testSessionWideScopeDropsTheToolFromTheLink() {
+        let scope = ApprovalAlwaysScope(savesRule: false, tool: "Bash", trustsWholeSession: true)
+        XCTAssertEqual(scope, .wholeSession)
+        XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "Bash", scope: scope), "Always allow this session")
+        L10n.shared.language = "zh"
+        XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "Bash", scope: scope), "本会话始终允许")
+        L10n.shared.language = "en"
+        // A rule Codex saves to disk is still named by where it goes — the
+        // session-wide answer never applies to a rule that outlives the session.
+        XCTAssertEqual(ApprovalAlwaysScope(savesRule: true, tool: "Bash", trustsWholeSession: true), .codexRules)
+        XCTAssertEqual(ApprovalAlwaysScope(savesRule: false, tool: "Bash", trustsWholeSession: false), .session)
+    }
+
     func testAlwaysScopeFollowsWhereTheRuleIsSaved() {
         XCTAssertEqual(ApprovalAlwaysScope(savesRule: false, tool: "mcp__github__create_pull_request"), .session)
         XCTAssertEqual(ApprovalAlwaysScope(savesRule: true, tool: "Bash"), .codexRules)

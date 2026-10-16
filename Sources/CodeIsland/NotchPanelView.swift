@@ -349,6 +349,7 @@ struct NotchPanelView: View {
                                 onAllow: { appState.approvePermission(always: false, expectedSessionId: sid) },
                                 onAlwaysAllow: { appState.approvePermission(always: true, expectedSessionId: sid) },
                                 onDeny: { appState.denyPermission(expectedSessionId: sid) },
+                                onSendBack: { appState.denyPermission(expectedSessionId: sid, feedback: $0) },
                                 onDismiss: { appState.dismissPermissionPrompt(expectedSessionId: sid) }
                             )
                             .transition(.blurFade.combined(with: .scale(scale: 0.96, anchor: .top)))
@@ -404,10 +405,10 @@ struct NotchPanelView: View {
                         }
                     case .completionCard:
                         SessionListView(appState: appState, onlySessionId: appState.justCompletedSessionId)
-                            .transition(.blurFade.combined(with: .move(edge: .top)))
+                            .transition(.listReveal)
                     case .sessionList:
                         SessionListView(appState: appState, onlySessionId: nil)
-                            .transition(.blurFade.combined(with: .move(edge: .top)))
+                            .transition(.listReveal)
                     case .collapsed:
                         EmptyView()
                     }
@@ -1438,6 +1439,10 @@ private struct ApprovalToolDetailView: View {
                     }
                 }
 
+            case PlanReview.toolName where PlanReview.plan(toolName: tool, toolInput: toolInput) != nil:
+                AssistantReplyText(text: PlanReview.plan(toolName: tool, toolInput: toolInput) ?? "",
+                                   fontSize: type.secondary, lineLimit: maxLines ?? 6)
+
             case "Grep":
                 VStack(alignment: .leading, spacing: 2) {
                     if let pattern = toolInput?["pattern"] as? String {
@@ -1731,6 +1736,7 @@ enum NotchCardPalette {
     static let deny = Color(red: 0.92, green: 0.38, blue: 0.38)
     static let link = Color(red: 0.45, green: 0.72, blue: 1.0)
     static let permission = Color(red: 1.0, green: 0.6, blue: 0.2)
+    static let plan = Color(red: 0.62, green: 0.55, blue: 1.0)
 }
 
 private struct NotchCardButton: View {
@@ -1822,11 +1828,12 @@ private struct NotchCardButton: View {
     }
 }
 
-/// "Always allow Bash this session" — the approval card's leading link. A
-/// link rather than a fourth button: it is the one answer that outlives the
-/// request, so it says what it commits to and doesn't sit where a hand
-/// reaching for Allow lands.
-private struct NotchCardTextLink: View {
+/// "Always allow Bash this session" — the approval card's leading action. A
+/// tinted blue button rather than a fourth grey one: it is the one answer
+/// that outlives the request, so it says what it commits to, reads apart
+/// from the decision buttons, and doesn't sit where a hand reaching for
+/// Allow lands.
+private struct NotchCardAlwaysButton: View {
     let label: String
     let fontSize: CGFloat
     var hint: String? = nil
@@ -1836,11 +1843,13 @@ private struct NotchCardTextLink: View {
     @State private var hovering = false
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 6)
         Button(action: action) {
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
+            HStack(spacing: 5) {
+                Image(systemName: "checkmark.shield")
+                    .font(.system(size: fontSize - 1, weight: .semibold))
                 Text(label)
-                    .font(.system(size: fontSize, weight: .medium))
-                    .underline()
+                    .font(.system(size: fontSize, weight: .semibold))
                     .lineLimit(lineLimit)
                     .truncationMode(.middle)
                     .multilineTextAlignment(.leading)
@@ -1851,10 +1860,13 @@ private struct NotchCardTextLink: View {
                         .fixedSize()
                 }
             }
-            .foregroundStyle(NotchCardPalette.link.opacity(hovering ? 1 : 0.9))
-            .padding(.vertical, 4)
+            .foregroundStyle(NotchCardPalette.link.opacity(hovering ? 1 : 0.92))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
             .frame(minHeight: 26)
-            .contentShape(Rectangle())
+            .background(shape.fill(NotchCardPalette.link.opacity(hovering ? 0.2 : 0.11)))
+            .overlay(shape.strokeBorder(NotchCardPalette.link.opacity(hovering ? 0.6 : 0.35), lineWidth: 1))
+            .contentShape(shape)
         }
         .buttonStyle(.plain)
         .onHover { h in withAnimation(NotchAnimation.micro) { hovering = h } }
@@ -2005,13 +2017,20 @@ private struct ApprovalBar: View {
     let onAllow: () -> Void
     let onAlwaysAllow: () -> Void
     let onDeny: () -> Void
+    /// Sends a reviewed plan back with the user's feedback.
+    let onSendBack: (String) -> Void
     let onDismiss: () -> Void
 
     // Jump validation state for click-to-jump functionality
     @State private var failureShakeOffset: CGFloat = 0
     @State private var jumpValidationTask: Task<Void, Never>?
+    @State private var planFeedback = ""
+    @FocusState private var feedbackFocused: Bool
     @AppStorage(SettingsKey.autoCollapseAfterSessionJump) private var autoCollapseAfterSessionJump = SettingsDefaults.autoCollapseAfterSessionJump
     @AppStorage(SettingsKey.contentFontSize) private var contentFontSize = SettingsDefaults.contentFontSize
+
+    /// Claude's plan, when this request is the end of plan mode.
+    private var plan: String? { PlanReview.plan(toolName: tool, toolInput: toolInput) }
 
     private var serverName: String? {
         toolInput?["server_name"] as? String
@@ -2047,43 +2066,11 @@ private struct ApprovalBar: View {
                 )
             }
 
-            // What is being asked
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
-                NotchCardTag(text: L10n.shared["card_permission_tag"], color: NotchCardPalette.permission, fontSize: type.badge)
-                let title = ApprovalCopy.title(tool: tool, toolInput: toolInput)
-                Text(title)
-                    .font(.system(size: type.title, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(tool == title ? title : "\(title)\n\(tool)")
-                if let server = serverName {
-                    Text("(\(server))")
-                        .font(.system(size: type.secondary))
-                        .foregroundStyle(Color(red: 0.6, green: 0.7, blue: 0.9))
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
+            if let plan {
+                planReviewContent(plan, type)
+            } else {
+                permissionContent(type)
             }
-            .contentShape(Rectangle())
-            .onTapGesture { handleCardClick() }
-
-            // Tool-specific detail view. A long command scrolls inside the
-            // window rather than pushing the buttons off its bottom edge.
-            if toolInput != nil {
-                PanelFittedScrollArea(minimumHeight: Self.detailMinimumHeight(type)) {
-                    ApprovalToolDetailView(tool: tool, toolInput: toolInput)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06)))
-                .contentShape(Rectangle())
-                .onTapGesture { handleCardClick() }
-            }
-
-            actionRow(type)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -2102,6 +2089,122 @@ private struct ApprovalBar: View {
             jumpValidationTask?.cancel()
             jumpValidationTask = nil
         }
+    }
+
+    // MARK: - Plan review
+
+    /// The plan in full Markdown, a field for feedback, and Send back /
+    /// Approve. No "Always": every plan is its own decision.
+    @ViewBuilder
+    private func planReviewContent(_ plan: String, _ type: NotchCardTypography) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            NotchCardTag(text: L10n.shared["card_plan_tag"], color: NotchCardPalette.plan, fontSize: type.badge)
+            Text(L10n.shared["plan_review_title"])
+                .font(.system(size: type.title, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { handleCardClick() }
+
+        AssistantReplyText(text: plan, fontSize: type.body, lineLimit: nil, isCompletionReply: true)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06)))
+
+        HStack(spacing: 6) {
+            Image(systemName: "text.bubble")
+                .font(.system(size: type.secondary, weight: .semibold))
+                .foregroundStyle(NotchCardPalette.plan)
+                .accessibilityHidden(true)
+            TextField(L10n.shared["plan_feedback_placeholder"], text: $planFeedback, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.system(size: type.link))
+                .foregroundStyle(.white)
+                .lineLimit(1...4)
+                .focused($feedbackFocused)
+                .onSubmit(sendBack)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.05)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(feedbackFocused ? NotchCardPalette.plan.opacity(0.6) : Color.white.opacity(0.1), lineWidth: 1)
+        )
+
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                Spacer(minLength: 12)
+                planButtons(type, expands: false)
+            }
+            HStack(spacing: 6) {
+                planButtons(type, expands: true)
+            }
+            .frame(minWidth: 0, idealWidth: 0, maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private func planButtons(_ type: NotchCardTypography, expands: Bool) -> some View {
+        let hasFeedback = !planFeedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        NotchCardButton(label: L10n.shared["card_hide"], role: .quiet, fontSize: type.button,
+                        help: L10n.shared["dismiss_card_hint"], action: onDismiss)
+        NotchCardButton(label: L10n.shared[hasFeedback ? "plan_send_back" : "card_deny"], role: .destructive,
+                        fontSize: type.button, hint: CardShortcutHint.text(for: .deny),
+                        help: L10n.shared["plan_send_back_hint"], expands: expands, action: sendBack)
+        NotchCardButton(label: L10n.shared["plan_approve"], role: .primary, fontSize: type.button,
+                        hint: CardShortcutHint.text(for: .approve), expands: expands, action: onAllow)
+    }
+
+    private func sendBack() {
+        let feedback = planFeedback.trimmingCharacters(in: .whitespacesAndNewlines)
+        if feedback.isEmpty { onDeny() } else { onSendBack(feedback) }
+    }
+
+    // MARK: - Permission
+
+    @ViewBuilder
+    private func permissionContent(_ type: NotchCardTypography) -> some View {
+        // What is being asked
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            NotchCardTag(text: L10n.shared["card_permission_tag"], color: NotchCardPalette.permission, fontSize: type.badge)
+            let title = ApprovalCopy.title(tool: tool, toolInput: toolInput)
+            Text(title)
+                .font(.system(size: type.title, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(tool == title ? title : "\(title)\n\(tool)")
+            if let server = serverName {
+                Text("(\(server))")
+                    .font(.system(size: type.secondary))
+                    .foregroundStyle(Color(red: 0.6, green: 0.7, blue: 0.9))
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { handleCardClick() }
+
+        // Tool-specific detail view. A long command scrolls inside the
+        // window rather than pushing the buttons off its bottom edge.
+        if toolInput != nil {
+            PanelFittedScrollArea(minimumHeight: Self.detailMinimumHeight(type)) {
+                ApprovalToolDetailView(tool: tool, toolInput: toolInput)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06)))
+            .contentShape(Rectangle())
+            .onTapGesture { handleCardClick() }
+        }
+
+        actionRow(type)
     }
 
     /// Three lines of command, so a scrolled detail never shrinks to a sliver.
@@ -2143,7 +2246,7 @@ private struct ApprovalBar: View {
     }
 
     private func alwaysLink(_ type: NotchCardTypography, lineLimit: Int) -> some View {
-        NotchCardTextLink(
+        NotchCardAlwaysButton(
             label: ApprovalCopy.alwaysLink(tool: tool, scope: alwaysScope),
             fontSize: type.link,
             hint: CardShortcutHint.text(for: .approveAlways),
@@ -2335,6 +2438,9 @@ private struct QuestionBar: View {
     // Multi-question wizard state, bound to `requestId` (#333)
     @State private var wizard = QuestionWizardState()
     @FocusState private var otherFocused: Bool
+    /// This card's claim on ⌘1…⌘9 (QuestionOptionHotKeys).
+    @State private var hotKeyOwner = UUID()
+    @AppStorage(SettingsKey.questionOptionShortcuts) private var optionShortcuts = SettingsDefaults.questionOptionShortcuts
 
     private let cyan = Color(red: 0.4, green: 0.7, blue: 1.0)
     /// The options never shrink below about two rows.
@@ -2393,9 +2499,56 @@ private struct QuestionBar: View {
             // gets a fresh view; this keeps the wizard honest if it does not.
             wizard.bind(to: newId)
         }
+        // Each wizard step has its own options, so the keys follow the step.
+        .onChange(of: OptionHotKeyClaim(step: wizard.currentQuestionIndex, count: optionCount, enabled: optionShortcuts),
+                  initial: true) { _, claim in
+            guard requestId != nil else { return }
+            QuestionOptionHotKeys.shared.activate(owner: hotKeyOwner, count: claim.enabled ? claim.count : 0) { index in
+                pickOption(at: index)
+            }
+        }
         .onDisappear {
             jumpValidationTask?.cancel()
             jumpValidationTask = nil
+            QuestionOptionHotKeys.shared.deactivate(owner: hotKeyOwner)
+        }
+    }
+
+    private struct OptionHotKeyClaim: Equatable {
+        let step: Int
+        let count: Int
+        let enabled: Bool
+    }
+
+    /// Options on the step showing now.
+    private var optionCount: Int {
+        if let item = currentItem { return item.payload.options?.count ?? 0 }
+        return options?.count ?? 0
+    }
+
+    /// ⌘n's hint beside option `index`, when the shortcuts are on.
+    private func optionHint(_ index: Int) -> String? {
+        optionShortcuts ? QuestionOptionHotKeys.hint(forOptionAt: index) : nil
+    }
+
+    /// What ⌘n does: exactly what clicking option n does.
+    private func pickOption(at index: Int) {
+        if let item = currentItem {
+            guard let opts = item.payload.options, opts.indices.contains(index) else { return }
+            if item.multiSelect {
+                if wizard.selectedIndices.contains(index) {
+                    wizard.selectedIndices.remove(index)
+                } else {
+                    wizard.selectedIndices.insert(index)
+                }
+            } else {
+                wizard.selectedIndex = index
+                wizard.showOtherInput = false
+                advanceWithAnswer(opts[index], selectedOptions: [opts[index]])
+            }
+        } else if let options, options.indices.contains(index) {
+            wizard.selectedIndex = index
+            onAnswer(options[index])
         }
     }
 
@@ -2548,19 +2701,15 @@ private struct QuestionBar: View {
                         let desc = item.payload.descriptions?.indices.contains(idx) == true ? item.payload.descriptions?[idx] : nil
                         if item.multiSelect {
                             MultiSelectRow(index: idx + 1, label: option, description: desc,
-                                           isChecked: wizard.selectedIndices.contains(idx), accent: cyan, type: type) {
-                                if wizard.selectedIndices.contains(idx) {
-                                    wizard.selectedIndices.remove(idx)
-                                } else {
-                                    wizard.selectedIndices.insert(idx)
-                                }
+                                           isChecked: wizard.selectedIndices.contains(idx), accent: cyan, type: type,
+                                           shortcutHint: optionHint(idx)) {
+                                pickOption(at: idx)
                             }
                         } else {
                             OptionRow(index: idx + 1, label: option, description: desc,
-                                      isSelected: wizard.selectedIndex == idx, accent: cyan, type: type) {
-                                wizard.selectedIndex = idx
-                                wizard.showOtherInput = false
-                                advanceWithAnswer(option, selectedOptions: [option])
+                                      isSelected: wizard.selectedIndex == idx, accent: cyan, type: type,
+                                      shortcutHint: optionHint(idx)) {
+                                pickOption(at: idx)
                             }
                         }
                     }
@@ -2696,9 +2845,9 @@ private struct QuestionBar: View {
                     ForEach(Array(options.enumerated()), id: \.offset) { idx, option in
                         let desc = descriptions?.indices.contains(idx) == true ? descriptions?[idx] : nil
                         OptionRow(index: idx + 1, label: option, description: desc,
-                                  isSelected: wizard.selectedIndex == idx, accent: cyan, type: type) {
-                            wizard.selectedIndex = idx
-                            onAnswer(option)
+                                  isSelected: wizard.selectedIndex == idx, accent: cyan, type: type,
+                                  shortcutHint: optionHint(idx)) {
+                            pickOption(at: idx)
                         }
                     }
                 }
@@ -2728,6 +2877,8 @@ private struct MultiSelectRow: View {
     let isChecked: Bool
     let accent: Color
     let type: NotchCardTypography
+    /// "⌘1" — the global shortcut that picks this option, if any.
+    var shortcutHint: String? = nil
     let action: () -> Void
     @State private var hovering = false
 
@@ -2750,6 +2901,12 @@ private struct MultiSelectRow: View {
                     }
                 }
                 Spacer()
+                if let shortcutHint {
+                    Text(shortcutHint)
+                        .font(.system(size: max(8.5, type.caption - 1), weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.45))
+                        .fixedSize()
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
@@ -2778,6 +2935,8 @@ private struct OptionRow: View {
     let isSelected: Bool
     let accent: Color
     let type: NotchCardTypography
+    /// "⌘1" — the global shortcut that picks this option, if any.
+    var shortcutHint: String? = nil
     let action: () -> Void
     @State private var hovering = false
 
@@ -2810,6 +2969,12 @@ private struct OptionRow: View {
                     }
                 }
                 Spacer()
+                if let shortcutHint {
+                    Text(shortcutHint)
+                        .font(.system(size: max(8.5, type.caption - 1), weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.45))
+                        .fixedSize()
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
@@ -4497,13 +4662,24 @@ private struct SessionCard: View {
     private func inlineApprovalActions(tool: String, event: HookEvent) -> some View {
         let enabled = isActiveApproval
         let queuedHint = enabled ? nil : L10n.shared["session_inline_queued_hint"]
+        // Same scope as the approval card, so the two never promise different
+        // things for the same request — in particular, with the session-wide
+        // setting on, neither may claim it covers only this one tool.
+        let scope = ApprovalAlwaysScope(
+            savesRule: CodexPermissionRules.isCodexEvent(event),
+            tool: tool,
+            trustsWholeSession: SettingsManager.shared.sessionWideAlwaysAllow
+        )
+        let alwaysTitle = scope == .wholeSession
+            ? L10n.shared["card_always_whole_session"]
+            : String(format: L10n.shared["session_inline_always"], ToolNameDisplay.compact(tool))
         return HStack(spacing: 8) {
             SessionInlineButton(
-                title: String(format: L10n.shared["session_inline_always"], ToolNameDisplay.compact(tool)),
+                title: alwaysTitle,
                 style: .link,
                 fontSize: buttonFontSize,
                 enabled: enabled,
-                help: queuedHint ?? ApprovalHints.always(savesRule: CodexPermissionRules.isCodexEvent(event)),
+                help: queuedHint ?? ApprovalHints.always(scope: scope),
                 action: { appState.approvePermission(always: true, expectedSessionId: sessionId) }
             )
             Spacer(minLength: 8)
@@ -4913,7 +5089,7 @@ private struct SessionInlineButton: View {
         case destructive
         /// Low-key fill (Details).
         case quiet
-        /// Underlined text (Always allow …): gives way first when the row is tight.
+        /// Tinted blue (Always allow …): gives way first when the row is tight.
         case link
     }
 
@@ -4972,14 +5148,20 @@ private struct SessionInlineButton: View {
                 .frame(minHeight: Self.minHeight)
                 .background(shape.fill(Color.white.opacity(lit ? 0.14 : 0.08)))
         case .link:
-            Text(title)
-                .font(.system(size: fontSize - 0.5, weight: .medium))
-                .underline()
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .foregroundStyle(Self.link.opacity(enabled ? (lit ? 1 : 0.9) : 0.5))
-                .frame(minHeight: Self.minHeight)
-                .contentShape(Rectangle())
+            HStack(spacing: 4) {
+                Image(systemName: "checkmark.shield")
+                    .font(.system(size: fontSize - 1, weight: .semibold))
+                Text(title)
+                    .font(.system(size: fontSize, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .foregroundStyle(Self.link.opacity(enabled ? (lit ? 1 : 0.92) : 0.5))
+            .padding(.horizontal, 9)
+            .frame(minHeight: Self.minHeight)
+            .background(shape.fill(Self.link.opacity(enabled ? (lit ? 0.2 : 0.11) : 0.05)))
+            .overlay(shape.strokeBorder(Self.link.opacity(enabled ? (lit ? 0.6 : 0.35) : 0.15), lineWidth: 1))
+            .contentShape(shape)
         }
     }
 }

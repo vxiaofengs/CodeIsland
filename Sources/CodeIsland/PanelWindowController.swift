@@ -186,6 +186,7 @@ class PanelWindowController: NSObject, NSWindowDelegate {
     private var wasOcclusionVisible = true
     private var repaintScheduled = false
     private var repaintNudgeTimer: Timer?
+    private var pendingMascotWake: DispatchWorkItem?
     private var drawKeepAlive: NSObjectProtocol?
     private var globalClickMonitor: Any?
     private var lastChosenScreenSignature = ""
@@ -430,6 +431,11 @@ class PanelWindowController: NSObject, NSWindowDelegate {
 
     private func nudgeRepaint() {
         guard let panel = panel, panel.isVisible, !isAnimatingScreenHop else { return }
+        // Only while nothing else draws. A live mascot already commits a frame
+        // every display cycle, and a forced full-panel re-render on top of that
+        // only costs: it re-lays out every card, and one that lands on a
+        // hover expansion drops frames from the spring.
+        guard !MascotAnimationGate.shared.animationsActive else { return }
         // Unconditional backstop. It used to skip whenever a session was active,
         // which is exactly why the approval card still blanked out: a session
         // waiting for approval counts as active, and that card had no animation
@@ -772,7 +778,35 @@ class PanelWindowController: NSObject, NSWindowDelegate {
             panel.orderFrontRegardless()
         }
         MascotAnimationGate.shared.setPanelVisible(true)
-        MascotAnimationGate.shared.setIdleSettled(isIslandSettled())
+        updateMascotSettledState()
+    }
+
+    /// Leaving the settled state wakes every mascot at once: animations turn
+    /// on and the epoch bump rebuilds each timeline. When that is caused by
+    /// the panel expanding it lands on the first frames of the open spring,
+    /// and a live timeline re-runs the whole panel's layout every display
+    /// cycle (#299) — with the redesigned cards that is enough to make the
+    /// expansion stutter. So an expand lets the spring run first and wakes
+    /// the mascots once it has settled; anything else applies at once.
+    private func updateMascotSettledState() {
+        let settled = isIslandSettled()
+        pendingMascotWake?.cancel()
+        pendingMascotWake = nil
+        let gate = MascotAnimationGate.shared
+        guard !settled, gate.isIdleSettled, appState.surface.isExpanded else {
+            gate.setIdleSettled(settled)
+            return
+        }
+        let wake = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingMascotWake = nil
+            MascotAnimationGate.shared.setIdleSettled(self.isIslandSettled())
+        }
+        pendingMascotWake = wake
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + NotchAnimationMetrics.openResponse + 0.05,
+            execute: wake
+        )
     }
 
     /// Collapsed island with nothing running — the state a Mac spends most of

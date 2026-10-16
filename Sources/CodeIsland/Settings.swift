@@ -44,6 +44,8 @@ enum SettingsKey {
     static let hapticIntensity = "hapticIntensity"      // 1=light, 2=medium, 3=strong
     static let hoverExpandDelay = "hoverExpandDelay"    // seconds the pointer rests before the island opens (0.1–1.0)
     static let sessionWideAlwaysAllow = "sessionWideAlwaysAllow"
+    static let planReviewEnabled = "planReviewEnabled"
+    static let questionOptionShortcuts = "questionOptionShortcuts"
     static let showProjectName = "showProjectName"      // false = cards lead with the session title instead of the folder
     static let autoExpandOnQuestion = "autoExpandOnQuestion"
     static let sessionTimeout = "sessionTimeout"
@@ -185,6 +187,8 @@ struct SettingsDefaults {
     static let hapticIntensity = 1          // 1=light
     static let hoverExpandDelay = NotchHoverInteraction.expandDelay
     static let sessionWideAlwaysAllow = true
+    static let planReviewEnabled = true
+    static let questionOptionShortcuts = true
     static let showProjectName = true
     static let autoExpandOnQuestion = true
     static let sessionTimeout = 30
@@ -292,6 +296,8 @@ class SettingsManager {
             SettingsKey.hapticIntensity: SettingsDefaults.hapticIntensity,
             SettingsKey.hoverExpandDelay: SettingsDefaults.hoverExpandDelay,
             SettingsKey.sessionWideAlwaysAllow: SettingsDefaults.sessionWideAlwaysAllow,
+            SettingsKey.planReviewEnabled: SettingsDefaults.planReviewEnabled,
+            SettingsKey.questionOptionShortcuts: SettingsDefaults.questionOptionShortcuts,
             SettingsKey.showProjectName: SettingsDefaults.showProjectName,
             SettingsKey.autoExpandOnQuestion: SettingsDefaults.autoExpandOnQuestion,
             SettingsKey.sessionTimeout: SettingsDefaults.sessionTimeout,
@@ -495,6 +501,19 @@ class SettingsManager {
     var sessionWideAlwaysAllow: Bool {
         get { defaults.bool(forKey: SettingsKey.sessionWideAlwaysAllow) }
         set { defaults.set(newValue, forKey: SettingsKey.sessionWideAlwaysAllow) }
+    }
+
+    /// When on, Claude's plan always gets a review card — the auto-approve
+    /// list and a session's "Always Allow" no longer wave ExitPlanMode through.
+    var planReviewEnabled: Bool {
+        get { defaults.bool(forKey: SettingsKey.planReviewEnabled) }
+        set { defaults.set(newValue, forKey: SettingsKey.planReviewEnabled) }
+    }
+
+    /// ⌘1…⌘9 pick a question card's options while the card is on screen.
+    var questionOptionShortcuts: Bool {
+        get { defaults.bool(forKey: SettingsKey.questionOptionShortcuts) }
+        set { defaults.set(newValue, forKey: SettingsKey.questionOptionShortcuts) }
     }
 
     var autoApproveTools: Set<String> {

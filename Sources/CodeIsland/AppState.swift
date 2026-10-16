@@ -2428,7 +2428,9 @@ final class AppState {
         })?.key
     }
 
-    func denyPermission(expectedSessionId: String? = nil) {
+    /// `feedback` rides along as the deny's message — how a reviewed plan is
+    /// sent back: Claude stays in plan mode and revises along it.
+    func denyPermission(expectedSessionId: String? = nil, feedback: String? = nil) {
         guard let index = permissionIndex(expecting: expectedSessionId) else {
             if let expectedSessionId {
                 discardStalePanelAction(expected: expectedSessionId, kind: "deny")
@@ -2438,8 +2440,7 @@ final class AppState {
         let pending = permissionQueue.remove(at: index)
         let sessionId = pending.event.sessionId ?? "default"
         dismissedPermissionSessionIds.remove(sessionId)
-        let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#
-        pending.continuation.resume(returning: Data(response.utf8))
+        pending.continuation.resume(returning: PlanReview.denyResponse(feedback: feedback))
         // Folded Task deny must not idle the whole parent chat card.
         resolveMergedSubagentAfterUI(
             sessionId: sessionId,

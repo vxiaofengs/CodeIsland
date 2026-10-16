@@ -753,8 +753,14 @@ class HookServer {
         case .permission:
             let sessionId = event.sessionId ?? "default"
 
+            // Claude's plan is reviewed on the island whatever the
+            // auto-approve list or the session's trust says: waving it through
+            // is exactly what reviewing it is meant to stop.
+            let reviewsPlan = SettingsManager.shared.planReviewEnabled
+                && PlanReview.isPlanReview(toolName: event.toolName, toolInput: event.toolInput)
+
             // Auto-approve safe internal tools without showing UI
-            if let toolName = event.toolName, Self.autoApproveTools.contains(toolName) {
+            if !reviewsPlan, let toolName = event.toolName, Self.autoApproveTools.contains(toolName) {
                 let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
                 sendResponse(connection: connection, data: Data(response.utf8))
                 return
@@ -765,7 +771,7 @@ class HookServer {
             // to the provider's session and kept expiring under the user, which
             // is what made "Always Allow" feel like it did nothing. High-risk
             // commands still get a card — see HighRiskCommand.
-            if appState.isSessionWideAllowed(event) {
+            if !reviewsPlan, appState.isSessionWideAllowed(event) {
                 let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
                 sendResponse(connection: connection, data: Data(response.utf8))
                 return
