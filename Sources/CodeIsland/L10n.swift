@@ -156,7 +156,7 @@ final class L10n: ObservableObject {
         "task_progress_more": "+%d more",
         "task_progress_a11y": "Tasks: %d of %d done",
         "plugin_session_mode": "Agent Sub-Sessions",
-        "plugin_session_mode_desc": "How to show child sessions spawned by agents, including Codex subagents, Cursor IDE Task/subagents, and plugin hook events (e.g. omo in OpenCode)",
+        "plugin_session_mode_desc": "How to show child sessions spawned by agents, including Codex subagents, Cursor IDE Task/subagents, pi and Oh My Pi subagents, and plugin hook events (e.g. omo in OpenCode)",
         "plugin_session_mode_separate": "Show separately",
         "plugin_session_mode_merge": "Merge into main",
         "plugin_session_mode_hide": "Hide",
@@ -470,6 +470,9 @@ final class L10n: ObservableObject {
         "remote_disconnected": "Disconnected",
         "remote_disconnect": "Disconnect",
         "remote_remove": "Remove",
+        "remote_retry_in": "Reconnecting in %d s (attempt %d/%d)",
+        "remote_retry_slow": "Still unreachable after %d attempts; trying again in %d min",
+        "remote_waiting_network": "Offline; reconnects when the network is back",
 
         // Buddy
         "buddy": "Buddy",
@@ -753,7 +756,7 @@ final class L10n: ObservableObject {
         "task_progress_more": "+%d weitere",
         "task_progress_a11y": "Aufgaben: %d von %d erledigt",
         "plugin_session_mode": "Agent-Sub-Sitzungen",
-        "plugin_session_mode_desc": "Darstellung von durch Agenten gestarteten Kind-Sitzungen, einschließlich Codex-Subagenten, Cursor-IDE-Task/Subagenten und Plugin-Hook-Ereignissen (z. B. omo in OpenCode)",
+        "plugin_session_mode_desc": "Darstellung von durch Agenten gestarteten Kind-Sitzungen, einschließlich Codex-Subagenten, Cursor-IDE-Task/Subagenten, pi- und Oh-My-Pi-Subagenten und Plugin-Hook-Ereignissen (z. B. omo in OpenCode)",
         "plugin_session_mode_separate": "Separat anzeigen",
         "plugin_session_mode_merge": "In Hauptsitzung zusammenführen",
         "plugin_session_mode_hide": "Ausblenden",
@@ -1067,6 +1070,9 @@ final class L10n: ObservableObject {
         "remote_disconnected": "Getrennt",
         "remote_disconnect": "Trennen",
         "remote_remove": "Entfernen",
+        "remote_retry_in": "Erneute Verbindung in %d s (Versuch %d/%d)",
+        "remote_retry_slow": "Nach %d Versuchen nicht erreichbar; nächster Versuch in %d Min.",
+        "remote_waiting_network": "Offline – verbindet sich wieder, sobald das Netzwerk zurück ist",
 
         // Buddy
         "buddy": "Buddy",
@@ -1350,7 +1356,7 @@ final class L10n: ObservableObject {
         "task_progress_more": "还有 %d 项",
         "task_progress_a11y": "任务：已完成 %d 项，共 %d 项",
         "plugin_session_mode": "Agent 子会话",
-        "plugin_session_mode_desc": "处理由 agent 派生的子会话，包括 Codex subagent、Cursor IDE Task/subagent 和插件 hook 事件（例如 OpenCode 中的 omo）",
+        "plugin_session_mode_desc": "处理由 agent 派生的子会话，包括 Codex subagent、Cursor IDE Task/subagent、pi 与 Oh My Pi 子代理和插件 hook 事件（例如 OpenCode 中的 omo）",
         "plugin_session_mode_separate": "独立显示",
         "plugin_session_mode_merge": "合并到主会话",
         "plugin_session_mode_hide": "隐藏",
@@ -1664,6 +1670,9 @@ final class L10n: ObservableObject {
         "remote_disconnected": "未连接",
         "remote_disconnect": "断开",
         "remote_remove": "删除",
+        "remote_retry_in": "%d 秒后重新连接（第 %d/%d 次）",
+        "remote_retry_slow": "已连续失败 %d 次，%d 分钟后再试",
+        "remote_waiting_network": "网络已断开，恢复后自动重新连接",
 
         // Buddy
         "buddy": "Buddy",
@@ -1947,7 +1956,7 @@ final class L10n: ObservableObject {
         "task_progress_more": "還有 %d 項",
         "task_progress_a11y": "任務：已完成 %d 項，共 %d 項",
         "plugin_session_mode": "Agent 子會話",
-        "plugin_session_mode_desc": "處理由 agent 衍生的子會話，包括 Codex subagent、Cursor IDE Task/subagent 和外掛 hook 事件（例如 OpenCode 中的 omo）",
+        "plugin_session_mode_desc": "處理由 agent 衍生的子會話，包括 Codex subagent、Cursor IDE Task/subagent、pi 與 Oh My Pi 子代理和外掛 hook 事件（例如 OpenCode 中的 omo）",
         "plugin_session_mode_separate": "獨立顯示",
         "plugin_session_mode_merge": "合併到主會話",
         "plugin_session_mode_hide": "隱藏",
@@ -2261,6 +2270,9 @@ final class L10n: ObservableObject {
         "remote_disconnected": "未連線",
         "remote_disconnect": "中斷連線",
         "remote_remove": "刪除",
+        "remote_retry_in": "%d 秒後重新連線（第 %d/%d 次）",
+        "remote_retry_slow": "已連續失敗 %d 次，%d 分鐘後再試",
+        "remote_waiting_network": "網路已中斷，恢復後自動重新連線",
 
         // Buddy
         "buddy": "Buddy",
@@ -2544,7 +2556,7 @@ final class L10n: ObservableObject {
         "task_progress_more": "ほか %d 件",
         "task_progress_a11y": "タスク: %d / %d 件完了",
         "plugin_session_mode": "エージェントのサブセッション",
-        "plugin_session_mode_desc": "Codex subagent、Cursor IDE Task/subagent、プラグイン hook イベントなど、エージェントから派生した子セッションの表示方法を選択します（例: OpenCode の omo）",
+        "plugin_session_mode_desc": "Codex subagent、Cursor IDE Task/subagent、pi と Oh My Pi のサブエージェント、プラグイン hook イベントなど、エージェントから派生した子セッションの表示方法を選択します（例: OpenCode の omo）",
         "plugin_session_mode_separate": "別々に表示",
         "plugin_session_mode_merge": "メインセッションに統合",
         "plugin_session_mode_hide": "非表示",
@@ -2858,6 +2870,9 @@ final class L10n: ObservableObject {
         "remote_disconnected": "未接続",
         "remote_disconnect": "切断",
         "remote_remove": "削除",
+        "remote_retry_in": "%d 秒後に再接続（%d/%d 回目）",
+        "remote_retry_slow": "%d 回続けて失敗しました。%d 分後に再試行します",
+        "remote_waiting_network": "オフライン：ネットワーク復帰後に自動で再接続します",
 
         // Buddy
         "buddy": "Buddy",
@@ -3141,7 +3156,7 @@ final class L10n: ObservableObject {
         "task_progress_more": "외 %d개",
         "task_progress_a11y": "작업: %d / %d개 완료",
         "plugin_session_mode": "에이전트 하위 세션",
-        "plugin_session_mode_desc": "Codex subagent, Cursor IDE Task/subagent 및 플러그인 hook 이벤트 등 에이전트가 만든 하위 세션을 표시하는 방식 (예: OpenCode의 omo)",
+        "plugin_session_mode_desc": "Codex subagent, Cursor IDE Task/subagent, pi 및 Oh My Pi 서브에이전트, 플러그인 hook 이벤트 등 에이전트가 만든 하위 세션을 표시하는 방식 (예: OpenCode의 omo)",
         "plugin_session_mode_separate": "별도로 표시",
         "plugin_session_mode_merge": "메인 세션으로 병합",
         "plugin_session_mode_hide": "숨김",
@@ -3455,6 +3470,9 @@ final class L10n: ObservableObject {
         "remote_disconnected": "연결 끊김",
         "remote_disconnect": "연결 해제",
         "remote_remove": "삭제",
+        "remote_retry_in": "%d초 후 다시 연결 (%d/%d번째 시도)",
+        "remote_retry_slow": "%d회 연속 실패, %d분 후 다시 시도합니다",
+        "remote_waiting_network": "오프라인: 네트워크가 복구되면 다시 연결합니다",
 
         // Buddy
         "buddy": "Buddy",
@@ -3738,7 +3756,7 @@ final class L10n: ObservableObject {
         "task_progress_more": "+%d tane daha",
         "task_progress_a11y": "Görevler: %d / %d tamamlandı",
         "plugin_session_mode": "Ajan Alt Oturumları",
-        "plugin_session_mode_desc": "Codex subagent'ları, Cursor IDE Task/subagent'ları ve eklenti hook olayları dahil, ajanların başlattığı alt oturumların nasıl gösterileceği (örn: OpenCode içinde omo)",
+        "plugin_session_mode_desc": "Codex subagent'ları, Cursor IDE Task/subagent'ları, pi ve Oh My Pi alt ajanları ve eklenti hook olayları dahil, ajanların başlattığı alt oturumların nasıl gösterileceği (örn: OpenCode içinde omo)",
         "plugin_session_mode_separate": "Ayrı göster",
         "plugin_session_mode_merge": "Ana oturuma birleştir",
         "plugin_session_mode_hide": "Gizle",
@@ -4052,6 +4070,9 @@ final class L10n: ObservableObject {
         "remote_disconnected": "Bağlı Değil",
         "remote_disconnect": "Bağlantıyı Kes",
         "remote_remove": "Kaldır",
+        "remote_retry_in": "%d sn sonra yeniden bağlanılacak (deneme %d/%d)",
+        "remote_retry_slow": "%d denemeden sonra hâlâ ulaşılamıyor; %d dk sonra yeniden denenecek",
+        "remote_waiting_network": "Çevrimdışı; ağ geri geldiğinde yeniden bağlanacak",
 
         // Buddy
         "buddy": "Buddy",

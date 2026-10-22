@@ -4222,13 +4222,11 @@ enum NotchCardKind: Equatable {
 /// Retry schedule for checking whether a click-to-jump actually landed.
 let sessionJumpValidationDelays: [UInt64] = [120_000_000, 320_000_000, 640_000_000]
 
-/// Did the terminal owning `session` come to the front?
+/// Did the terminal owning `session` come to the front, onto the session?
 func sessionJumpSucceeded(_ session: SessionSnapshot) async -> Bool {
     await withCheckedContinuation { continuation in
         DispatchQueue.global(qos: .userInitiated).async {
-            let succeeded = TerminalVisibilityDetector.isSessionTabVisible(session)
-                || TerminalVisibilityDetector.isTerminalFrontmostForSession(session)
-            continuation.resume(returning: succeeded)
+            continuation.resume(returning: TerminalVisibilityDetector.didJumpLand(session))
         }
     }
 }
@@ -4928,9 +4926,7 @@ private struct SessionCard: View {
     private func checkJumpSucceeded() async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let succeeded = TerminalVisibilityDetector.isSessionTabVisible(session)
-                    || TerminalVisibilityDetector.isTerminalFrontmostForSession(session)
-                continuation.resume(returning: succeeded)
+                continuation.resume(returning: TerminalVisibilityDetector.didJumpLand(session))
             }
         }
     }
