@@ -93,7 +93,14 @@ public struct SessionSnapshot: Sendable {
     ]
 
     public var status: AgentStatus = .idle
-    public var currentTool: String?
+    public var currentTool: String? {
+        didSet { if currentTool != oldValue { currentToolUseId = nil } }
+    }
+    /// The tool use (its `tool_use_id`, or its source's spelling of it) that
+    /// put up ``currentTool``, when it named one; any other change of
+    /// ``currentTool`` forgets it. A tool step finishing another tool use
+    /// leaves the running tool up (``finishesAnotherToolUse(_:)``).
+    public var currentToolUseId: String?
     public var toolDescription: String?
     public var lastActivity: Date = Date()
     public var cwd: String?
@@ -164,8 +171,12 @@ public struct SessionSnapshot: Sendable {
     /// CLAUDE_CODE_HOST_SESSION_ID) — what its `claude://code/continue` link
     /// takes to open that exact session instead of just raising the app.
     public var claudeDesktopSessionId: String?
-    public var cliPid: pid_t?            // CLI process PID (from bridge _ppid)
+    public var cliPid: pid_t?            // CLI process PID (from bridge _ppid); this Mac's sessions only
     public var cliStartTime: Date?       // Start time of the tracked CLI PID (guards PID reuse)
+    /// A remote session's agent process id on its own host (its hooks'
+    /// `_ppid`). It names no process on this Mac, so it is never `cliPid`:
+    /// only compared with other hooks from that host (`processId(onHost:)`).
+    public var remotePid: pid_t?
     /// UI harness (T3 Code, …) that spawned the CLI, found by walking the
     /// ancestry of `cliPid`. Resolved off the main actor and re-read rather
     /// than persisted: the harness may have restarted between runs. (#321)
@@ -174,7 +185,8 @@ public struct SessionSnapshot: Sendable {
     public var interrupted: Bool = false
     /// The last turn ended on an error (Claude Code / Grok `StopFailure`, a
     /// failed AiWork stream or Cowork turn); the card's status reads ERROR
-    /// until the next prompt. Set by AppState.enqueueCompletion. Transient.
+    /// until the next prompt. Set when AppState announces the turn's
+    /// completion (`AttentionDecision.completion`). Transient.
     public var lastTurnFailed: Bool = false
     /// Cline-specific: true after TaskComplete/TaskCancel until the next TaskStart/TaskResume.
     /// Cline runs hooks asynchronously (background bridge), so events from prior tools can
@@ -183,16 +195,23 @@ public struct SessionSnapshot: Sendable {
     public var sessionTitle: String?
     public var sessionTitleSource: SessionTitleSource?
     public var providerSessionId: String?
-    /// The session this one works for, when it said so (`_parent_session_id`,
-    /// see ``DeclaredSubsession``): a pi-subagents child on a card of its own.
-    /// Its turns are part of the parent's, so none of them rings, pops a
-    /// completion card or sends a push; approvals and questions still do.
+    /// The card of the session this one works for: a child session on a card
+    /// of its own (``SubsessionLink`` — a Codex subagent thread, a Cursor
+    /// Task, a pi-subagents child, …), as Agent Sub-Sessions routed it or the
+    /// child declared it (`_parent_session_id`). Its turns are part of the
+    /// parent's, so none of them rings, pops a completion card or sends a
+    /// push; approvals and questions still do. Persisted.
     public var parentSessionId: String?
     /// AiWork/Agentix `client_type` from `sessions.get` (e.g. `DTCoderGUI`, `AiWorkGUI`).
     /// Prefer this over the `acp:`/`cli:` session-id prefix — modern TUI also uses `acp:`.
     public var aiworkClientType: String?
     public var remoteHostId: String?
     public var remoteHostName: String?
+    /// Tools the user chose "Always allow … this session" for on a card whose
+    /// agent keeps no rule for it: a remote Codex, whose rules live on its
+    /// own host. Its later requests for them are allowed without a card. Goes
+    /// with the card — a SessionStart rebuilds it — and is never persisted.
+    public var alwaysAllowedTools: Set<String> = []
     /// nil = unchecked, false = not YOLO, true = YOLO
     public var isYoloMode: Bool?
     /// Checked-out git branch for cwd; refreshed on cwd changes and Stop
@@ -484,6 +503,20 @@ public struct SessionSnapshot: Sendable {
         }
     }
 
+    /// Whether a PostToolUse / PostToolUseFailure finishes a tool use other
+    /// than the one running. Remote tool steps do not wait for the island,
+    /// so over SSH a large PostToolUse(A) can arrive after the PreToolUse(B)
+    /// that came next — with parallel tool calls in particular. Only when
+    /// both name their tool use: a source that names none goes as before.
+    public func finishesAnotherToolUse(_ event: HookEvent) -> Bool {
+        Self.isStep(event, ofAnotherToolUseThan: currentToolUseId, showing: currentTool)
+    }
+
+    static func isStep(_ event: HookEvent, ofAnotherToolUseThan running: String?, showing tool: String?) -> Bool {
+        guard tool != nil, let running, let finished = event.toolUseId else { return false }
+        return finished != running
+    }
+
     /// Display name: project folder, or short session ID
     public var displayName: String {
         guard let cwd = cwd else { return "Session" }
@@ -678,6 +711,14 @@ public struct SessionSnapshot: Sendable {
     public var isRemote: Bool {
         guard let remoteHostId else { return false }
         return !remoteHostId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The agent's process id as hooks from `host` (nil: this Mac) report
+    /// it — nil when the session runs on another machine, where the same
+    /// number is a different process.
+    public func processId(onHost host: String?) -> pid_t? {
+        guard let host else { return isRemote ? nil : cliPid }
+        return isRemote && remoteHostId == host ? remotePid : nil
     }
 
     public var remoteDisplayName: String? {
@@ -1074,12 +1115,98 @@ public enum SideEffect: Equatable {
 
 // MARK: - Pure Reducer
 
-/// Pure reducer: mutates sessions, returns side effects for the caller to execute.
+/// A hook event applied to the sessions: the lifecycle effects for the
+/// caller to execute (never `.playSound` or `.enqueueCompletion`), and what
+/// the event did, for `AttentionPolicy` to decide whether the user hears
+/// about it.
+public struct HookEventReduction {
+    public var effects: [SideEffect]
+    public var facts: HookEventFacts
+    /// Where the reducer used to put `.enqueueCompletion` and `.playSound`,
+    /// for `reduceEvent` to put the policy's intents back.
+    fileprivate var slots = AttentionEffectSlots()
+}
+
+/// Indexes into a reduction's effects: where the turn ended (the completion
+/// went in) and where the event finished moving its session (the sound
+/// went in, ahead of the closing switch of the active session).
+fileprivate struct AttentionEffectSlots {
+    var completion: Int?
+    var sound: Int?
+}
+
+/// Pure reducer: mutates sessions and reports what happened. Whether that
+/// rings, pops a card, pushes or gets a follow-up is `AttentionPolicy`'s call.
+public func reduceHookEvent(
+    sessions: inout [String: SessionSnapshot],
+    event: HookEvent,
+    maxHistory: Int,
+    replyCompletePlaceholder: String = "Reply complete"
+) -> HookEventReduction {
+    var facts = HookEventFacts(event: event)
+    var slots = AttentionEffectSlots()
+    let effects = applyHookEvent(
+        sessions: &sessions,
+        event: event,
+        maxHistory: maxHistory,
+        replyCompletePlaceholder: replyCompletePlaceholder,
+        facts: &facts,
+        slots: &slots
+    )
+    if facts.endedTurn {
+        let sessionId = event.sessionId ?? "default"
+        facts.subagentTurn = PushEventClassifier.isSubagentCompletion(
+            agentId: event.agentId,
+            raw: event.rawJSON,
+            sessionId: sessionId,
+            session: sessions[sessionId]
+        )
+    }
+    return HookEventReduction(effects: effects, facts: facts, slots: slots)
+}
+
+/// The reducer followed by `AttentionPolicy`'s own reading of the event:
+/// `.enqueueCompletion` and `.playSound` are the policy's intents, before the
+/// user's settings and the room have their say. The app runs the two halves
+/// itself — ``reduceHookEvent`` now, the policy with the context it gathers
+/// once the event has settled — and this keeps an event's whole story
+/// checkable in one call, in the order the reducer always returned it.
 public func reduceEvent(
     sessions: inout [String: SessionSnapshot],
     event: HookEvent,
     maxHistory: Int,
     replyCompletePlaceholder: String = "Reply complete"
+) -> [SideEffect] {
+    let reduction = reduceHookEvent(
+        sessions: &sessions,
+        event: event,
+        maxHistory: maxHistory,
+        replyCompletePlaceholder: replyCompletePlaceholder
+    )
+    let sessionId = event.sessionId ?? "default"
+    let intents = AttentionPolicy.intents(
+        for: .hookEvent(reduction.facts),
+        subject: AttentionSubject(sessions[sessionId])
+    )
+    // Exactly where the reducer used to put them: the sound (later in the
+    // list) first, so the completion's slot still points where it should.
+    var effects = reduction.effects
+    if let sound = intents.sound {
+        effects.insert(.playSound(sound), at: reduction.slots.sound ?? effects.count)
+    }
+    if intents.completion != nil {
+        effects.insert(.enqueueCompletion(sessionId: sessionId), at: reduction.slots.completion ?? effects.count)
+    }
+    return effects
+}
+
+private func applyHookEvent(
+    sessions: inout [String: SessionSnapshot],
+    event: HookEvent,
+    maxHistory: Int,
+    replyCompletePlaceholder: String,
+    facts: inout HookEventFacts,
+    slots: inout AttentionEffectSlots
 ) -> [SideEffect] {
     let sessionId = event.sessionId ?? "default"
     let eventName = EventNormalizer.normalize(event.eventName)
@@ -1151,6 +1278,7 @@ public func reduceEvent(
             effects: &effects
         )
         recordSubagentModel(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event)
+        recordFoldedSubsession(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event)
         if handled { return effects }
     }
 
@@ -1224,22 +1352,23 @@ public func reduceEvent(
         if !isWaiting {
             sessions[sessionId]?.status = .running
             sessions[sessionId]?.currentTool = event.activityLabel
+            sessions[sessionId]?.currentToolUseId = event.toolUseId
             sessions[sessionId]?.toolDescription = event.toolDescription
         }
-    case "PostToolUse":
+    case "PostToolUse", "PostToolUseFailure":
+        let success = eventName == "PostToolUse"
+        if sessions[sessionId]?.finishesAnotherToolUse(event) == true {
+            // An earlier tool's step, overtaken by the next tool's start:
+            // it is recorded from its own payload, and the running tool
+            // stays up.
+            if let tool = event.activityLabel {
+                sessions[sessionId]?.recordTool(tool, description: event.toolDescription, success: success, agentType: nil, maxHistory: maxHistory)
+            }
+            break
+        }
         if let tool = sessions[sessionId]?.currentTool {
             let desc = sessions[sessionId]?.toolDescription
-            sessions[sessionId]?.recordTool(tool, description: desc, success: true, agentType: nil, maxHistory: maxHistory)
-        }
-        if !isWaiting {
-            sessions[sessionId]?.status = .processing
-            sessions[sessionId]?.currentTool = nil
-            sessions[sessionId]?.toolDescription = nil
-        }
-    case "PostToolUseFailure":
-        if let tool = sessions[sessionId]?.currentTool {
-            let desc = sessions[sessionId]?.toolDescription
-            sessions[sessionId]?.recordTool(tool, description: desc, success: false, agentType: nil, maxHistory: maxHistory)
+            sessions[sessionId]?.recordTool(tool, description: desc, success: success, agentType: nil, maxHistory: maxHistory)
         }
         if !isWaiting {
             sessions[sessionId]?.status = .processing
@@ -1297,7 +1426,8 @@ public func reduceEvent(
                 sessions[sessionId]?.status = .idle
                 sessions[sessionId]?.currentTool = nil
                 sessions[sessionId]?.toolDescription = nil
-                effects.append(.enqueueCompletion(sessionId: sessionId))
+                facts.endedTurn = true
+                slots.completion = effects.count
             }
         } else {
             sessions[sessionId]?.status = .processing
@@ -1361,7 +1491,8 @@ public func reduceEvent(
             sessions[sessionId]?.status = .idle
             sessions[sessionId]?.taskRoundEnded = true
         }
-        effects.append(.enqueueCompletion(sessionId: sessionId))
+        facts.endedTurn = true
+        slots.completion = effects.count
     case "Stop":
         // Hermes fires on_session_end at the end of every turn. A delegate_task
         // child or a scheduled job runs just one, so its turn ending is its
@@ -1444,12 +1575,14 @@ public func reduceEvent(
             sessions[sessionId]?.status = .idle
             sessions[sessionId]?.currentTool = nil
             sessions[sessionId]?.toolDescription = nil
-            // A Hermes gateway chat's turn settles its card without a completion.
-            if !HermesHookPayload.isQuiet(event) {
-                effects.append(.enqueueCompletion(sessionId: sessionId))
-            }
+            facts.endedTurn = true
+            slots.completion = effects.count
         }
     case "SessionStart":
+        // A link an AppState pass made (the split on switching to Show
+        // separately, discovery) is on the card, not in the child's hooks:
+        // the rebuild keeps it unless the hook names a parent itself.
+        let linkedParentId = sessions[sessionId]?.parentSessionId
         effects.append(.stopMonitor(sessionId: sessionId))
         sessions[sessionId] = SessionSnapshot(startTime: Date())
         // Re-apply metadata from this event (common extraction above wrote to the old session)
@@ -1458,13 +1591,7 @@ public func reduceEvent(
             sessions[sessionId]?.model = model
             sessions[sessionId]?.modelReportedAt = Date()
         }
-        if let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 {
-            let newPid = pid_t(ppid)
-            if sessions[sessionId]?.cliPid != newPid {
-                sessions[sessionId]?.cliPid = newPid
-                sessions[sessionId]?.cliStartTime = nil
-            }
-        }
+        applyHookProcessId(into: &sessions, sessionId: sessionId, event: event)
         if let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) {
             sessions[sessionId]?.source = source
         }
@@ -1496,15 +1623,7 @@ public func reduceEvent(
         if let weztermPane = event.rawJSON["_wezterm_pane"] as? String, !weztermPane.isEmpty {
             sessions[sessionId]?.weztermPaneId = weztermPane
         }
-        if let herdrPane = event.rawJSON["_herdr_pane_id"] as? String, !herdrPane.isEmpty {
-            sessions[sessionId]?.herdrPaneId = herdrPane
-        }
-        if let herdrSocket = event.rawJSON["_herdr_socket_path"] as? String, !herdrSocket.isEmpty {
-            sessions[sessionId]?.herdrSocketPath = herdrSocket
-        }
-        if let herdrBinary = event.rawJSON["_herdr_bin_path"] as? String, !herdrBinary.isEmpty {
-            sessions[sessionId]?.herdrBinaryPath = herdrBinary
-        }
+        applyHerdrRoute(into: &sessions, sessionId: sessionId, event: event)
         if let supersetWs = event.rawJSON["_superset_workspace_id"] as? String, !supersetWs.isEmpty {
             sessions[sessionId]?.supersetWorkspaceId = supersetWs
         }
@@ -1538,12 +1657,12 @@ public func reduceEvent(
            !sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             sessions[sessionId]?.sessionTitle = sessionTitle
         }
-        sessions[sessionId]?.parentSessionId = DeclaredSubsession.parentSessionId(in: event.rawJSON)
+        sessions[sessionId]?.parentSessionId = SubsessionRouter.parentCardId(in: event.rawJSON) ?? linkedParentId
         if !isRemote {
             effects.append(.tryMonitorSession(sessionId: sessionId))
         }
     case "SessionEnd":
-        // Side effect: AppState handles pending permission deny before removal
+        // Side effect: AppState drops the session's pending requests, undecided, before removal
         effects.append(.removeSession(sessionId: sessionId))
         return effects
     case "Notification":
@@ -1591,7 +1710,8 @@ public func reduceEvent(
         sessions[sessionId]?.status = .idle
         sessions[sessionId]?.currentTool = nil
         sessions[sessionId]?.toolDescription = nil
-        effects.append(.enqueueCompletion(sessionId: sessionId))
+        facts.endedTurn = true
+        slots.completion = effects.count
     default:
         break
     }
@@ -1623,28 +1743,15 @@ public func reduceEvent(
         effects.append(.tryMonitorSession(sessionId: sessionId))
     }
 
-    // A session another agent spawned (it named its parent) works for that
-    // agent's turn. Its own start, prompt and turn end are the parent's
-    // business, not the user's: no completion card or push, no chime — the
-    // user hears the parent finish (#378). Its approvals and questions ring
-    // on their own path; the user still has to answer those.
-    let isDeclaredChild = sessions[sessionId]?.parentSessionId != nil
-    if isDeclaredChild {
-        effects.removeAll { $0 == .enqueueCompletion(sessionId: sessionId) }
-    }
-
-    // Trigger sound for this event. A single failed tool stays silent; only a
-    // turn that died (StopFailure) rings the error sound. See EventSoundRouting.
-    // A Hermes gateway chat's start, prompt and turn end stay silent.
-    if let sound = EventSoundRouting.soundEvent(rawEventName: event.eventName, normalizedEventName: eventName),
-       !HermesHookPayload.isQuiet(event),
-       !isDeclaredChild {
-        effects.append(.playSound(sound))
-    }
+    // The event reached this session's own state. Whether it rings, pops a
+    // completion card or pushes — a declared child's never do (#378), nor a
+    // Hermes gateway chat's (#364) — is AttentionPolicy's call.
+    facts.appliedToSession = true
+    slots.sound = effects.count
 
     // Switch display to the session that just had activity
     if eventName == "Stop" {
-        // Stop event: keep activeSessionId on completed session (set by enqueueCompletion)
+        // Stop event: keep activeSessionId on completed session (set when its completion card shows)
     } else if sessions[sessionId]?.status != .idle {
         effects.append(.setActiveSession(sessionId: sessionId))
     }
@@ -1736,6 +1843,18 @@ public func fillMissingParentMetadataFromSubagentEvent(
     sessionId: String,
     event: HookEvent
 ) {
+    // The host is the card's as much as the child's: a remote host's hook
+    // only ever describes a session on that host. Left out, a card that a
+    // remote subagent's hook created looked local to every check that keeps
+    // a remote session's pids, paths and terminal handles off this Mac.
+    if sessions[sessionId]?.remoteHostId == nil,
+       let remoteHostId = SubsessionRouter.remoteHostId(in: event.rawJSON) {
+        sessions[sessionId]?.remoteHostId = remoteHostId
+    }
+    if sessions[sessionId]?.remoteHostName == nil,
+       let remoteHostName = event.rawJSON["_remote_host_name"] as? String, !remoteHostName.isEmpty {
+        sessions[sessionId]?.remoteHostName = remoteHostName
+    }
     // Default SessionSnapshot.source is "claude". Upgrade when the hook carries a
     // real source so merge-first Cursor Tasks are not branded as Claude forever.
     if sessions[sessionId]?.source == "claude",
@@ -1780,28 +1899,85 @@ public func fillMissingParentMetadataFromSubagentEvent(
         sessions[sessionId]?.transcriptPath = transcriptPath
     }
 
-    if sessions[sessionId]?.cliPid == nil,
-       let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 {
-        sessions[sessionId]?.cliPid = pid_t(ppid)
-    }
+    applyHookProcessId(into: &sessions, sessionId: sessionId, event: event, fillingOnly: true)
 
-    if sessions[sessionId]?.herdrPaneId == nil,
-       let pane = event.rawJSON["_herdr_pane_id"] as? String, !pane.isEmpty {
-        sessions[sessionId]?.herdrPaneId = pane
-    }
-    if sessions[sessionId]?.herdrSocketPath == nil,
-       let socket = event.rawJSON["_herdr_socket_path"] as? String, !socket.isEmpty {
-        sessions[sessionId]?.herdrSocketPath = socket
-    }
-    if sessions[sessionId]?.herdrBinaryPath == nil,
-       let binary = event.rawJSON["_herdr_bin_path"] as? String, !binary.isEmpty {
-        sessions[sessionId]?.herdrBinaryPath = binary
-    }
+    applyHerdrRoute(into: &sessions, sessionId: sessionId, event: event, fillingOnly: true)
     // A subagent runs inside the parent's CLI, so it carries the same id.
     if sessions[sessionId]?.claudeDesktopSessionId == nil,
        let hostId = claudeDesktopSessionId(in: event) {
         sessions[sessionId]?.claudeDesktopSessionId = hostId
     }
+    // A child on a card of its own whose hooks also carry an `agent_id`
+    // (Codex has sent a thread's own id as one) is still linked to its
+    // parent. A hook folded into its parent's card carries no link.
+    if sessions[sessionId]?.parentSessionId == nil,
+       let parentSessionId = SubsessionRouter.parentCardId(in: event.rawJSON) {
+        sessions[sessionId]?.parentSessionId = parentSessionId
+    }
+}
+
+/// Records the Herdr pane the hook's agent runs in (`_herdr_*`, from the
+/// pane's env). `fillingOnly` keeps what the card already has — a subagent's
+/// hook only fills gaps on its parent's card.
+///
+/// A remote hook's are never recorded: its pane belongs to the Herdr on its
+/// own host, and the binary path it names would be run on this Mac
+/// (HerdrController).
+private func applyHerdrRoute(
+    into sessions: inout [String: SessionSnapshot],
+    sessionId: String,
+    event: HookEvent,
+    fillingOnly: Bool = false
+) {
+    guard SubsessionRouter.remoteHostId(in: event.rawJSON) == nil else { return }
+    if let pane = event.rawJSON["_herdr_pane_id"] as? String, !pane.isEmpty,
+       !fillingOnly || sessions[sessionId]?.herdrPaneId == nil {
+        sessions[sessionId]?.herdrPaneId = pane
+    }
+    if let socket = event.rawJSON["_herdr_socket_path"] as? String, !socket.isEmpty,
+       !fillingOnly || sessions[sessionId]?.herdrSocketPath == nil {
+        sessions[sessionId]?.herdrSocketPath = socket
+    }
+    if let binary = event.rawJSON["_herdr_bin_path"] as? String, !binary.isEmpty,
+       !fillingOnly || sessions[sessionId]?.herdrBinaryPath == nil {
+        sessions[sessionId]?.herdrBinaryPath = binary
+    }
+}
+
+/// Records the process the hook's agent runs as (`_ppid`). `fillingOnly`
+/// keeps one the card already has — a subagent's hook only fills gaps.
+///
+/// On this Mac that is the CLI the island watches (`cliPid`). A remote
+/// host's is kept apart (`remotePid`), for telling that host's sessions
+/// apart only: as `cliPid` it would have the island watch, probe and, on
+/// orphan cleanup, SIGTERM whatever process has that number here.
+private func applyHookProcessId(
+    into sessions: inout [String: SessionSnapshot],
+    sessionId: String,
+    event: HookEvent,
+    fillingOnly: Bool = false
+) {
+    guard let pid = hookProcessId(event) else { return }
+    if SubsessionRouter.remoteHostId(in: event.rawJSON) != nil {
+        if !fillingOnly || sessions[sessionId]?.remotePid == nil {
+            sessions[sessionId]?.remotePid = pid
+        }
+    } else if fillingOnly {
+        if sessions[sessionId]?.cliPid == nil {
+            sessions[sessionId]?.cliPid = pid
+        }
+    } else if sessions[sessionId]?.cliPid != pid {
+        sessions[sessionId]?.cliPid = pid
+        sessions[sessionId]?.cliStartTime = nil
+    }
+}
+
+/// The CLI process the bridge found for the hook (`_ppid`). A number past
+/// pid_t's range comes only from a malformed payload; converting it would
+/// trap.
+private func hookProcessId(_ event: HookEvent) -> pid_t? {
+    guard let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 else { return nil }
+    return pid_t(exactly: ppid)
 }
 
 /// The Claude Desktop Code-tab id the bridge forwarded from
@@ -1814,12 +1990,11 @@ private func claudeDesktopSessionId(in event: HookEvent) -> String? {
 }
 
 private func shouldReopenSubagentOnPrompt(event: HookEvent, session: SessionSnapshot?) -> Bool {
-    if (event.rawJSON["_cursor_subagent"] as? Bool) == true {
-        return true
-    }
-    // A folded declared child (a pi-subagents child) starts every turn with a
-    // prompt; one sent after its last Stop is a new turn of the same child.
-    if DeclaredSubsession.isMergedEvent(event) {
+    // A child session folded into its parent's card (a Cursor Task, a Codex
+    // thread, a pi-subagents child) starts every turn with a prompt, and none
+    // sends a SubagentStart: one sent after its last Stop is a new turn of
+    // the same child.
+    if SubsessionRouter.foldedKind(of: event) != nil {
         return true
     }
     let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String)
@@ -1837,7 +2012,7 @@ private func isCodexSubagentEvent(_ event: HookEvent, session: SessionSnapshot?)
 
 /// Whether folded-child prompt/response text should appear on the parent card.
 private func shouldSurfaceCursorSubagentChat(event: HookEvent, session: SessionSnapshot?) -> Bool {
-    if (event.rawJSON["_cursor_subagent"] as? Bool) == true {
+    if SubsessionRouter.foldedKind(of: event) == .cursorTask {
         return true
     }
     return CursorSubsessionRouter.isCursorFamilySource(
@@ -1922,13 +2097,7 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     if let env = event.rawJSON["_env"] as? [String: String] {
         applyEnvMetadata(into: &sessions, sessionId: sessionId, env: env)
     }
-    if let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 {
-        let newPid = pid_t(ppid)
-        if sessions[sessionId]?.cliPid != newPid {
-            sessions[sessionId]?.cliPid = newPid
-            sessions[sessionId]?.cliStartTime = nil
-        }
-    }
+    applyHookProcessId(into: &sessions, sessionId: sessionId, event: event)
     if let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) {
         sessions[sessionId]?.source = source
     } else if sessions[sessionId]?.source == "claude",
@@ -1957,15 +2126,7 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     if let weztermPane = event.rawJSON["_wezterm_pane"] as? String, !weztermPane.isEmpty {
         sessions[sessionId]?.weztermPaneId = weztermPane
     }
-    if let herdrPane = event.rawJSON["_herdr_pane_id"] as? String, !herdrPane.isEmpty {
-        sessions[sessionId]?.herdrPaneId = herdrPane
-    }
-    if let herdrSocket = event.rawJSON["_herdr_socket_path"] as? String, !herdrSocket.isEmpty {
-        sessions[sessionId]?.herdrSocketPath = herdrSocket
-    }
-    if let herdrBinary = event.rawJSON["_herdr_bin_path"] as? String, !herdrBinary.isEmpty {
-        sessions[sessionId]?.herdrBinaryPath = herdrBinary
-    }
+    applyHerdrRoute(into: &sessions, sessionId: sessionId, event: event)
     // Superset workspace / pane (injected by bridge from SUPERSET_* env vars). Presence routes
     // activation to com.superset.desktop instead of the spoofed kitty TERM_PROGRAM. (#213)
     if let supersetWs = event.rawJSON["_superset_workspace_id"] as? String, !supersetWs.isEmpty {
@@ -2010,7 +2171,7 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
        !sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         sessions[sessionId]?.sessionTitle = sessionTitle
     }
-    if let parentSessionId = DeclaredSubsession.parentSessionId(in: event.rawJSON) {
+    if let parentSessionId = SubsessionRouter.parentCardId(in: event.rawJSON) {
         sessions[sessionId]?.parentSessionId = parentSessionId
     }
 }
@@ -2141,6 +2302,21 @@ private func recordSubagentModel(
     sessions[sessionId]?.subagents[agentId]?.model = model
 }
 
+/// Mark the row of a child session Agent Sub-Sessions folded into this card
+/// (``SubagentState/subsessionKind``), so the child's later hooks follow it
+/// here. A row the agent's own SubagentStart rebuilt is marked again by the
+/// child's next folded hook.
+private func recordFoldedSubsession(
+    sessions: inout [String: SessionSnapshot],
+    sessionId: String,
+    agentId: String,
+    event: HookEvent
+) {
+    guard let kind = SubsessionRouter.foldedKind(of: event),
+          sessions[sessionId]?.subagents[agentId] != nil else { return }
+    sessions[sessionId]?.subagents[agentId]?.subsessionKind = kind
+}
+
 /// Handle subagent events. Returns true if the event was consumed.
 private func handleSubagentEvent(
     sessions: inout [String: SessionSnapshot],
@@ -2234,6 +2410,7 @@ private func handleSubagentEvent(
         }
         sessions[sessionId]?.subagents[agentId]?.status = .running
         sessions[sessionId]?.subagents[agentId]?.currentTool = event.activityLabel
+        sessions[sessionId]?.subagents[agentId]?.currentToolUseId = event.toolUseId
         sessions[sessionId]?.subagents[agentId]?.toolDescription = event.toolDescription
         sessions[sessionId]?.subagents[agentId]?.lastActivity = Date()
         // Keep parent session showing as active while subagents work
@@ -2247,8 +2424,17 @@ private func handleSubagentEvent(
         guard ensureSubagent(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event) else {
             return true
         }
+        let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
+        if sessions[sessionId]?.subagents[agentId]?.finishesAnotherToolUse(event) == true {
+            // An earlier tool's step, overtaken by the next tool's start.
+            if let tool = event.activityLabel {
+                sessions[sessionId]?.recordTool(tool, description: event.toolDescription, success: true, agentType: agentType, maxHistory: maxHistory)
+            }
+            sessions[sessionId]?.subagents[agentId]?.lastActivity = Date()
+            sessions[sessionId]?.lastActivity = Date()
+            return true
+        }
         if let tool = sessions[sessionId]?.subagents[agentId]?.currentTool {
-            let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
             let desc = sessions[sessionId]?.subagents[agentId]?.toolDescription
             sessions[sessionId]?.recordTool(tool, description: desc, success: true, agentType: agentType, maxHistory: maxHistory)
         }
@@ -2263,8 +2449,16 @@ private func handleSubagentEvent(
         guard ensureSubagent(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event) else {
             return true
         }
+        let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
+        if sessions[sessionId]?.subagents[agentId]?.finishesAnotherToolUse(event) == true {
+            // An earlier tool's step, overtaken by the next tool's start.
+            if let tool = event.activityLabel {
+                sessions[sessionId]?.recordTool(tool, description: event.toolDescription, success: false, agentType: agentType, maxHistory: maxHistory)
+            }
+            sessions[sessionId]?.lastActivity = Date()
+            return true
+        }
         if let tool = sessions[sessionId]?.subagents[agentId]?.currentTool {
-            let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
             let desc = sessions[sessionId]?.subagents[agentId]?.toolDescription
             sessions[sessionId]?.recordTool(tool, description: desc, success: false, agentType: agentType, maxHistory: maxHistory)
         }

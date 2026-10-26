@@ -126,7 +126,7 @@ extension AppState {
             // Preserve state-backed cards, refresh immediately, and restore the
             // live JSON-RPC channel with capped exponential backoff.
             invalidateCodexAppServerQuestionsAfterDisconnect()
-            requestCodexDesktopDiscoveryScan()
+            discovery.requestCodexDesktopScan()
             scheduleCodexAppServerReconnect()
         case .stopAndRemoveSessions:
             codexAppServerReconnectTask?.cancel()
@@ -350,18 +350,23 @@ extension AppState {
             askUserQuestionState: askState
         )
         questionQueue.append(request)
-        pushQuestionQueued(request, sessionId: sessionId, smartSuppressed: false)
-
         // First of a burst, as in `handleQuestion`.
-        if nextVisibleQuestion?.id == request.id {
+        let firstOfBurst = nextVisibleQuestion?.id == request.id
+        let attention = decideAttention(
+            .questionQueued(firstOfBurst: firstOfBurst, smartSuppressible: false),
+            sessionId: sessionId
+        )
+        pushQuestionQueued(request, sessionId: sessionId, push: attention.push)
+
+        if firstOfBurst {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion() {
                 withAnimation(NotchAnimation.open) {
                     surface = .questionCard(sessionId: sessionId)
                 }
             }
-            SoundManager.shared.handleEvent("PermissionRequest")
         }
+        playAttentionSound(attention, sessionId: sessionId)
         refreshDerivedState()
     }
 
@@ -433,6 +438,7 @@ extension AppState {
         }
         if let name = thread["name"]?.asString, !name.isEmpty {
             snapshot.sessionTitle = name
+            invalidateProviderTitleReads(for: sessionId)
         }
         if let path = thread["path"]?.asString, !path.isEmpty {
             snapshot.transcriptPath = path

@@ -1,15 +1,34 @@
 #!/usr/bin/env python3
+# CodeIsland's hook on a remote host. It does not interpret the hook: it sends
+# the agent's stdin as is, with what it observed in `_edge` (source, cwd, tty,
+# host, a digest of the stdin), and the island reads both with HookIntake, the
+# interpretation codeisland-bridge runs on the Mac (docs/hook-edge-protocol.md).
+# What only this host can see — transcripts, the Hermes store — is read here.
+# For islands that predate `_edge`, the host and the source are named at the
+# top level too.
+import hashlib
 import json
 import os
 import socket
+import stat
+import struct
 import subprocess
 import sys
 
-VERSION = "0.3.1"
+VERSION = "0.4.4"
+# The `_edge` facts version (HookEdgeFacts.version on the island).
+EDGE_FACTS_VERSION = 1
 # Per-user socket path (#193): CodeIsland injects CODEISLAND_SOCKET_PATH via the hook
-# command, but fall back to a uid-scoped path so multiple users on a shared host never
-# collide on a single /tmp/codeisland.sock.
-SOCKET_PATH = os.environ.get("CODEISLAND_SOCKET_PATH") or f"/tmp/codeisland-{os.getuid()}.sock"
+# command, but fall back to the uid-scoped path it forwards to, in the SSH user's own
+# folder, so multiple users on a shared host never collide on one socket.
+SOCKET_PATH = os.environ.get("CODEISLAND_SOCKET_PATH") or f"/tmp/codeisland-{os.getuid()}/island.sock"
+# Who owns the island's socket here: sshd makes it as the SSH user. A hook run
+# as that user, as hooks usually are, uses only a socket of its own user's. On
+# a host whose agents run as other users (containers, sudo), the installer
+# names the SSH user's uid in CODEISLAND_SOCKET_OWNER_UID: a hook run as
+# another user then uses that user's socket, and still nobody else's.
+_SOCKET_OWNER = os.environ.get("CODEISLAND_SOCKET_OWNER_UID", "").strip()
+SOCKET_OWNER_UID = int(_SOCKET_OWNER) if _SOCKET_OWNER and all(c in "0123456789" for c in _SOCKET_OWNER) else os.getuid()
 REMOTE_HOST_ID = os.environ.get("CODEISLAND_REMOTE_HOST_ID", "")
 REMOTE_HOST_NAME = os.environ.get("CODEISLAND_REMOTE_HOST_NAME", "")
 SOURCE = os.environ.get("CODEISLAND_SOURCE", "")
@@ -19,102 +38,55 @@ TIMEOUT_SECONDS = 300
 # agent side, and a socket timeout of 5 minutes would silently drop the decision
 # of anyone who stepped away (#306).
 BLOCKING_TIMEOUT_SECONDS = 86400
+# How long a hook nobody waits on waits for the island's reply (`{}`, or
+# nothing), which normally takes one round trip over the SSH link. Short, so
+# a busy island never holds up the agent long; within Codex's 3 s cap on its
+# SessionEnd hook. A tool step doesn't wait at all (see _TOOL_STEP_EVENTS).
+REPLY_TIMEOUT_SECONDS = 2
 TRANSCRIPT_TAIL_BYTES = 262144
 
 
-def _normalize_event(name):
-    """Best-effort normalization matching CodeIslandCore.EventNormalizer."""
-    if not isinstance(name, str):
-        return ""
-    # Cursor (camelCase)
-    if name == "beforeSubmitPrompt":
-        return "UserPromptSubmit"
-    if name == "beforeShellExecution":
-        return "PreToolUse"
-    if name == "afterShellExecution":
-        return "PostToolUse"
-    if name == "beforeReadFile":
-        return "PreToolUse"
-    if name == "afterFileEdit":
-        return "PostToolUse"
-    if name == "beforeMCPExecution":
-        return "PreToolUse"
-    if name == "afterMCPExecution":
-        return "PostToolUse"
-    if name == "afterAgentThought":
-        return "Notification"
-    if name == "afterAgentResponse":
-        return "AfterAgentResponse"
-    if name == "stop":
-        return "Stop"
-    # Gemini
-    if name == "BeforeTool":
-        return "PermissionRequest"
-    if name == "AfterTool":
-        return "PostToolUse"
-    if name == "BeforeAgent":
-        return "SubagentStart"
-    if name == "AfterAgent":
-        return "SubagentStop"
-    # GitHub Copilot CLI
-    if name == "sessionStart":
-        return "SessionStart"
-    if name == "sessionEnd":
-        return "SessionEnd"
-    if name == "userPromptSubmitted":
-        return "UserPromptSubmit"
-    if name == "preToolUse":
-        return "PreToolUse"
-    if name == "postToolUse":
-        return "PostToolUse"
-    if name == "errorOccurred":
-        return "Notification"
-    # TraeCli (snake_case)
-    if name == "session_start":
-        return "SessionStart"
-    if name == "session_end":
-        return "SessionEnd"
-    if name == "user_prompt_submit":
-        return "UserPromptSubmit"
-    if name == "pre_tool_use":
-        return "PreToolUse"
-    if name == "post_tool_use":
-        return "PostToolUse"
-    if name == "post_tool_use_failure":
-        return "PostToolUseFailure"
-    if name == "permission_request":
-        return "PermissionRequest"
-    if name == "subagent_start":
-        return "SubagentStart"
-    if name == "subagent_stop":
-        return "SubagentStop"
-    if name == "pre_compact":
-        return "PreCompact"
-    if name == "post_compact":
-        return "PostCompact"
-    if name == "notification":
-        return "Notification"
-    # Hermes (Nous Research) — snake_case, diverged from Claude/Gemini (#226).
-    # `subagent_stop` is already handled above.
-    if name == "pre_tool_call":
-        return "PreToolUse"
-    if name == "post_tool_call":
-        return "PostToolUse"
-    if name == "pre_llm_call":
-        return "UserPromptSubmit"
-    if name == "post_llm_call":
-        return "AgentTurnSettled"
-    if name == "on_session_start":
-        return "SessionStart"
-    # Despite its name, Hermes fires on_session_end at the end of every turn.
-    if name == "on_session_end":
-        return "Stop"
-    # The real end of a session (/new, quitting, gateway shutdown).
-    if name == "on_session_finalize":
-        return "SessionEnd"
-    if name == "on_session_reset":
-        return "SessionEnd"
-    return name
+# Whether the hook waits for the island's answer: a permission request, or a
+# question. Decided here so that no other hook waits on a round trip, and sent
+# with the facts (`waits`): the island never holds a hook nobody waits on, and
+# answers a hook it does not hold (one Cursor runs) at once, with nothing. The
+# event names are those EventNormalizer maps to PermissionRequest and
+# Notification.
+_PERMISSION_EVENTS = {"PermissionRequest", "permission_request", "BeforeTool"}
+_NOTIFICATION_EVENTS = {"Notification", "notification", "afterAgentThought", "errorOccurred"}
+
+
+def _event_name(data):
+    name = data.get("hook_event_name") or data.get("event")
+    return name if isinstance(name, str) else None
+
+
+def _waits_for_answer(data):
+    name = _event_name(data)
+    if name in _PERMISSION_EVENTS:
+        return True
+    return name in _NOTIFICATION_EVENTS and isinstance(data.get("question"), str)
+
+
+# A tool step fires on every tool call, and the agent waits for the hook to
+# exit before it goes on, so its hook does not stay for the island's reply: the
+# island keeps the event of a hook that closed at once, and an older island
+# losing one tool step is harmless. A lifecycle event (a start, a prompt, a
+# finished turn, a session end) stays for it, so that an older island does not
+# lose it and leave a card behind. The names are those EventNormalizer maps to
+# PreToolUse, PostToolUse and PostToolUseFailure.
+_TOOL_STEP_EVENTS = {
+    "PreToolUse", "PostToolUse", "PostToolUseFailure",
+    "preToolUse", "postToolUse",
+    "pre_tool_use", "post_tool_use", "post_tool_use_failure",
+    "pre_tool_call", "post_tool_call",
+    "beforeShellExecution", "afterShellExecution", "beforeReadFile",
+    "afterFileEdit", "beforeMCPExecution", "afterMCPExecution", "AfterTool",
+}
+
+
+def _stays_for_reply(data, waits):
+    return waits or _event_name(data) not in _TOOL_STEP_EVENTS
 
 
 def _claude_config_dir():
@@ -453,24 +425,154 @@ def _scan_hermes_store(session_id):
         conn.close()
 
 
-def _read_stdin_json():
+def _read_stdin():
     try:
-        return json.load(sys.stdin)
+        return sys.stdin.buffer.read()
+    except Exception:
+        return b""
+
+
+def _parse_object(raw):
+    try:
+        data = json.loads(raw)
     except Exception:
         return None
+    return data if isinstance(data, dict) else None
 
 
-def _send_event(payload, expects_response):
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+def _socket_is_ours(path):
+    """Whether `path` is a socket the island's user here owns: the SSH user
+    CODEISLAND_SOCKET_OWNER_UID names, else this user (SOCKET_OWNER_UID). The
+    path is a predictable name in /tmp, where any user on this host can create
+    a socket first: theirs would get the event and could answer it. lstat, not
+    stat: a symlink, even to the island's socket, stays its owner's to repoint,
+    while a socket in sticky /tmp is its owner's alone to remove. sshd creates
+    the island's forwarded socket as the SSH user."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISSOCK(info.st_mode) and info.st_uid == SOCKET_OWNER_UID
+
+
+def _peer_uid(sock):
+    """The uid of whoever listens at the other end of the connected socket
+    `sock`, as the kernel tells it — the credentials it had when it called
+    listen(), which no file at the socket's path can change: Linux's
+    SO_PEERCRED (a struct ucred: pid, uid, gid), OpenBSD's (a struct
+    sockpeercred: uid, gid, pid), the LOCAL_PEERCRED of macOS and FreeBSD (a
+    struct xucred, cr_uid after cr_version). None where the platform has no
+    way to ask; -1, which is nobody's, when asking failed."""
+    try:
+        if sys.platform.startswith("linux") and hasattr(socket, "SO_PEERCRED"):
+            creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII"))
+            return struct.unpack("iII", creds)[1]
+        if sys.platform.startswith("openbsd") and hasattr(socket, "SO_PEERCRED"):
+            creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("IIi"))
+            return struct.unpack("IIi", creds)[0]
+        if sys.platform == "darwin" or sys.platform.startswith("freebsd"):
+            level = getattr(socket, "SOL_LOCAL", 0)
+            option = getattr(socket, "LOCAL_PEERCRED", 0x001)
+            creds = sock.getsockopt(level, option, 256)
+            return struct.unpack_from("=II", creds)[1]
+    except (OSError, struct.error):
+        return -1
+    return None
+
+
+def _peer_is_island(sock):
+    """Whether the island's user here (SOCKET_OWNER_UID) listens at the other
+    end of `sock`: sshd's forward, which listens as the SSH user. The lstat
+    before connect() looked at a file; this is who answers through it. Where
+    the platform cannot say, the lstat stands alone."""
+    uid = _peer_uid(sock)
+    return uid is None or uid == SOCKET_OWNER_UID
+
+
+def _island_sockets():
+    """The sockets to try, in order: SOCKET_PATH, the one the hook command
+    names — but for the path older installs wrote into each command,
+    /tmp/codeisland-<uid>.sock, where the island forwarded before its socket
+    had a folder of its own. An agent started before this host's hooks were
+    reinstalled still runs that command, and this script is the one the
+    newest island installed: that user's socket in its folder,
+    /tmp/codeisland-<uid>/island.sock, where only such an island listens,
+    comes first. The old path comes after it, for an older island that still
+    forwards there while the folder has no tunnel (nothing there, or the
+    socket a finished tunnel left behind, which sshd never removes). So
+    whatever else still listens at the old path never takes the island's
+    events: a tunnel an older island left running when its app died, which
+    forwards to a Mac's main socket that refuses them now, or an sshd whose
+    client is gone, which never answers. A host connected to two Macs of
+    different versions at once gives these agents' events to the newer."""
+    folder, name = os.path.split(SOCKET_PATH)
+    prefix, suffix = "codeisland-", ".sock"
+    if folder != "/tmp" or not name.startswith(prefix) or not name.endswith(suffix):
+        return [SOCKET_PATH]
+    uid = name[len(prefix):-len(suffix)]
+    if not uid or not all(c in "0123456789" for c in uid):
+        return [SOCKET_PATH]
+    return ["/tmp/codeisland-%s/island.sock" % uid, SOCKET_PATH]
+
+
+def _connect_to_island():
+    """A socket connected to the island: the first of _island_sockets() that
+    is the island's user's (_socket_is_ours), takes the connection, and has
+    that user listening behind it (_peer_is_island). None when none does."""
+    for path in _island_sockets():
+        if not _socket_is_ours(path):
+            continue
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(path)
+            if _peer_is_island(sock):
+                return sock
+        except (OSError, socket.error):
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return None
+
+
+def _wire(payload):
+    """The payload as it is sent: in UTF-8 as it is — `\\uXXXX` escapes would
+    double a CJK text against the island's limit on a remote host's request —
+    or escaped where it cannot be (a lone surrogate)."""
+    try:
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(payload).encode("utf-8")
+
+
+def _send_event(payload, expects_response, stays_for_reply=True):
+    """Sends the event and reads the island's reply to EOF; returns the reply
+    when the hook waits for one. A hook nobody waits on reads it too, for a
+    short while, unless it is a tool step (`stays_for_reply`, see
+    _TOOL_STEP_EVENTS): an older island, which accepted connections on its main
+    thread, lost the event of a hook that had closed before it got there.
+    Nothing is sent to a socket the island's user does not own, nor to one
+    whose listener is not that user: as if the island were not there."""
+    sock = _connect_to_island()
+    if sock is None:
+        return None
     sock.settimeout(BLOCKING_TIMEOUT_SECONDS if expects_response else TIMEOUT_SECONDS)
     try:
-        sock.connect(SOCKET_PATH)
-        sock.sendall(json.dumps(payload).encode("utf-8"))
+        sock.sendall(_wire(payload))
         sock.shutdown(socket.SHUT_WR)
-        if expects_response:
-            response = sock.recv(65536)
-            return response.decode("utf-8") if response else None
-        return None
+        if not expects_response:
+            if not stays_for_reply:
+                return None
+            sock.settimeout(REPLY_TIMEOUT_SECONDS)
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        response = b"".join(chunks)
+        return response.decode("utf-8") if expects_response and response else None
     except (OSError, socket.error):
         # Socket may not exist or server may have shut down — fail silently (#45)
         return None
@@ -508,12 +610,60 @@ def _get_tty():
     return None
 
 
-def _is_cursor_payload(data):
-    """Cursor runs the Claude Code hooks it imports with its own input, which
-    always carries `cursor_version` (#377). Over Remote-SSH that is this script
-    under CODEISLAND_SOURCE=claude, so the card would otherwise say Claude."""
-    version = data.get("cursor_version")
-    return isinstance(version, str) and bool(version.strip())
+def _getcwd():
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
+def _edge_facts(raw, data, waits):
+    """What this hook observed, for the island to interpret (HookEdgeFacts)."""
+    edge = {
+        "v": EDGE_FACTS_VERSION,
+        "source": SOURCE,
+        "host": {"id": REMOTE_HOST_ID, "name": REMOTE_HOST_NAME},
+        "stdin_sha256": hashlib.sha256(raw).hexdigest(),
+        "waits": waits,
+    }
+    cwd = _getcwd()
+    if cwd:
+        edge["cwd"] = cwd
+    # A payload that names its terminal already (the remote OpenCode plugin's)
+    # spares the process walk.
+    if not data.get("_tty"):
+        tty = _get_tty()
+        if tty:
+            edge["tty"] = tty
+    return edge
+
+
+def _for_islands_without_facts(payload):
+    """An island that predates `_edge` reads the top level only: name this host
+    there (a host the payload names stands, here and on the island), and the
+    agent the hook was installed for — except Claude Code's own hook, which
+    Cursor runs too (#377), so the island decides that one from the payload.
+    A process id of this host is never sent: no island can track it, and one
+    that took it for a local pid (an older island filing a session without a
+    host) would monitor, and could signal, an unrelated process of its own."""
+    for key in ("_ppid", "_hook_ppid"):
+        payload.pop(key, None)
+    if REMOTE_HOST_ID and not payload.get("_remote_host_id"):
+        payload["_remote_host_id"] = REMOTE_HOST_ID
+    if REMOTE_HOST_NAME and not payload.get("_remote_host_name"):
+        payload["_remote_host_name"] = REMOTE_HOST_NAME
+    if SOURCE and SOURCE != "claude" and not payload.get("_source"):
+        payload["_source"] = SOURCE
+
+
+def _merge_extras(payload, extras, event_name):
+    for key, value in extras.items():
+        if value and not payload.get(key):
+            payload[key] = value
+    if event_name == "UserPromptSubmit" and not payload.get("prompt"):
+        prompt = extras.get("last_user_message")
+        if prompt:
+            payload["prompt"] = prompt
 
 
 def main():
@@ -521,60 +671,27 @@ def main():
         print(VERSION)
         return 0
 
-    data = _read_stdin_json()
+    raw = _read_stdin()
+    data = _parse_object(raw)
     if not data:
         return 1
 
-    event_name = data.get("hook_event_name") or data.get("event")
+    event_name = _event_name(data)
     session_id = data.get("session_id")
-    cwd = data.get("cwd") or os.getcwd()
-    if not event_name or not session_id:
-        return 1
-
-    normalized_event = _normalize_event(event_name)
-    is_cursor = _is_cursor_payload(data)
-    source = "cursor" if is_cursor else SOURCE
-
+    cwd = data.get("cwd") or _getcwd()
     payload = dict(data)
-    payload["hook_event_name"] = event_name
-    payload["session_id"] = session_id
-    payload["cwd"] = cwd
-    payload["_source"] = payload.get("_source") or source
-    payload["_remote_host_id"] = payload.get("_remote_host_id") or REMOTE_HOST_ID
-    payload["_remote_host_name"] = payload.get("_remote_host_name") or REMOTE_HOST_NAME
-    payload["_tty"] = payload.get("_tty") or _get_tty()
 
-    if source == "claude":
-        extras = _scan_claude_jsonl(session_id, cwd)
-        for key, value in extras.items():
-            if value and not payload.get(key):
-                payload[key] = value
-        if normalized_event == "UserPromptSubmit" and not payload.get("prompt"):
-            prompt = extras.get("last_user_message")
-            if prompt:
-                payload["prompt"] = prompt
+    # What only this host can read: the agent's transcript, Hermes's store.
+    if SOURCE == "claude":
+        _merge_extras(payload, _scan_claude_jsonl(session_id, cwd), event_name)
 
     if SOURCE == "qoder":
-        extras = _scan_qoder_jsonl(session_id, cwd)
-        for key, value in extras.items():
-            if value and not payload.get(key):
-                payload[key] = value
-        if normalized_event == "UserPromptSubmit" and not payload.get("prompt"):
-            prompt = extras.get("last_user_message")
-            if prompt:
-                payload["prompt"] = prompt
+        _merge_extras(payload, _scan_qoder_jsonl(session_id, cwd), event_name)
 
     if SOURCE == "codebuddy":
-        extras = _scan_codebuddy_jsonl(session_id, cwd)
-        for key, value in extras.items():
-            if value and not payload.get(key):
-                payload[key] = value
-        if normalized_event == "UserPromptSubmit" and not payload.get("prompt"):
-            prompt = extras.get("last_user_message")
-            if prompt:
-                payload["prompt"] = prompt
+        _merge_extras(payload, _scan_codebuddy_jsonl(session_id, cwd), event_name)
 
-    if SOURCE == "codex" and normalized_event not in {"SessionStart", "UserPromptSubmit"}:
+    if SOURCE == "codex" and event_name not in {"SessionStart", "UserPromptSubmit"}:
         extras = _scan_codex_jsonl(payload.get("transcript_path"))
         if extras.get("last_assistant_message") and not payload.get("last_assistant_message"):
             payload["last_assistant_message"] = extras["last_assistant_message"]
@@ -589,32 +706,14 @@ def main():
         if store:
             payload["_hermes_store"] = store
 
-    # Blocking events: permission prompts + question prompts. Never for a hook
-    # Cursor runs: it reads stdout against its own schema for the step, so an
-    # island answer is not one it acts on.
-    expects_response = not is_cursor and (
-        normalized_event == "PermissionRequest"
-        or (normalized_event == "Notification" and payload.get("question"))
-    )
-    response = _send_event(payload, expects_response)
+    _for_islands_without_facts(payload)
+    waits = _waits_for_answer(data)
+    payload["_edge"] = _edge_facts(raw, data, waits)
+    response = _send_event(payload, waits, _stays_for_reply(data, waits))
+    # The island sends the answer as the agent reads it (Gemini's decision
+    # included), or nothing when there is none to give.
     if response:
-        if SOURCE == "google-antigravity" or SOURCE == "gemini":
-            try:
-                res_obj = json.loads(response)
-                behavior = res_obj.get("hookSpecificOutput", {}).get("decision", {}).get("behavior")
-                if behavior in ("allow", "always"):
-                    print(json.dumps({"decision": "allow"}))
-                else:
-                    print(json.dumps({"decision": "deny"}))
-            except Exception:
-                if '"behavior":"allow"' in response or '"behavior":"always"' in response:
-                    print(json.dumps({"decision": "allow"}))
-                elif '"behavior":"deny"' in response:
-                    print(json.dumps({"decision": "deny"}))
-                else:
-                    print(response)
-        else:
-            print(response)
+        print(response)
     return 0
 
 

@@ -136,6 +136,11 @@ public enum CLIProcessResolver {
                 || lowercasedPath.contains("/@minimax-ai/code/")
         case "mimo":
             return isMimoCLIPath(lowercasedPath)
+        case "pi":
+            // pi and Oh My Pi by name: as a substring, "/pi" is also pinentry,
+            // pip, pico, and every program under a home folder like /Users/pierre.
+            let basename = (lowercasedPath as NSString).lastPathComponent
+            return basename == "pi" || basename == "omp" || lowercasedPath.contains("/pi-coding-agent/")
         default:
             return lowercasedPath.contains("/\(normalizedSource)")
         }
@@ -385,8 +390,16 @@ public struct HookEvent {
     public let rawJSON: [String: Any]  // Full payload for event-specific fields
 
     public init?(from data: Data) {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let eventName = HookEvent.firstString(in: json, keys: ["hook_event_name", "hookEventName", "event_name", "eventName"]) else {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        self.init(json: json)
+    }
+
+    /// A hook from its payload already parsed (HookServer parses one once to
+    /// route it under Agent Sub-Sessions).
+    public init?(json: [String: Any]) {
+        guard let eventName = HookEvent.firstString(in: json, keys: ["hook_event_name", "hookEventName", "event_name", "eventName"]) else {
             return nil
         }
         self.eventName = eventName
@@ -800,7 +813,11 @@ public struct SubagentState: Sendable {
     public let agentId: String
     public let agentType: String
     public var status: AgentStatus = .running
-    public var currentTool: String?
+    public var currentTool: String? {
+        didSet { if currentTool != oldValue { currentToolUseId = nil } }
+    }
+    /// As ``SessionSnapshot/currentToolUseId``, for this subagent's tool.
+    public var currentToolUseId: String?
     public var toolDescription: String?
     public var startTime: Date = Date()
     public var lastActivity: Date = Date()
@@ -808,10 +825,19 @@ public struct SubagentState: Sendable {
     /// since a Task routinely runs on a different model than its caller.
     public var model: String?
     public var reasoningEffort: String?
+    /// Set when this row is a child session folded into the card (see
+    /// ``SubsessionLink``) rather than the agent's own subagent; the child's
+    /// later hooks follow it here.
+    public var subsessionKind: SubsessionLink.Kind?
 
     public init(agentId: String, agentType: String) {
         self.agentId = agentId
         self.agentType = agentType
+    }
+
+    /// As ``SessionSnapshot/finishesAnotherToolUse(_:)``, for this subagent.
+    public func finishesAnotherToolUse(_ event: HookEvent) -> Bool {
+        SessionSnapshot.isStep(event, ofAnotherToolUseThan: currentToolUseId, showing: currentTool)
     }
 }
 

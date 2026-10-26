@@ -1025,10 +1025,12 @@ struct ConfigInstaller {
     }
 
     /// Hook script version — bump this when the script template changes
-    private static let hookScriptVersion = 5
+    private static let hookScriptVersion = 6
 
-    /// Hook script for Claude Code (dispatcher: bridge binary → nc fallback)
-    private static let hookScript = """
+    /// Hook script for Claude Code (dispatcher: bridge binary → nc fallback).
+    /// The fallback, like the bridge, sends only to a socket this user owns
+    /// (`SocketPath.Holder`): BSD stat reads the path without following it.
+    static let hookScript = """
         #!/bin/bash
         # CodeIsland hook v\(hookScriptVersion) — native bridge with shell fallback
         BRIDGE="$HOME/.codeisland/codeisland-bridge"
@@ -1037,7 +1039,7 @@ struct ConfigInstaller {
         fi
         # Fallback: original shell approach (no binary installed yet)
         SOCK="/tmp/codeisland-$(id -u).sock"
-        [ -S "$SOCK" ] || exit 0
+        [ "$(/usr/bin/stat -f '%u %HT' "$SOCK" 2>/dev/null)" = "$(id -u) Socket" ] || exit 0
         INPUT=$(cat)
         _ITERM_GUID="${ITERM_SESSION_ID##*:}"
         TERM_INFO="\\"_term_app\\":\\"${TERM_PROGRAM:-}\\",\\"_iterm_session\\":\\"${_ITERM_GUID:-}\\",\\"_tty\\":\\"$(tty 2>/dev/null || true)\\",\\"_ppid\\":$PPID"
@@ -1065,8 +1067,8 @@ struct ConfigInstaller {
     static func install() -> Bool {
         let fm = FileManager.default
 
-        // Ensure ~/.codeisland directory
-        try? fm.createDirectory(atPath: codeislandDir, withIntermediateDirectories: true)
+        // Ensure ~/.codeisland, a folder of this user's alone
+        prepareCodeislandDir()
 
         // Clean up legacy paths at ~/.claude/hooks/ (#32)
         try? fm.removeItem(atPath: legacyBridgePath)
@@ -1732,7 +1734,18 @@ struct ConfigInstaller {
         guard let merged = JSONMinimalEditor.setTopLevelValue(in: source, key: key, value: value) else {
             return false
         }
+        // Runs on every launch: a file that already says this is left alone.
+        // The dictionaries we build serialize in a different key order in
+        // each process, so writing anyway rewrote every config on every launch.
+        if let originalText, isSameJSONDocument(originalText, merged) { return true }
         return ConfigPathIdentity.write(Data(merged.utf8), to: cli.fullPath, fileManager: fm)
+    }
+
+    /// Whether two JSON (or JSONC) texts hold the same document, whatever
+    /// their key order, spacing or comments.
+    static func isSameJSONDocument(_ lhs: String, _ rhs: String) -> Bool {
+        guard let left = parseJSONString(lhs), let right = parseJSONString(rhs) else { return false }
+        return NSDictionary(dictionary: left).isEqual(to: right)
     }
 
     // MARK: - External CLIs (use bridge binary directly)
@@ -2741,6 +2754,7 @@ struct ConfigInstaller {
         if !original.isEmpty, parseJSONString(original) == nil { return false }
 
         let merged = mergeZcodeHooks(into: original)
+        if !original.isEmpty, isSameJSONDocument(original, merged) { return true }
         guard let data = merged.data(using: .utf8) else { return false }
         do {
             try data.write(to: URL(fileURLWithPath: zcodeConfigPath), options: .atomic)
@@ -3364,10 +3378,23 @@ struct ConfigInstaller {
 
     // MARK: - Bridge & Hook Script
 
-    private static func installHookScript(fm: FileManager) {
+    /// `~/.codeisland` is this user's alone (PrivateFiles): sessions.json
+    /// there holds every local session's last prompt and reply. Made 0700,
+    /// or narrowed to it where an older build left it 0755, along with what
+    /// that build put inside. `dir` is for tests.
+    static func prepareCodeislandDir(_ dir: String = codeislandDir) {
+        PrivateFiles.prepareFolder(dir)
+        for name in ["codeisland-hook.sh", "codeisland-bridge", "sessions.json"] {
+            PrivateFiles.closeToOthers(dir + "/" + name)
+        }
+    }
+
+    /// The hook script, written 0700: only this user's agents run it. `path`
+    /// is for tests.
+    static func installHookScript(fm: FileManager, path: String = hookScriptPath) {
         let needsUpdate: Bool
-        if fm.fileExists(atPath: hookScriptPath) {
-            if let existing = fm.contents(atPath: hookScriptPath),
+        if fm.fileExists(atPath: path) {
+            if let existing = fm.contents(atPath: path),
                let str = String(data: existing, encoding: .utf8) {
                 // Update if script doesn't contain bridge dispatcher OR version is outdated
                 let hasCurrentVersion = str.contains("# CodeIsland hook v\(hookScriptVersion)")
@@ -3379,8 +3406,9 @@ struct ConfigInstaller {
             needsUpdate = true
         }
         if needsUpdate {
-            fm.createFile(atPath: hookScriptPath, contents: Data(hookScript.utf8))
-            chmod(hookScriptPath, 0o755)
+            try? PrivateFiles.write(Data(hookScript.utf8), to: path, mode: 0o700)
+        } else {
+            PrivateFiles.closeToOthers(path)
         }
     }
 
@@ -3397,15 +3425,17 @@ struct ConfigInstaller {
         do {
             try? fm.removeItem(atPath: tmpPath)
             try fm.copyItem(atPath: srcPath, toPath: tmpPath)
-            chmod(tmpPath, 0o755)
+            chmod(tmpPath, 0o700)
             // Strip quarantine xattr so Gatekeeper won't block the binary
             stripQuarantine(tmpPath)
             _ = try fm.replaceItemAt(URL(fileURLWithPath: bridgePath), withItemAt: URL(fileURLWithPath: tmpPath))
         } catch {
             // replaceItemAt fails if destination doesn't exist yet — fall back to rename
             try? fm.moveItem(atPath: tmpPath, toPath: bridgePath)
-            chmod(bridgePath, 0o755)
         }
+        // 0700 whichever way it got there: replaceItemAt keeps the replaced
+        // binary's permissions, which an older build made 0755.
+        PrivateFiles.closeToOthers(bridgePath)
         // Ensure final binary is free of quarantine (covers both paths above)
         stripQuarantine(bridgePath)
     }
@@ -3432,13 +3462,13 @@ struct ConfigInstaller {
     // MARK: - pi Extension
 
     /// Current pi extension version — bump when codeisland-pi.ts changes.
-    private static let piExtensionVersion = "v5"
+    private static let piExtensionVersion = "v6"
 
     /// Current omp extension version — bump when codeisland-omp.ts changes.
     /// Kept independent of pi (OMP reuses the "CodeIsland pi extension" banner
     /// but ships its own resource file), so a pi-only bump does not false-flag
     /// healthy OMP installs as needing repair.
-    private static let ompExtensionVersion = "v9"
+    private static let ompExtensionVersion = "v10"
 
     private static func piExtensionSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-pi", withExtension: "ts", subdirectory: "Resources"),
@@ -3531,7 +3561,7 @@ struct ConfigInstaller {
 
     // MARK: - OpenClaw plugin (#235)
 
-    private static let openclawPluginVersion = "v1"
+    private static let openclawPluginVersion = "v2"
     private static let openclawPluginFiles = ["index.ts", "openclaw.plugin.json", "package.json"]
 
     private static func openclawPluginSource(_ file: String) -> String? {
@@ -3814,7 +3844,7 @@ struct ConfigInstaller {
 
     /// Current OpenCode plugin version — bump when codeisland-opencode.js changes
     /// (the MiMo Code copy is the same file, so it follows this too).
-    private static let opencodePluginVersion = "v9"
+    private static let opencodePluginVersion = "v11"
 
     private static func isOpencodePluginInstalled(fm: FileManager) -> Bool {
         guard fm.fileExists(atPath: opencodePluginPath) else { return false }
@@ -4223,7 +4253,7 @@ extension ConfigInstaller {
         // The primary itself under another spelling: its own entry installs.
         if ExtraConfigDirs.isSameDirectory(dir.path, as: primary) { return .shared(with: primary) }
         let fm = FileManager.default
-        try? fm.createDirectory(atPath: codeislandDir, withIntermediateDirectories: true)
+        prepareCodeislandDir()
         installHookScript(fm: fm)
         installBridgeBinary(fm: fm)
         return installHooks(

@@ -1,10 +1,16 @@
 import XCTest
 @testable import CodeIsland
+import CodeIslandCore
+
+/// The socket the hook's host has on the island: requests there are its own.
+private let buildBox = HookOrigin.remoteHost(id: "host-1", name: "Build Box")
 
 /// #377 over Remote-SSH: Cursor runs the Claude Code hooks it imports, so on a
 /// remote host its events reach the remote hook as CODEISLAND_SOURCE=claude.
 /// These tests run the shipped codeisland-remote-hook.py's `main()` against a
-/// throwaway socket and read what it would send to the island.
+/// throwaway socket and read what the island makes of what it sends: the
+/// hook sends facts (`_edge`), HookServer interprets them (HookIntake).
+@MainActor
 final class RemoteHookCursorPayloadTests: XCTestCase {
     private var sandbox: URL!
     private var hookURL: URL!
@@ -27,8 +33,21 @@ final class RemoteHookCursorPayloadTests: XCTestCase {
     }
 
     /// Feeds `input` to the hook's `main()` with CODEISLAND_SOURCE=claude and
-    /// returns the payload it sent, or nil when it sent none.
+    /// returns the event the island reads from what it sent, or nil when it
+    /// sent nothing.
     private func sentPayload(for input: [String: Any]) throws -> [String: Any]? {
+        guard let sent = try rawSentPayload(for: input) else { return nil }
+        XCTAssertNotNil(sent["_edge"], "the hook sends facts")
+        XCTAssertNil(sent["_source"], "and leaves interpreting them to the island")
+        guard case .route(let routed, let edge) = HookServer.intake(try JSONSerialization.data(withJSONObject: sent), origin: buildBox) else {
+            XCTFail("the island answered nothing")
+            return nil
+        }
+        XCTAssertNotNil(edge)
+        return try JSONSerialization.jsonObject(with: routed) as? [String: Any]
+    }
+
+    private func rawSentPayload(for input: [String: Any]) throws -> [String: Any]? {
         let driver = """
         import importlib.util, io, json, os, socket, sys, threading
         hook_path, socket_path, stdin_text = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -55,7 +74,7 @@ final class RemoteHookCursorPayloadTests: XCTestCase {
         spec = importlib.util.spec_from_file_location("hook", hook_path)
         hook = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hook)
-        sys.stdin = io.StringIO(stdin_text)
+        sys.stdin = io.TextIOWrapper(io.BytesIO(stdin_text.encode("utf-8")), encoding="utf-8")
         hook.main()
         thread.join(6)
         print(json.dumps(received.get("payload")))

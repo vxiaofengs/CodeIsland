@@ -126,6 +126,7 @@ private struct RemoteHostsPage: View {
     @State private var authSocket = ""
     @State private var cwdFilter = ""
     @State private var autoConnect = false
+    @State private var agentsRunAsOtherUsers = false
 
     var body: some View {
         Form {
@@ -154,6 +155,10 @@ private struct RemoteHostsPage: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Toggle(l10n["remote_auto_connect"], isOn: $autoConnect)
+                Toggle(l10n["remote_other_users"], isOn: $agentsRunAsOtherUsers)
+                Text(l10n["remote_other_users_hint"])
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 Button(l10n["remote_add_button"]) {
                     let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -168,7 +173,8 @@ private struct RemoteHostsPage: View {
                         identityFile: identityFile.trimmingCharacters(in: .whitespacesAndNewlines),
                         autoConnect: autoConnect,
                         authSocket: authSocket.trimmingCharacters(in: .whitespacesAndNewlines),
-                        cwdFilter: cwdFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+                        cwdFilter: cwdFilter.trimmingCharacters(in: .whitespacesAndNewlines),
+                        agentsRunAsOtherUsers: agentsRunAsOtherUsers
                     ))
 
                     name = ""
@@ -179,6 +185,7 @@ private struct RemoteHostsPage: View {
                     authSocket = ""
                     cwdFilter = ""
                     autoConnect = false
+                    agentsRunAsOtherUsers = false
                 }
                 .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     || host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -258,6 +265,20 @@ private struct RemoteHostRow: View {
                 .onAppear { cwdFilterDraft = host.cwdFilter }
                 .onChange(of: host.cwdFilter) { _, newValue in cwdFilterDraft = newValue }
                 .onSubmit { saveCwdFilter() }
+
+            // Who may use CodeIsland's socket on the host; a connected host
+            // reconnects to apply it.
+            Toggle(l10n["remote_other_users"], isOn: Binding(
+                get: { host.agentsRunAsOtherUsers },
+                set: { newValue in
+                    guard newValue != host.agentsRunAsOtherUsers else { return }
+                    var updated = host
+                    updated.agentsRunAsOtherUsers = newValue
+                    remoteManager.updateHost(updated)
+                }
+            ))
+            .font(.system(size: 11))
+            .help(l10n["remote_other_users_hint"])
 
             HStack(spacing: 8) {
                 switch status {
@@ -699,6 +720,7 @@ private struct BehaviorPage: View {
 private struct HooksPage: View {
     var appState: AppState?
     @ObservedObject private var l10n = L10n.shared
+    @ObservedObject private var socketHealth = HookSocketHealth.shared
     @State private var cliStatuses: [String: Bool] = [:]
     @State private var statusMessage = ""
     @State private var statusIsError = false
@@ -800,6 +822,11 @@ private struct HooksPage: View {
 
     var body: some View {
         Form {
+            if let problem = socketHealth.problem {
+                Section {
+                    HookSocketProblemRow(problem: problem) { socketHealth.retryIfDown() }
+                }
+            }
             Section(l10n["cli_status"]) {
                 ForEach(ConfigInstaller.allCLIs, id: \.source) { cli in
                     let installed = cliStatuses[cli.source] ?? false
@@ -2311,6 +2338,10 @@ private struct BuddyPage: View {
                 Text(l10n["apple_companion_desc"])
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Text(l10n["apple_companion_read_only"])
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
@@ -2429,6 +2460,8 @@ private struct AboutPage: View {
                     )
                 }
                 .buttonStyle(.plain)
+                // What the zip holds, also on the save panel it opens.
+                .help(l10n["export_diagnostics_desc"])
                 .onHover { h in
                     if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
                 }

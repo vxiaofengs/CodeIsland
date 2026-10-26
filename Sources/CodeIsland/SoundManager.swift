@@ -1,14 +1,15 @@
 import AppKit
 import CodeIslandCore
 
-/// Plays 8-bit sound effects in response to hook events
+/// Plays the 8-bit sound effects `AttentionPolicy` decides on, and supplies
+/// it with the user's sound settings (`preferences`, `hold`).
 @MainActor
 class SoundManager {
     static let shared = SoundManager()
 
     private let defaults = UserDefaults.standard
 
-    /// Map event names to 8-bit WAV file names (without extension)
+    /// Map sound cues (event names, see `SoundCue`) to 8-bit WAV file names (without extension)
     static let eventSounds: [(event: String, sound: String, key: String, label: String)] = [
         ("SessionStart",      "8bit_start",    SettingsKey.soundSessionStart,   "会话开始"),
         ("TaskRoundComplete", "8bit_complete",  SettingsKey.soundTaskComplete,   "任务完成"),
@@ -20,6 +21,11 @@ class SoundManager {
         ("UserPromptSubmit",  "8bit_submit",    SettingsKey.soundPromptSubmit,   "任务确认"),
     ]
 
+    /// The launch chime: the app's own cue, with its own switch. It stays out
+    /// of `eventSounds`, whose cues are hook event names (no hook event may
+    /// carry this one, see `EventSoundRouting`), and is not preloaded.
+    static let launchSound = (cue: SoundCue.launch, sound: "8bit_boot", key: SettingsKey.soundBoot)
+
     private var soundCache: [String: NSSound] = [:]
 
     /// A failing session tends to fail again seconds later (the user retries
@@ -29,9 +35,9 @@ class SoundManager {
     /// Where a *decided* event sound goes. Production plays it; a test installs
     /// a recorder and asserts on the names it receives.
     ///
-    /// Only the play step is swappable — everything above it (master toggle,
-    /// quiet hours, the per-event toggle, and the caller's own "is this the
-    /// start of a burst" decision) stays the code under test. That decision is
+    /// Only the play step is swappable — everything above it (the attention
+    /// policy's master toggle, quiet hours and per-event toggle, and its "is
+    /// this the start of a burst" rule) stays the code under test. That rule is
     /// not the same question as "should a card open", and it has already drifted
     /// once behind a shared `if` with nothing able to catch it. (#312)
     ///
@@ -57,26 +63,82 @@ class SoundManager {
         }
     }
 
-    /// Called from AppState.handleEvent() to trigger appropriate sounds.
-    /// `sessionId` scopes the turn-failure debounce; nil shares one bucket.
+    /// A sound cue that has not been through `AttentionPolicy.settle`: the
+    /// user's sound settings are applied here, by the policy's own rule
+    /// (`AttentionPolicy.audibleSound`). `sessionId` scopes the turn-failure
+    /// debounce; nil shares one bucket.
     func handleEvent(_ eventName: String, sessionId: String? = nil, now: Date = Date()) {
-        guard defaults.bool(forKey: SettingsKey.soundEnabled) else { return }
-        guard !isEventSoundDeferred else { return }
-        guard let entry = Self.eventSounds.first(where: { $0.event == eventName }) else { return }
-        guard defaults.bool(forKey: entry.key) else { return }
-        if eventName == EventSoundRouting.turnFailed,
+        guard let cue = AttentionPolicy.audibleSound(eventName, sounds: preferences, hold: hold) else { return }
+        play(cue: cue, sessionId: sessionId, now: now)
+    }
+
+    /// A follow-up reminder's cue: the user's sound settings apply as to any
+    /// cue, the turn-failure debounce does not. Reminders already come an
+    /// interval apart, one per cue per tick; the debounce, there for a
+    /// session failing again seconds later, would swallow another session's
+    /// failed-turn reminder that happened to fall inside its window.
+    func playReminder(_ cue: String) {
+        guard let cue = AttentionPolicy.audibleSound(cue, sounds: preferences, hold: hold),
+              let sound = Self.soundName(forCue: cue) else { return }
+        emit(sound)
+    }
+
+    /// Plays a cue `AttentionPolicy` let through. All that is left to decide
+    /// is the turn-failure jingle's debounce, which needs the jingles before it.
+    func play(cue: String, sessionId: String? = nil, now: Date = Date()) {
+        guard let sound = Self.soundName(forCue: cue) else { return }
+        if cue == EventSoundRouting.turnFailed,
            !turnFailureDebouncer.shouldPlay(key: sessionId ?? "", now: now) {
             return
         }
-        emit(entry.sound)
+        emit(sound)
     }
 
-    /// Play boot sound on app launch
+    /// The WAV a cue plays, nil for a cue with no sound of its own.
+    private static func soundName(forCue cue: String) -> String? {
+        if cue == launchSound.cue { return launchSound.sound }
+        return eventSounds.first(where: { $0.event == cue })?.sound
+    }
+
+    /// Play boot sound on app launch: the policy's `.appLaunched` moment,
+    /// settled like any other — master switch, its own switch, the hold.
     func playBoot() {
-        guard defaults.bool(forKey: SettingsKey.soundEnabled) else { return }
-        guard !isEventSoundDeferred else { return }
-        guard defaults.bool(forKey: SettingsKey.soundBoot) else { return }
-        emit("8bit_boot")
+        let context = AttentionContext(
+            sounds: preferences,
+            soundHold: hold,
+            // Only the sound settings matter for a launch.
+            completionStyle: .off,
+            pushEnabled: false,
+            sessionInFront: { false }
+        )
+        guard let cue = AttentionPolicy.decide(.appLaunched, context: context).sound else { return }
+        play(cue: cue)
+    }
+
+    // MARK: - Settings, for the policy
+
+    /// The standing sound choices: the master switch, and every cue whose
+    /// own switch is on. Read for every hook event, so with the master switch
+    /// off (the default) the per-event switches are not read at all.
+    var preferences: SoundPreferences {
+        guard defaults.bool(forKey: SettingsKey.soundEnabled) else {
+            return SoundPreferences(enabled: false, audibleCues: [])
+        }
+        var cues = Set(Self.eventSounds.filter { defaults.bool(forKey: $0.key) }.map(\.event))
+        if defaults.bool(forKey: Self.launchSound.key) {
+            cues.insert(Self.launchSound.cue)
+        }
+        return SoundPreferences(enabled: true, audibleCues: cues)
+    }
+
+    /// What may hold event sounds back right now. The clock and the lock
+    /// state are read only for a cue the user would otherwise hear.
+    var hold: SoundHold {
+        SoundHold(
+            quietHours: { self.quietHoursActive },
+            muteWhenAway: muteWhenAway,
+            sceneQuiet: { SceneMuteMonitor.shared.isQuietScene }
+        )
     }
 
     /// Quiet-hours window test. Half-open [start, end) in minutes since
@@ -95,16 +157,15 @@ class SoundManager {
     /// wait out a deferral and catch up afterwards, but never a choice.
     /// Settings previews stay audible: only event-driven sounds are gated.
     var isEventSoundDeferred: Bool {
-        quietHoursActive || awayMuteActive
+        AttentionPolicy.holdsSounds(hold)
     }
 
     /// Scene auto-mute, on unless the user turned it off. Read through
     /// `object(forKey:)` so an unregistered default still means "on".
-    private var awayMuteActive: Bool {
-        let enabled = defaults.object(forKey: SettingsKey.autoMuteWhenAway) == nil
+    private var muteWhenAway: Bool {
+        defaults.object(forKey: SettingsKey.autoMuteWhenAway) == nil
             ? SettingsDefaults.autoMuteWhenAway
             : defaults.bool(forKey: SettingsKey.autoMuteWhenAway)
-        return enabled && SceneMuteMonitor.shared.isQuietScene
     }
 
     private var quietHoursActive: Bool {

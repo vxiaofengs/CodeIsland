@@ -1,97 +1,28 @@
 import SwiftUI
-import CoreServices
 import os.log
-import SQLite3
-import CryptoKit
 import CodeIslandCore
 
 private let log = Logger(subsystem: "com.codeisland", category: "AppState")
 
-/// FSEventStream context target. Callbacks hold an unretained pointer to this
-/// box (not `AppState`), and reach the owner only through `weak`, so queued
-/// main-queue deliveries stay safe if `AppState` tears down off the main actor.
-private final class ProjectsWatcherBox: @unchecked Sendable {
-    weak var appState: AppState?
-    private let lock = NSLock()
-    private var cancelled = false
+/// AppState's answers to the Agent Sub-Sessions resolvers, taken on the main
+/// actor for one hook (``AppState/subsessionContext``).
+struct AppSubsessionContext: SubsessionContext {
+    let cards: [String: SessionSnapshot]
+    let codexRollouts: CodexRolloutCache
 
-    func cancel() {
-        lock.lock()
-        cancelled = true
-        lock.unlock()
-    }
-
-    func handleChange() {
-        lock.lock()
-        let isCancelled = cancelled
-        lock.unlock()
-        guard !isCancelled else { return }
-        appState?.handleProjectsDirChange()
+    func codexRolloutInspection(transcriptPath: String) -> CodexTranscriptSubagentInspection {
+        codexRollouts.inspection(transcriptPath: transcriptPath)
     }
 }
 
-struct CodexSubagentMetadata: Equatable, Sendable {
-    let parentThreadId: String
-    let agentType: String?
-    let agentNickname: String?
-}
-
-private struct CodexSpawnEdgeRecord {
-    let metadata: CodexSubagentMetadata
-    let status: String?
-    let transcriptPath: String?
-}
-
-private enum CodexTranscriptSubagentInspection {
-    /// The first line could not be established as a valid `session_meta`.
-    case unavailable
-    /// A valid root `session_meta` explicitly contains no subagent relation.
-    case root
-    case subagent(CodexSubagentMetadata)
-}
-
-struct ProcessIdentity: Equatable {
-    let pid: pid_t
-    let startTime: Date?
-}
-
-struct CodexDiscoveryIdentity: Equatable, Sendable {
-    let sessionId: String
-    let providerSessionId: String?
-    let termBundleId: String?
-}
-
-struct CodexProcessDiscoveryCandidate: Sendable {
-    let pid: pid_t
-    let cwd: String?
-    let startTime: Date?
-    let isDesktop: Bool
-}
-
-enum CodexTranscriptOrigin: Equatable, Sendable {
-    case desktop
-    case cli
-    case unknown
-}
-
-/// A Codex Desktop thread recovered from Codex's local state database.
-///
-/// Recent Codex Desktop builds run their app-server with `/` as the process CWD,
-/// so the CLI discovery path cannot map that process back to a project. Keeping
-/// this small value type separate lets discovery hydrate native-app sessions from
-/// the authoritative state DB without exposing the private `DiscoveredSession`.
-struct CodexDesktopThreadRecord: Sendable {
-    let sessionId: String
-    let cwd: String
-    let model: String?
-    let modifiedAt: Date
-    let recentMessages: [ChatMessage]
-    let transcriptPath: String
-    let status: AgentStatus
-    let subagentMetadata: CodexSubagentMetadata?
-    let subagentStatus: String?
-}
-
+/// The session store the island's views observe, and the coordinator around
+/// it, on the main actor: hook events, approvals and questions, completions
+/// and attention land here. The slow work it coordinates runs elsewhere —
+/// session discovery in `SessionDiscoveryCoordinator` and the `Discovery/`
+/// namespaces, a known card's store reads through `SessionStoreReaders`,
+/// both off the main actor; exit watches in `SessionProcessMonitor`; the
+/// compact bar's rotation in `CompactBarRotation` — and AppState integrates
+/// what they find.
 @MainActor
 @Observable
 final class AppState {
@@ -177,10 +108,10 @@ final class AppState {
             recentHookEvents.removeFirst(recentHookEvents.count - maxRecentHookEvents)
         }
     }
-    /// Cache of in-flight PreToolUse records keyed by tool_use_id. Used to correlate
+    /// Cache of in-flight PreToolUse records keyed by card and tool_use_id. Used to correlate
     /// permission requests back to their originating tool call. See AppState+ToolUseCache.
     @ObservationIgnored
-    var pendingToolUses: [String: PreToolUseRecord] = [:]
+    var pendingToolUses: [ToolUseKey: PreToolUseRecord] = [:]
     /// Records the transcript path currently watched for each session so we only
     /// reattach when the path actually changes. See AppState+TranscriptTailer.
     @ObservationIgnored
@@ -379,6 +310,11 @@ final class AppState {
     @ObservationIgnored
     var completionAutoCollapseDelay: TimeInterval = 5
     private var completionQueue: [String] = []
+    /// The queued completion whose card waits on Smart Suppress's look at
+    /// its session's tab (off the main thread). It is the next card on its
+    /// way: nothing else leaves the queue meanwhile.
+    @ObservationIgnored
+    private var queuedCompletionLookingAtTab: String?
     /// Mouse must enter the panel before auto-collapse is allowed (prevents instant dismiss)
     var completionHasBeenEntered = false {
         // The pointer on the completion card is the one proof the turn was seen.
@@ -390,27 +326,20 @@ final class AppState {
     }
     /// Auto-collapse timer fired but mouse is inside panel — defer collapse until mouse leaves
     var deferCollapseOnMouseLeave = false
-    /// `attachParentPid` is the monitored process's ppid captured when the monitor was
-    /// attached. Processes that already had ppid <= 1 at attach time are launchd-managed
-    /// daemons (e.g. a Hermes gateway with KeepAlive=true), NOT orphans of a closed
-    /// terminal — they must never be terminated by orphan cleanup (#243).
-    /// Cancelled from `deinit` off the main actor.
-    @ObservationIgnored
-    nonisolated(unsafe) private var processMonitors: [String: (source: DispatchSourceProcess, process: ProcessIdentity, attachParentPid: pid_t?)] = [:]
+    /// Exit watches on the sessions' local CLI processes.
+    private let processMonitor = SessionProcessMonitor()
+    /// Sessions in the grace period after their process exited, with that process.
     private var exitingSessions: [String: ProcessIdentity] = [:]
     @ObservationIgnored
     nonisolated(unsafe) private var saveTimer: Timer?
+    /// Session discovery: the session-store watcher and the scans it runs off
+    /// the main actor, whose sessions land in `integrateDiscovered`.
     @ObservationIgnored
-    nonisolated(unsafe) private var fsEventStream: FSEventStreamRef?
-    @ObservationIgnored
-    nonisolated(unsafe) private var projectsWatcherBox: ProjectsWatcherBox?
-    private var lastFSScanTime: Date = .distantPast
-    @ObservationIgnored
-    nonisolated(unsafe) private var discoveryScanTask: Task<Void, Never>?
-    private var pendingDiscoveryRescan = false
-    @ObservationIgnored
-    nonisolated(unsafe) private var codexDesktopDiscoveryScanTask: Task<Void, Never>?
-    private var lastCodexDesktopDiscoveryPollAt: Date?
+    private(set) lazy var discovery: SessionDiscoveryCoordinator = {
+        let discovery = SessionDiscoveryCoordinator()
+        discovery.onDiscovered = { [weak self] in self?.integrateDiscovered($0) }
+        return discovery
+    }()
     /// Cursor Agent Task transcripts on disk, for rebranding default-Claude
     /// Task cards and folding Cursor-labelled ones. Built off the main actor;
     /// see `rebrandMisattributedCursorTaskCards`.
@@ -429,6 +358,10 @@ final class AppState {
     /// When such a card is looked up after it first goes unresolved. Tests shorten it.
     @ObservationIgnored
     var cursorSubagentLookupDelays = CursorSubagentLookupSchedule.defaultDelays
+    /// What each Codex thread's rollout says about its parent: Agent
+    /// Sub-Sessions asks on every Codex hook, and reads a rollout once.
+    @ObservationIgnored
+    let codexRollouts = CodexRolloutCache(read: { CodexDiscovery.inspectCodexSubagentMetadata(inTranscriptPath: $0) })
     private var isShowingCompletion: Bool {
         if case .completionCard = surface { return true }
         return false
@@ -441,6 +374,19 @@ final class AppState {
         }
     }
     private var modelReadRetryAt: [String: Date] = [:]
+    /// Cards whose model (`maybeBackfillModel`), YOLO setting or native-app
+    /// turn end is being read off the main actor.
+    @ObservationIgnored
+    private(set) var modelReadsInFlight: Set<String> = []
+    @ObservationIgnored
+    private(set) var cursorYoloReadsInFlight: Set<String> = []
+    @ObservationIgnored
+    private(set) var nativeAppTurnReadsInFlight: Set<String> = []
+    /// The reads of the agents' own stores made for a known card, run off
+    /// the main actor (see `SessionStoreReaders`). Inert in a test process;
+    /// tests install their own.
+    @ObservationIgnored
+    var storeReaders = SessionStoreReaders.current
     /// Per parent session → subagent id: the subagent's own model/effort once
     /// read from its transcript, and the reads still trying to find it.
     @ObservationIgnored
@@ -536,13 +482,13 @@ final class AppState {
         return ids
     }
 
-    var rotatingSessionId: String?
+    /// The compact bar's mascot rotation through the active sessions.
+    private let rotation = CompactBarRotation()
+    var rotatingSessionId: String? { rotation.rotatingSessionId }
     var rotatingSession: SessionSnapshot? {
         guard let rid = rotatingSessionId else { return nil }
         return sessions[rid]
     }
-    @ObservationIgnored
-    nonisolated(unsafe) private var rotationTimer: Timer?
 
     private func startCleanupTimer() {
         guard cleanupTimer == nil else { return }
@@ -595,26 +541,11 @@ final class AppState {
     private func cleanupIdleSessions() {
         // 1. Verify monitored PIDs are still alive (DispatchSource can silently miss exits)
         //    Also kill orphaned processes (ppid <= 1, terminal closed but process survived).
-        var deadMonitors: [(String, ProcessIdentity)] = []
-        var orphaned: [(String, pid_t)] = []
-        for (sessionId, monitor) in processMonitors {
-            let process = monitor.process
-            let pid = process.pid
-            // Check if the monitored process is still the same live process.
-            if !Self.isLiveProcess(process) {
-                deadMonitors.append((sessionId, process))
-                continue
-            }
-            // Check for orphaned processes: ppid <= 1 now, but only if the process had a
-            // real parent when we attached. A process whose ppid was already <= 1 at attach
-            // time is a launchd-managed daemon, not a terminal orphan — killing it puts
-            // KeepAlive daemons into a SIGTERM/restart loop (#243).
-            if Self.isReparentedOrphan(currentParentPid: Self.parentPid(of: pid), attachParentPid: monitor.attachParentPid)
-                && shouldTerminateOrphanedProcess(sessionId: sessionId, pid: pid) {
-                orphaned.append((sessionId, pid))
-            }
+        let sweep = processMonitor.sweep()
+        let orphaned = sweep.reparented.filter {
+            shouldTerminateOrphanedProcess(sessionId: $0.sessionId, pid: $0.pid)
         }
-        for (sessionId, process) in deadMonitors {
+        for (sessionId, process) in sweep.exited {
             // PID gone but monitor didn't fire — treat as process exit so session is removed
             // promptly (after 5s grace) instead of lingering for 10 minutes.
             handleProcessExit(sessionId: sessionId, exitedProcess: process)
@@ -641,7 +572,7 @@ final class AppState {
         //    clock right after: their session store stays silent through a long
         //    tool run and for as long as a permission card is left open.
         for (key, session) in sessions
-            where processMonitors[key] == nil
+            where !processMonitor.isWatching(key)
             && session.status != .idle
             && !session.isRemote
             && !key.hasPrefix(Self.coworkSessionPrefix) {
@@ -680,18 +611,17 @@ final class AppState {
                 }
                 continue
             }
-            guard processMonitors[key] != nil else { continue }
-            if session.isNativeAppMode,
-               elapsed >= codexTerminalTurnSettleTime,
-               let finishedAt = Self.nativeAppFinishedTurnTimestamp(sessionId: key, session: session),
-               finishedAt >= session.lastActivity.addingTimeInterval(-1) {
-                sessions[key]?.status = .idle
-                continue
-            }
-            // Native apps write transcripts synchronously — if the transcript check above
+            guard processMonitor.isWatching(key) else { continue }
+            // Native apps write transcripts synchronously — if the transcript check below
             // didn't find a stop marker after 30s, the session is almost certainly idle.
             if session.isNativeAppMode, elapsed > nativeAppThinkingTimeout {
                 sessions[key]?.status = .idle
+                continue
+            }
+            // Before that, the turn's end in its transcript settles it: read
+            // off the main actor, applied when the read lands.
+            if session.isNativeAppMode, elapsed >= codexTerminalTurnSettleTime {
+                checkNativeAppTurnEnded(sessionId: key, session: session, settleTime: codexTerminalTurnSettleTime)
                 continue
             }
             if elapsed > monitoredThinkingTimeout {
@@ -702,9 +632,9 @@ final class AppState {
         // 3. Verify PID liveness for sessions without monitors but with a known PID.
         //    If the process died: idle sessions are removed directly (no grace needed),
         //    non-idle sessions go through handleProcessExit for the 5s grace period.
-        for (key, session) in sessions where processMonitors[key] == nil {
+        for (key, session) in sessions where !processMonitor.isWatching(key) {
             guard let process = resolvedSessionProcessIdentity(for: key) else { continue }
-            if !Self.isLiveProcess(process) {
+            if !ProcessTable.isLiveProcess(process) {
                 if exitingSessions[key] == process { continue }
                 if session.status == .idle {
                     removeSession(key)
@@ -740,20 +670,7 @@ final class AppState {
                 removeSession(key)
             }
         }
-        let discoveryPollNow = Date()
-        // Check the cheap clock predicate before the expensive app list: the poll
-        // is rate-limited to every 6s, so five of every six ticks can skip it.
-        let codexPollIntervalElapsed = lastCodexDesktopDiscoveryPollAt.map {
-            discoveryPollNow.timeIntervalSince($0) >= 6
-        } ?? true
-        if codexPollIntervalElapsed, Self.shouldPollCodexDesktopDiscovery(
-            runningBundleIdentifiers: runningBundleIds(),
-            lastPollAt: lastCodexDesktopDiscoveryPollAt,
-            now: discoveryPollNow
-        ) {
-            lastCodexDesktopDiscoveryPollAt = discoveryPollNow
-            requestCodexDesktopDiscoveryScan()
-        }
+        discovery.pollCodexDesktopIfDue(now: Date(), runningBundleIdentifiers: runningBundleIds)
 
         // 4. Remove idle sessions past timeout (user setting, or 10 min default for no-monitor sessions)
         let userTimeout = SettingsManager.shared.sessionTimeout
@@ -762,7 +679,7 @@ final class AppState {
             if Self.isStaleIdleSession(
                 idleMinutes: idleMinutes,
                 userTimeoutMinutes: userTimeout,
-                hasMonitor: processMonitors[key] != nil,
+                hasMonitor: processMonitor.isWatching(key),
                 hermesChatElsewhere: session.hermesChatElsewhere
             ) {
                 removeSession(key)
@@ -796,9 +713,43 @@ final class AppState {
         refreshDerivedState()
     }
 
-    private nonisolated static func currentPluginSessionMode() -> String {
-        UserDefaults.standard.string(forKey: SettingsKey.pluginSessionMode)
-            ?? SettingsDefaults.pluginSessionMode
+    /// Settle a native app's thinking card idle once its transcript shows
+    /// the turn ended after the card's last activity. The cleanup tick asks
+    /// every 3 s while the card thinks, and the read opens the state database
+    /// and reads the transcript's tail, so it runs off the main actor; the
+    /// card is settled when it lands if it is still the same quiet,
+    /// monitored, thinking card.
+    func checkNativeAppTurnEnded(sessionId: String, session: SessionSnapshot, settleTime: TimeInterval) {
+        guard nativeAppTurnReadsInFlight.insert(sessionId).inserted else { return }
+        let read = storeReaders.nativeAppFinishedTurn
+        Task.detached(priority: .utility) { [weak self] in
+            let finishedAt = read(sessionId, session)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.nativeAppTurnReadsInFlight.remove(sessionId)
+                guard let finishedAt,
+                      let current = self.sessions[sessionId],
+                      current.status == .processing,
+                      current.currentTool == nil,
+                      current.toolDescription == nil,
+                      current.isNativeAppMode,
+                      !Self.isDaemonBackedSource(current.source),
+                      self.processMonitor.isWatching(sessionId),
+                      -current.lastActivity.timeIntervalSinceNow >= settleTime,
+                      finishedAt >= current.lastActivity.addingTimeInterval(-1) else { return }
+                self.sessions[sessionId]?.status = .idle
+                self.refreshDerivedState()
+            }
+        }
+    }
+
+    /// Agent Sub-Sessions as set now; an unknown setting reads as Show
+    /// separately, the default (HookServer routes hooks by the same reading).
+    nonisolated static func currentPluginSessionMode() -> SubsessionMode {
+        SubsessionMode(
+            setting: UserDefaults.standard.string(forKey: SettingsKey.pluginSessionMode)
+                ?? SettingsDefaults.pluginSessionMode
+        )
     }
 
     // MARK: - Process Monitoring (DispatchSource)
@@ -810,167 +761,54 @@ final class AppState {
 
     private func resolvedSessionProcessIdentity(for sessionId: String) -> ProcessIdentity? {
         guard let process = currentSessionProcessIdentity(for: sessionId) else { return nil }
-        if let resolved = Self.trackedProcessIdentity(for: process.pid, source: sessions[sessionId]?.source) {
+        if let resolved = ProcessTable.trackedProcessIdentity(for: process.pid, source: sessions[sessionId]?.source) {
             if resolved != process {
                 setSessionProcessIdentity(resolved, for: sessionId)
             }
             return resolved
         }
         if process.startTime != nil { return process }
-        guard let refreshed = Self.liveProcessIdentity(for: process.pid) else { return process }
+        guard let refreshed = ProcessTable.liveProcessIdentity(for: process.pid) else { return process }
         setSessionProcessIdentity(refreshed, for: sessionId)
         return refreshed
     }
 
+    /// A remote session's agent runs on its own host: no process here is
+    /// ever its own, to watch or to signal.
     private func setSessionProcessIdentity(_ process: ProcessIdentity, for sessionId: String) {
+        guard sessions[sessionId]?.isRemote != true else { return }
         sessions[sessionId]?.cliPid = process.pid
         sessions[sessionId]?.cliStartTime = process.startTime
     }
 
     private func shouldTerminateOrphanedProcess(sessionId: String, pid: pid_t) -> Bool {
-        guard let session = sessions[sessionId] else { return true }
-        if session.isNativeAppMode { return false }
+        Self.shouldTerminateOrphanedProcess(session: sessions[sessionId], pid: pid)
+    }
+
+    /// cleanupIdleSessions' orphan filter: whether a watched process its
+    /// parent left (`SessionProcessMonitor.isReparentedOrphan`) is SIGTERMed.
+    /// Never one running Claude Code's binary as anything but its CLI — a
+    /// grep its shell ran, its terminal host or a spare worker its own
+    /// supervisor reaps — however the process came to be watched.
+    nonisolated static func shouldTerminateOrphanedProcess(
+        session: SessionSnapshot?,
+        pid: pid_t,
+        executablePath: (pid_t) -> String? = { ProcessTable.executablePath(for: $0) },
+        arguments: (pid_t) -> [String]? = { ProcessTable.getProcessArgs($0) }
+    ) -> Bool {
+        if AgentProcessFinder.isClaudeCodeNonCLIProcess(pid, executablePath: executablePath, arguments: arguments) {
+            return false
+        }
+        guard let session else { return true }
+        if session.isNativeAppMode || session.isRemote { return false }
         guard let source = SessionSnapshot.normalizedSupportedSource(session.source) else { return true }
-        return !Self.isNativeAppProcess(pid, source: source)
-    }
-
-    /// Current ppid of `pid`, or nil if the process is gone / info is unavailable.
-    nonisolated static func parentPid(of pid: pid_t) -> pid_t? {
-        var info = proc_bsdinfo()
-        let ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
-        guard ret > 0 else { return nil }
-        return pid_t(info.pbi_ppid)
-    }
-
-    /// A process counts as a terminal orphan only when it USED to have a real parent
-    /// (attachParentPid > 1) and has since been reparented to launchd/init (ppid <= 1).
-    /// Daemons started by launchd have ppid <= 1 from the beginning and are never
-    /// orphans, no matter how long they run (#243). Unknown attach ppid stays safe: no kill.
-    nonisolated static func isReparentedOrphan(currentParentPid: pid_t?, attachParentPid: pid_t?) -> Bool {
-        guard let currentParentPid, currentParentPid <= 1 else { return false }
-        guard let attachParentPid, attachParentPid > 1 else { return false }
-        return true
-    }
-
-    nonisolated static func liveProcessIdentity(for pid: pid_t) -> ProcessIdentity? {
-        guard pid > 0, kill(pid, 0) == 0 else { return nil }
-        return ProcessIdentity(pid: pid, startTime: getProcessStartTime(pid))
-    }
-
-    nonisolated static func isLiveProcess(_ process: ProcessIdentity) -> Bool {
-        guard process.pid > 0, kill(process.pid, 0) == 0 else { return false }
-        guard let expectedStart = process.startTime else { return true }
-        return getProcessStartTime(process.pid) == expectedStart
-    }
-
-    private nonisolated static func trackedProcessIdentity(for pid: pid_t, source: String?) -> ProcessIdentity? {
-        guard pid > 0 else { return nil }
-
-        var currentPid: pid_t? = pid
-        var visited = Set<pid_t>()
-        var firstLiveProcess: ProcessIdentity?
-
-        for _ in 0..<6 {
-            guard let candidatePid = currentPid,
-                  candidatePid > 0,
-                  !visited.contains(candidatePid),
-                  let process = liveProcessIdentity(for: candidatePid) else {
-                break
-            }
-
-            visited.insert(candidatePid)
-            if firstLiveProcess == nil {
-                firstLiveProcess = process
-            }
-            if let path = executablePath(for: candidatePid),
-               CLIProcessResolver.sourceMatchesExecutablePath(path, source: source) {
-                return process
-            }
-            currentPid = parentPID(for: candidatePid)
-        }
-
-        return firstLiveProcess
-    }
-
-    private nonisolated static func parentPID(for pid: pid_t) -> pid_t? {
-        var info = proc_bsdinfo()
-        let ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
-        guard ret > 0, info.pbi_ppid > 0 else { return nil }
-        return pid_t(info.pbi_ppid)
-    }
-
-    /// Both bundle names the Qoder IDE has shipped under, lowercased.
-    ///
-    /// Qoder IDE 1.25.1 (2026-08-19) renamed the macOS bundle from `Qoder.app`
-    /// to `Qoder IDE.app` and its executable from `Electron` to `Qoder` — so
-    /// matching on `/qoder.app/contents/` alone stopped recognising the IDE
-    /// entirely (#327). Both names stay listed: the rename doesn't reach
-    /// installs that haven't updated. `com.qoder.ide` is unchanged, so
-    /// activation and badge labels were never affected — only the
-    /// process-ancestry matching that runs off executable paths.
-    ///
-    /// Qoder App (`com.qoder.app`) also uses `Qoder.app` and the `qoder` hook
-    /// source, so it shares this process-path protection. Session bundle IDs
-    /// distinguish it from the IDE. Neither prefix matches QoderWork.
-    nonisolated static let qoderIDEBundlePrefixes = [
-        "/qoder.app/contents/",
-        "/qoder ide.app/contents/",
-    ]
-
-    /// Is `executablePath` inside a Qoder IDE bundle, under either name?
-    nonisolated static func isQoderIDEBundlePath(_ executablePath: String) -> Bool {
-        let path = executablePath.lowercased()
-        return qoderIDEBundlePrefixes.contains { path.contains($0) }
-    }
-
-    /// Is `executablePath` inside the Trae CN IDE bundle, under any name it
-    /// ships as? It never matches the international `Trae.app`: the two
-    /// editions are separate installs and must not keep each other's
-    /// sessions alive. The markers live in CodeIslandCore so the bridge's
-    /// `_ppid` resolution uses the same list.
-    nonisolated static func isTraeCNIDEBundlePath(_ executablePath: String) -> Bool {
-        CLIProcessResolver.isTraeCNBundlePath(executablePath)
-    }
-
-    private nonisolated static func isNativeAppProcess(_ pid: pid_t, source: String) -> Bool {
-        guard let executable = executablePath(for: pid) else { return false }
-        let path = executable.lowercased()
-        switch source {
-        case "cursor":     return path.contains("/cursor.app/contents/")
-        case "trae":       return path.contains("/trae.app/contents/")
-        case "traecn":     return isTraeCNIDEBundlePath(path)
-        case "qoder":      return isQoderIDEBundlePath(path)
-        // QoderWork desktop app (#249) — bundle id undocumented; the standard
-        // /Applications/QoderWork.app layout is assumed, pending real-install
-        // verification.
-        case "qoderwork":  return path.contains("/qoderwork.app/contents/")
-        case "droid":      return path.contains("/factory.app/contents/")
-        case "codebuddy":  return path.contains("/codebuddy.app/contents/")
-        case "codybuddycn": return path.contains("/codebuddycn.app/contents/") || path.contains("/codebuddy.app/contents/")
-        case "stepfun":    return path.contains("/stepfun.app/contents/")
-        case "codex":      return isCodexExecutablePath(executable)
-        case "opencode":   return path.contains("/opencode.app/contents/")
-        // Xiaomi MiMo desktop runs MiMo Code inside its own main process.
-        case "mimo":       return CLIProcessResolver.isMimoDesktopBundlePath(path)
-        case "antigravity": return path.contains("/antigravity.app/contents/")
-        // Google Antigravity IDE — host app is Antigravity.app. Same .app path as
-        // the fork, but the check is per-source so a "google-antigravity" session
-        // (whose host genuinely IS Antigravity.app) never collides with the fork's
-        // "antigravity" CLI sessions (#215).
-        case "google-antigravity": return path.contains("/antigravity.app/contents/")
-        case "workbuddy":   return path.contains("/workbuddy.app/contents/")
-        case "hermes":      return path.contains("/hermes.app/contents/")
-        // Claude Code Desktop (#211): local Code-tab sessions live inside Claude.app.
-        case "claude":      return path.contains("/claude.app/contents/")
-        case "zcode":       return path.contains("/zcode.app/contents/")
-        default:           return false
-        }
+        return !AgentProcessFinder.isNativeAppProcess(pid, source: source, executablePath: executablePath)
     }
 
     /// Watch a Claude process for exit — waits a grace period before removing, in case the
     /// process restarts (e.g. auto-update) or a new hook event re-activates the session.
     private func monitorProcess(sessionId: String, pid: pid_t) {
-        guard let process = Self.liveProcessIdentity(for: pid) else {
+        guard let process = ProcessTable.liveProcessIdentity(for: pid) else {
             handleProcessExit(sessionId: sessionId, exitedProcess: ProcessIdentity(pid: pid, startTime: nil))
             return
         }
@@ -978,22 +816,18 @@ final class AppState {
     }
 
     private func monitorProcess(sessionId: String, process: ProcessIdentity) {
-        guard processMonitors[sessionId] == nil else { return }
-        let source = DispatchSource.makeProcessSource(identifier: process.pid, eventMask: .exit, queue: .main)
-        source.setEventHandler { [weak self] in
-            Task { @MainActor in
-                guard let self = self, self.sessions[sessionId] != nil else { return }
-                self.handleProcessExit(sessionId: sessionId, exitedProcess: process)
-            }
+        guard sessions[sessionId]?.isRemote != true else { return }
+        let attached = processMonitor.watch(sessionId: sessionId, process: process) { [weak self] in
+            guard let self = self, self.sessions[sessionId] != nil else { return }
+            self.handleProcessExit(sessionId: sessionId, exitedProcess: process)
         }
-        source.resume()
-        processMonitors[sessionId] = (source: source, process: process, attachParentPid: Self.parentPid(of: process.pid))
+        guard attached else { return }
         exitingSessions.removeValue(forKey: sessionId)
 
         // Keep cliPid aligned with the monitored process unless we already have a different
         // live PID from a stronger source (hooks beat heuristic discovery).
         if let currentProcess = resolvedSessionProcessIdentity(for: sessionId) {
-            if !Self.isLiveProcess(currentProcess) || currentProcess.pid == process.pid {
+            if !ProcessTable.isLiveProcess(currentProcess) || currentProcess.pid == process.pid {
                 setSessionProcessIdentity(process, for: sessionId)
             }
         } else {
@@ -1001,7 +835,7 @@ final class AppState {
         }
 
         // Safety: if process already exited before monitor started
-        if !Self.isLiveProcess(process) {
+        if !ProcessTable.isLiveProcess(process) {
             handleProcessExit(sessionId: sessionId, exitedProcess: process)
         }
     }
@@ -1015,7 +849,7 @@ final class AppState {
         // If the session already moved to a replacement live PID, reattach immediately and
         // avoid flashing idle because a stale/wrong monitor exited.
         if let currentProcess = resolvedSessionProcessIdentity(for: sessionId),
-           currentProcess != exitedProcess, Self.isLiveProcess(currentProcess) {
+           currentProcess != exitedProcess, ProcessTable.isLiveProcess(currentProcess) {
             monitorProcess(sessionId: sessionId, process: currentProcess)
             return
         }
@@ -1044,12 +878,12 @@ final class AppState {
             guard self.exitingSessions[sessionId] == exitedProcess else { return }
 
             // A new monitor was attached during the grace period (new process took over)
-            if self.processMonitors[sessionId] != nil { return }
+            if self.processMonitor.isWatching(sessionId) { return }
 
             // Session was taken over by a different process (e.g. auto-update/restart):
             // cliPid changed to a new PID that's still alive → attach monitor, don't remove.
             if let currentProcess = self.resolvedSessionProcessIdentity(for: sessionId),
-               currentProcess != exitedProcess, Self.isLiveProcess(currentProcess) {
+               currentProcess != exitedProcess, ProcessTable.isLiveProcess(currentProcess) {
                 self.monitorProcess(sessionId: sessionId, process: currentProcess)
                 return
             }
@@ -1057,7 +891,7 @@ final class AppState {
             // Original process confirmed dead — remove regardless of lastActivity.
             // This prevents a race where an in-flight hook event (e.g. "Stop") updates
             // lastActivity after exitTime, causing the session to linger for 10+ minutes.
-            if !Self.isLiveProcess(exitedProcess) {
+            if !ProcessTable.isLiveProcess(exitedProcess) {
                 self.removeSession(sessionId)
                 return
             }
@@ -1075,8 +909,7 @@ final class AppState {
     }
 
     private func stopMonitor(_ sessionId: String) {
-        processMonitors[sessionId]?.source.cancel()
-        processMonitors.removeValue(forKey: sessionId)
+        processMonitor.stop(sessionId)
     }
 
     /// Remove a session, clean up its monitor, and resume any pending continuations.
@@ -1126,85 +959,22 @@ final class AppState {
 
     // MARK: - Compact bar mascot rotation
 
-    /// Cached sorted active session IDs — refreshed by refreshActiveIds()
-    private var cachedActiveIds: [String] = []
-
-    private func refreshActiveIds() {
-        cachedActiveIds = sessions
-            .filter { $0.value.status != .idle }
-            .sorted { a, b in
-                let pa = statusPriority(a.value.status)
-                let pb = statusPriority(b.value.status)
-                if pa != pb { return pa > pb }
-                // Same priority — most recently active first
-                return a.value.lastActivity > b.value.lastActivity
-            }
-            .map(\.key)
-    }
-
-    /// Higher = more urgent, shown first in rotation
-    private func statusPriority(_ status: AgentStatus) -> Int {
-        switch status {
-        case .waitingApproval: return 5
-        case .waitingQuestion: return 4
-        case .running:         return 3
-        case .processing:      return 2
-        case .idle:            return 0
-        }
-    }
-
     private func startRotationIfNeeded() {
-        refreshActiveIds()
-        if cachedActiveIds.count > 1 {
-            // If the most urgent session changed, snap to it immediately
-            if let top = cachedActiveIds.first, top != rotatingSessionId {
-                let topStatus = sessions[top]?.status ?? .idle
-                let currentStatus = rotatingSessionId.flatMap { sessions[$0]?.status } ?? .idle
-                if statusPriority(topStatus) > statusPriority(currentStatus) {
-                    rotatingSessionId = top
-                }
-            }
-            if rotatingSessionId == nil || !cachedActiveIds.contains(rotatingSessionId!) {
-                rotatingSessionId = cachedActiveIds.first
-            }
-            if rotationTimer == nil {
-                let interval = TimeInterval(max(1, SettingsManager.shared.rotationInterval))
-                rotationTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-                    Task { @MainActor in
-                        self?.rotateToNextSession()
-                    }
-                }
-            }
-        } else {
-            rotationTimer?.invalidate()
-            rotationTimer = nil
-            rotatingSessionId = nil
-            // When rotation stops, ensure activeSessionId points to the remaining
-            // active session (if any) so the collapsed bar doesn't stick on an idle one.
-            if let active = cachedActiveIds.first, activeSessionId != active {
-                activeSessionId = active
-            }
+        // When rotation stops, ensure activeSessionId points to the remaining
+        // active session (if any) so the collapsed bar doesn't stick on an idle one.
+        if let active = rotation.update(sessions: sessions),
+           activeSessionId != active {
+            activeSessionId = active
         }
-    }
-
-    private func rotateToNextSession() {
-        guard cachedActiveIds.count > 1 else {
-            rotatingSessionId = nil
-            return
-        }
-        if let current = rotatingSessionId, let idx = cachedActiveIds.firstIndex(of: current) {
-            rotatingSessionId = cachedActiveIds[(idx + 1) % cachedActiveIds.count]
-        } else {
-            rotatingSessionId = cachedActiveIds.first
-        }
-        ESP32StatePublisher.shared.notifyDirty()
-        AppleCompanionPublisher.shared.notifyDirty()
     }
 
     /// Start monitoring the CLI process for a session.
     /// Prefers the PID captured by the bridge (_ppid), falls back to source-aware process scans by CWD.
     private func tryMonitorSession(_ sessionId: String) {
         guard sessions[sessionId]?.isRemote != true else { return }
+        // An isolated run watches no process: the pids its hooks name are this
+        // Mac's real agents, which an orphan sweep could otherwise signal.
+        guard !RuntimeEnvironment.isIsolated else { return }
         // Codex Desktop cards are owned by NSWorkspace/app-server lifecycle. A
         // CWD lookup can only find an unrelated Codex CLI process (or the
         // shared Desktop helper), and binding either PID would remove every
@@ -1218,11 +988,11 @@ final class AppState {
             exitingSessions.removeValue(forKey: sessionId)
             return
         }
-        let currentMonitor = processMonitors[sessionId]?.process
+        let currentMonitor = processMonitor.watchedProcess(for: sessionId)
 
         // Primary: use PID from bridge (works for any CLI)
         if let sessionProcess = resolvedSessionProcessIdentity(for: sessionId),
-           Self.isLiveProcess(sessionProcess) {
+           ProcessTable.isLiveProcess(sessionProcess) {
             if backfillClaudeTerminalMetadata(sessionId: sessionId, process: sessionProcess) {
                 scheduleSave()
             }
@@ -1234,7 +1004,7 @@ final class AppState {
             return
         }
 
-        if let currentMonitor, Self.isLiveProcess(currentMonitor) {
+        if let currentMonitor, ProcessTable.isLiveProcess(currentMonitor) {
             setSessionProcessIdentity(currentMonitor, for: sessionId)
             if backfillClaudeTerminalMetadata(sessionId: sessionId, process: currentMonitor) {
                 scheduleSave()
@@ -1246,15 +1016,15 @@ final class AppState {
         guard let cwd = sessions[sessionId]?.cwd else { return }
         let source = sessions[sessionId]?.source
         Task.detached {
-            let pid = Self.findPidForCwd(cwd, source: source)
+            let pid = AgentProcessFinder.findPidForCwd(cwd, source: source)
             await MainActor.run { [weak self] in
                 guard let self = self, let pid = pid,
                       self.sessions[sessionId] != nil else { return }
-                guard let discoveredProcess = Self.liveProcessIdentity(for: pid) else { return }
+                guard let discoveredProcess = ProcessTable.liveProcessIdentity(for: pid) else { return }
 
                 let preferredProcess: ProcessIdentity
                 if let currentProcess = self.resolvedSessionProcessIdentity(for: sessionId),
-                   Self.isLiveProcess(currentProcess) {
+                   ProcessTable.isLiveProcess(currentProcess) {
                     preferredProcess = currentProcess
                 } else {
                     preferredProcess = discoveredProcess
@@ -1264,12 +1034,12 @@ final class AppState {
                 if self.backfillClaudeTerminalMetadata(sessionId: sessionId, process: preferredProcess) {
                     self.scheduleSave()
                 }
-                if let monitorProcess = self.processMonitors[sessionId]?.process,
-                   monitorProcess == preferredProcess, Self.isLiveProcess(monitorProcess) {
+                if let monitorProcess = self.processMonitor.watchedProcess(for: sessionId),
+                   monitorProcess == preferredProcess, ProcessTable.isLiveProcess(monitorProcess) {
                     return
                 }
 
-                if self.processMonitors[sessionId] != nil {
+                if self.processMonitor.isWatching(sessionId) {
                     self.stopMonitor(sessionId)
                 }
                 self.monitorProcess(sessionId: sessionId, process: preferredProcess)
@@ -1277,56 +1047,7 @@ final class AppState {
         }
     }
 
-    /// Find a CLI process PID by matching CWD, scoped to the correct source.
-    /// Never guesses across sources: a missing/unknown source returns no PID instead of
-    /// accidentally binding a session to the wrong process family.
-    private nonisolated static func findPidForCwd(_ cwd: String, source: String? = nil) -> pid_t? {
-        guard let normalizedSource = SessionSnapshot.normalizedSupportedSource(source) else { return nil }
-        let pids = findPids(forSource: normalizedSource)
-        for pid in pids {
-            if getCwd(for: pid) == cwd { return pid }
-        }
-        return nil
-    }
-
-    private nonisolated static func findPids(forSource source: String, candidatePids: [pid_t]? = nil) -> [pid_t] {
-        switch source {
-        case "claude":     return findClaudePids(candidatePids: candidatePids)
-        case "codex":      return findCodexPids(candidatePids: candidatePids)
-        case "gemini":     return findGeminiPids(candidatePids: candidatePids)
-        case "cursor":     return findCursorPids(candidatePids: candidatePids)
-        case "cursor-cli": return findCursorCliPids(candidatePids: candidatePids)
-        case "trae":       return findTraePids(candidatePids: candidatePids)
-        case "traecn":     return findTraeCNPids(candidatePids: candidatePids)
-        case "traecli":   return findTraeCliPids(candidatePids: candidatePids)
-        case "copilot":    return findCopilotPids(candidatePids: candidatePids)
-        case "qoder":      return findQoderPids(candidatePids: candidatePids)
-        case "qoder-cli":  return findQoderCliPids(candidatePids: candidatePids)
-        case "qoderwork":  return findQoderWorkPids(candidatePids: candidatePids)
-        case "droid":      return findFactoryPids(candidatePids: candidatePids)
-        case "codebuddy":  return findCodeBuddyPids(candidatePids: candidatePids)
-        case "codybuddycn": return findCodyBuddyCNPids(candidatePids: candidatePids)
-        case "stepfun":    return findStepFunPids(candidatePids: candidatePids)
-        case "opencode":   return findOpenCodePids(candidatePids: candidatePids)
-        case "mimo":       return findMimoPids(candidatePids: candidatePids)
-        case "antigravity": return findAntiGravityPids(candidatePids: candidatePids)
-        case "google-antigravity": return findGoogleAntigravityPids(candidatePids: candidatePids)
-        case "workbuddy":  return findWorkBuddyPids(candidatePids: candidatePids)
-        case "hermes":     return findHermesPids(candidatePids: candidatePids)
-        case "grok":       return findGrokPids(candidatePids: candidatePids)
-        case "qwen":       return findQwenPids(candidatePids: candidatePids)
-        case "kimi":       return findKimiPids(candidatePids: candidatePids)
-        case "pi":         return findPiPids(candidatePids: candidatePids)
-        case "cline":      return findClinePids(candidatePids: candidatePids)
-        case "zcode":      return findZcodePids(candidatePids: candidatePids)
-        case "minimax":    return findMinimaxPids(candidatePids: candidatePids)
-        default:           return []
-        }
-    }
-
-    enum CompletionStyle: String {
-        case expand, glance, off
-    }
+    typealias CompletionStyle = CodeIslandCore.CompletionStyle
 
     /// Three-way completion notification style. Migration: the pre-glance
     /// boolean `autoExpandOnCompletion` (#146) maps false → .off; anything
@@ -1343,37 +1064,36 @@ final class AppState {
         return .expand
     }
 
-    /// `turnFailed`: the turn ended on an error (StopFailure, a failed AiWork
-    /// stream or Cowork turn) — its follow-up says so.
-    func enqueueCompletion(_ sessionId: String, turnFailed: Bool = false) {
+    /// Announce a finished turn the way `AttentionPolicy` decided: the card's
+    /// ERROR mark (`turnFailed`: a StopFailure, a failed AiWork stream or
+    /// Cowork turn), the follow-up, then the completion card or the glance dot.
+    func announceCompletion(_ decision: AttentionDecision, sessionId: String) {
+        guard let completion = decision.completion else { return }
         // The session card reads ERROR until the next prompt.
-        sessions[sessionId]?.lastTurnFailed = turnFailed
-        let style = Self.completionStyle()
-        // Follow-ups only chase completions the user asked to hear about.
-        if style != .off {
+        sessions[sessionId]?.lastTurnFailed = completion.turnFailed
+        if case .trackCompletion(let turnFailed)? = decision.followUp {
             followUps.trackCompletion(sessionId: sessionId, turnFailed: turnFailed)
         }
-        switch style {
-        case .off:
+        switch completion.presentation {
+        case .statusOnly:
             // Panel stays compact — status indicators still update, but no
             // completion card pops down (#146).
             return
         case .glance:
             flashGlanceCompletionIndicator()
             return
-        case .expand:
-            break
-        }
+        case .card:
+            // Don't queue duplicates
+            if completionQueue.contains(sessionId) || justCompletedSessionId == sessionId { return }
 
-        // Don't queue duplicates
-        if completionQueue.contains(sessionId) || justCompletedSessionId == sessionId { return }
-
-        if isShowingCompletion || isShowingInteractive {
-            // Already showing one — queue this for later
-            completionQueue.append(sessionId)
-        } else {
-            // Show immediately
-            showCompletion(sessionId)
+            // Already showing one, or one is on its way out of the queue —
+            // queue this for later
+            if isShowingCompletion || isShowingInteractive || queuedCompletionLookingAtTab != nil {
+                completionQueue.append(sessionId)
+            } else {
+                // Show immediately
+                showCompletion(sessionId)
+            }
         }
     }
 
@@ -1485,11 +1205,6 @@ final class AppState {
         }
     }
 
-    /// Fast app-level suppress check (main-thread safe, no blocking).
-    private func shouldSuppressAppLevel(for sessionId: String) -> Bool {
-        !shouldAutoOpenPendingSurface(for: sessionId)
-    }
-
     /// Notification kinds that describe the *account*, not the conversation.
     /// CodeBuddy's documented `notification_type` set is `permission_prompt`,
     /// `idle_prompt`, `auth_success`; only the last is boot-time auth chatter,
@@ -1578,6 +1293,12 @@ final class AppState {
         )
     }
 
+    /// Fast app-level suppress check (main-thread safe, no blocking): Smart
+    /// Suppress is on and the session's own terminal is in front.
+    private func shouldSuppressAppLevel(for sessionId: String) -> Bool {
+        !shouldAutoOpenPendingSurface(for: sessionId)
+    }
+
     private func showCompletion(_ sessionId: String) {
         // Fast path: terminal not even frontmost — show immediately
         guard shouldSuppressAppLevel(for: sessionId) else {
@@ -1626,6 +1347,7 @@ final class AppState {
     func cancelCompletionQueue() {
         autoCollapseTask?.cancel()
         completionQueue.removeAll()
+        queuedCompletionLookingAtTab = nil
         deferCollapseOnMouseLeave = false
     }
 
@@ -1734,13 +1456,71 @@ final class AppState {
 
         guard SessionTitleStore.supports(provider: session.source) else { return }
 
-        if let resolved = SessionTitleStore.title(for: lookupSessionId, provider: session.source, cwd: session.cwd) {
-            sessions[trackedSessionId]?.sessionTitle = resolved.title
-            sessions[trackedSessionId]?.sessionTitleSource = resolved.source
-        } else {
-            sessions[trackedSessionId]?.sessionTitle = nil
-            sessions[trackedSessionId]?.sessionTitleSource = nil
+        readProviderTitle(
+            ProviderTitleLookup(sessionId: lookupSessionId, provider: session.source, cwd: session.cwd),
+            for: trackedSessionId
+        )
+    }
+
+    /// A card's title read in flight, and the newest lookup asked for while
+    /// it ran.
+    private struct ProviderTitleRead {
+        var next: ProviderTitleLookup?
+    }
+
+    @ObservationIgnored
+    private var providerTitleReads: [String: ProviderTitleRead] = [:]
+    /// Per card, bumped when a title arrives from elsewhere (Codex's
+    /// `thread/started`): a store read started before then is stale.
+    @ObservationIgnored
+    private var providerTitleGenerations: [String: Int] = [:]
+
+    /// Look a card's title up in its provider's store, off the main actor:
+    /// every Claude and Codex hook asks, and the lookup reads a file (Codex's
+    /// whole thread index, the head and tail of a Claude transcript). One read
+    /// per card at a time. What a read finds is applied when it lands (unless
+    /// a newer title came from elsewhere meanwhile), then the newest lookup
+    /// asked for during it runs.
+    private func readProviderTitle(_ lookup: ProviderTitleLookup, for cardId: String) {
+        if providerTitleReads[cardId] != nil {
+            providerTitleReads[cardId]?.next = lookup
+            return
         }
+        providerTitleReads[cardId] = ProviderTitleRead()
+        let generation = providerTitleGenerations[cardId, default: 0]
+        let read = storeReaders.title
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let resolved = read(lookup)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                let next = self.providerTitleReads.removeValue(forKey: cardId)?.next
+                if self.providerTitleGenerations[cardId, default: 0] == generation {
+                    self.applyProviderTitle(resolved, to: cardId)
+                }
+                if let next {
+                    self.readProviderTitle(next, for: cardId)
+                }
+            }
+        }
+    }
+
+    /// A title the store has replaces the card's. A store with none says
+    /// nothing: the card keeps a title a hook (`session_title`), Codex
+    /// (`thread/started`) or Agent Sub-Sessions (a child's nickname) gave it.
+    private func applyProviderTitle(_ resolved: ResolvedSessionTitle?, to cardId: String) {
+        guard let resolved, let session = sessions[cardId],
+              session.sessionTitle != resolved.title
+                || session.sessionTitleSource != resolved.source else { return }
+        sessions[cardId]?.sessionTitle = resolved.title
+        sessions[cardId]?.sessionTitleSource = resolved.source
+        scheduleSave()
+        refreshDerivedState()
+    }
+
+    /// The card just got a title from Codex itself, newer than anything a
+    /// store read in flight for it can find: those reads are dropped.
+    func invalidateProviderTitleReads(for cardId: String) {
+        providerTitleGenerations[cardId, default: 0] += 1
     }
 
     func handleEvent(_ event: HookEvent) {
@@ -1760,7 +1540,7 @@ final class AppState {
         let source = event.rawJSON["_source"] as? String
         let hasTranscriptPath = (event.rawJSON["transcript_path"] as? String)
             .map { !$0.isEmpty } ?? false
-        if Self.isCodexPlaceholderHook(
+        if CodexDiscovery.isCodexPlaceholderHook(
             source: source,
             cwd: event.rawJSON["cwd"] as? String,
             hasTranscriptPath: hasTranscriptPath
@@ -1827,12 +1607,15 @@ final class AppState {
         cachePreToolUseIfApplicable(event)
         resolveToolUseIfCompleted(event)
         // #216: permission requests with no correlatable tool_use_id can't be drained by
-        // resolveToolUseIfCompleted. A follow-up activity event means the user already
-        // approved in the terminal — resume those (and only those) as approved.
+        // resolveToolUseIfCompleted. A later step of the agent that asked means it was
+        // answered in the terminal: its card goes, answered with no decision — never allow.
         resolveOrphanPermissionsOnActivity(event)
 
-        let effects = reduceEvent(sessions: &sessions, event: event, maxHistory: maxHistory,
-                                  replyCompletePlaceholder: L10n.shared["reply_complete_placeholder"])
+        let reduction = reduceHookEvent(sessions: &sessions, event: event, maxHistory: maxHistory,
+                                        replyCompletePlaceholder: L10n.shared["reply_complete_placeholder"])
+        // Whose turn this was is read off the session as the event left it,
+        // before the Cursor fold below can rebrand, fold or drop the card.
+        let attentionSubject = AttentionSubject(sessions[sessionId])
 
         // Cursor Agent Tasks often fire Claude-format hooks without `--source`,
         // leaving ghost Claude cards. Rebrand + fold before the rest of the
@@ -1906,18 +1689,35 @@ final class AppState {
         if let source = event.rawJSON["_source"] as? String,
            (source == "cursor" || source == "cursor-cli"),
            sessions[sessionId]?.isYoloMode == nil {
-            sessions[sessionId]?.isYoloMode = Self.detectCursorYoloMode()
+            readCursorYoloMode(for: sessionId)
         }
 
-        pushAfterReduce(event, sessionId: sessionId, effects: effects)
-        // The normalizer folds StopFailure onto Stop; only the raw name says
-        // the turn died (same rule as its sound).
-        let turnFailed = EventSoundRouting.soundEvent(
-            rawEventName: event.eventName, normalizedEventName: normalizedEventName
-        ) == EventSoundRouting.turnFailed
-        for effect in effects {
-            executeEffect(effect, sessionId: sessionId, turnFailed: turnFailed)
+        // Now that the event has settled: does the user hear about it, and
+        // how. One decision, carried out in the order the outlets always ran
+        // in — the push, the completion, then the sound.
+        //
+        // A card the Cursor fold above just moved into its parent's (or
+        // dropped) was a Task's: its turn is its parent's business, like a
+        // child's — no chime, no completion card for a card that is gone, no
+        // push as the user's own turn, nothing to follow up.
+        var subject = attentionSubject
+        if sessions[sessionId] == nil {
+            subject.isChild = true
         }
+        let attention = decideAttention(.hookEvent(reduction.facts), sessionId: sessionId, subject: subject)
+        if let push = attention.push {
+            pushTurnEnded(
+                push,
+                sessionId: sessionId,
+                errorType: reduction.facts.turnError?.type,
+                errorDetail: reduction.facts.turnError?.detail
+            )
+        }
+        announceCompletion(attention, sessionId: sessionId)
+        for effect in reduction.effects {
+            executeEffect(effect, sessionId: sessionId)
+        }
+        playAttentionSound(attention, sessionId: sessionId)
 
         if normalizedEventName == "SessionStart" {
             retireGrokSessionsSuperseded(bySessionStartOf: sessionId)
@@ -1938,9 +1738,16 @@ final class AppState {
         // Handle the "else if activeSessionId == sessionId → mostActive" edge case
         // (reducer can't check activeSessionId since it's AppState-local)
         if sessions[sessionId]?.status == .idle && activeSessionId == sessionId {
-            // A Stop keeps its session up for the completion card. A child's
-            // Stop pops none (#378), so it hands the spot on like any event.
-            if normalizedEventName != "Stop" || sessions[sessionId]?.parentSessionId != nil {
+            // A Stop keeps its session up for the completion card it pops. A
+            // turn end that pops none — a child's (#378), a gateway chat's
+            // (#364), one the completion style keeps to the glance dot or to
+            // nothing — hands the spot on like any event; so does a child's
+            // Stop that ended no turn.
+            let poppedCard: Bool
+            if case .card? = attention.completion?.presentation { poppedCard = true } else { poppedCard = false }
+            let keepsSpot = normalizedEventName == "Stop"
+                && (reduction.facts.endedTurn ? poppedCard : !subject.isChild)
+            if !keepsSpot {
                 activeSessionId = mostActiveSessionId()
             }
         }
@@ -1989,7 +1796,7 @@ final class AppState {
         guard let started = sessions[sessionId],
               started.source == "grok",
               let pid = started.cliPid else { return }
-        supersededGrokSessions = supersededGrokSessions.filter { Self.isLiveProcess($0.value) }
+        supersededGrokSessions = supersededGrokSessions.filter { ProcessTable.isLiveProcess($0.value) }
 
         let superseded = sessions.compactMap { key, candidate -> String? in
             guard Self.isGrokSessionSupersededBySessionStart(
@@ -2006,7 +1813,7 @@ final class AppState {
         }
         guard !superseded.isEmpty else { return }
 
-        let process = Self.liveProcessIdentity(for: pid) ?? ProcessIdentity(pid: pid, startTime: nil)
+        let process = ProcessTable.liveProcessIdentity(for: pid) ?? ProcessIdentity(pid: pid, startTime: nil)
         for key in superseded {
             log.info("retiring superseded grok session=\(key, privacy: .public) pid=\(pid, privacy: .public) new=\(sessionId, privacy: .public)")
             supersededGrokSessions[key] = process
@@ -2024,7 +1831,7 @@ final class AppState {
         guard let process = supersededGrokSessions[sessionId] else { return false }
         if normalizedEventName == "SessionStart"
             || normalizedEventName == "UserPromptSubmit"
-            || !Self.isLiveProcess(process) {
+            || !ProcessTable.isLiveProcess(process) {
             supersededGrokSessions.removeValue(forKey: sessionId)
             return false
         }
@@ -2033,7 +1840,7 @@ final class AppState {
 
     private func isSupersededGrokDiscovery(_ info: DiscoveredSession) -> Bool {
         guard let process = supersededGrokSessions[info.sessionId] else { return false }
-        if Self.isLiveProcess(process) { return true }
+        if ProcessTable.isLiveProcess(process) { return true }
         supersededGrokSessions.removeValue(forKey: info.sessionId)
         return false
     }
@@ -2048,39 +1855,80 @@ final class AppState {
         refreshDerivedState()
     }
 
-    private func executeEffect(_ effect: SideEffect, sessionId: String, turnFailed: Bool = false) {
+    private func executeEffect(_ effect: SideEffect, sessionId: String) {
         switch effect {
-        case .playSound(let eventName):
-            SoundManager.shared.handleEvent(eventName, sessionId: sessionId)
         case .tryMonitorSession(let sid):
             tryMonitorSession(sid)
         case .stopMonitor(let sid):
             stopMonitor(sid)
         case .removeSession(let sid):
             removeSession(sid)
-        case .enqueueCompletion(let sid):
-            enqueueCompletion(sid, turnFailed: turnFailed)
         case .setActiveSession(let sid):
             activeSessionId = sid
+        case .playSound, .enqueueCompletion:
+            // Attention is AttentionPolicy's to decide; `reduceHookEvent`
+            // never emits these (only the `reduceEvent` composition does).
+            assertionFailure("\(effect) reached executeEffect: attention goes through AttentionPolicy")
         }
     }
 
+    /// The read walks the card's transcript or session store (a Codex
+    /// rollout search, OpenCode's database), so it runs off the main actor,
+    /// one at a time per card. A model a hook supplies meanwhile wins.
     private func maybeBackfillModel(for sessionId: String) {
-        guard let session = sessions[sessionId], session.model == nil else { return }
+        // A remote session's store and transcript are on its own host.
+        guard let session = sessions[sessionId], !session.isRemote, session.model == nil else { return }
         let now = Date()
         if let retryAt = modelReadRetryAt[sessionId], retryAt > now {
             return
         }
+        guard modelReadsInFlight.insert(sessionId).inserted else { return }
 
-        if let model = Self.readModelForSession(sessionId: sessionId, session: session) {
-            sessions[sessionId]?.model = model
-            modelReadRetryAt.removeValue(forKey: sessionId)
-        } else {
-            modelReadRetryAt[sessionId] = now.addingTimeInterval(5)
+        let read = storeReaders.model
+        Task.detached(priority: .utility) { [weak self] in
+            let model = read(sessionId, session)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.modelReadsInFlight.remove(sessionId)
+                guard self.sessions[sessionId] != nil else { return }
+                if let model {
+                    if self.sessions[sessionId]?.model == nil {
+                        self.sessions[sessionId]?.model = model
+                        self.scheduleSave()
+                        self.refreshDerivedState()
+                    }
+                    self.modelReadRetryAt.removeValue(forKey: sessionId)
+                } else {
+                    self.modelReadRetryAt[sessionId] = now.addingTimeInterval(5)
+                }
+            }
         }
     }
 
-    func handlePermissionRequest(_ event: HookEvent, continuation: CheckedContinuation<Data, Never>) {
+    /// Read Cursor's settings for the card's YOLO badge, off the main actor;
+    /// once per card (nil = unchecked).
+    private func readCursorYoloMode(for sessionId: String) {
+        guard let session = sessions[sessionId], session.isYoloMode == nil,
+              cursorYoloReadsInFlight.insert(sessionId).inserted else { return }
+        let read = storeReaders.cursorYoloMode
+        Task.detached(priority: .utility) { [weak self] in
+            let yolo = read()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.cursorYoloReadsInFlight.remove(sessionId)
+                guard self.sessions[sessionId] != nil, self.sessions[sessionId]?.isYoloMode == nil else { return }
+                self.sessions[sessionId]?.isYoloMode = yolo
+                self.scheduleSave()
+                self.refreshDerivedState()
+            }
+        }
+    }
+
+    func handlePermissionRequest(
+        _ event: HookEvent,
+        continuation: CheckedContinuation<Data, Never>,
+        hookConnectionId: UUID? = nil
+    ) {
         let sessionId = event.sessionId ?? "default"
         if sessions[sessionId] == nil {
             sessions[sessionId] = SessionSnapshot()
@@ -2096,12 +1944,25 @@ final class AppState {
         tryMonitorSession(sessionId)
 
         // Closed Task/subagent ids must not surface new permission UI (parity with
-        // ensureSubagent refusing late tool hooks after Stop).
+        // ensureSubagent refusing late tool hooks after Stop). Nor is the request
+        // decided: the SubagentStop that closed the id says nothing of what the
+        // user would choose — it may have overtaken a request still waiting, and
+        // whoever can send a hook can send it — so the agent asks in its own prompt.
         if shouldSuppressClosedSubagentUI(sessionId: sessionId, agentId: event.agentId) {
-            let denyResponse = Data(
-                #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8
-            )
-            continuation.resume(returning: denyResponse)
+            continuation.resume(returning: Self.noDecisionAnswer)
+            return
+        }
+
+        // "Always allow … this session" on a Codex card that saved no rule
+        // (approvePermission) — a remote Codex's, or a request no rule can
+        // describe: nothing in Codex remembers it, so it is answered here,
+        // for every request of the tool, as the card said.
+        if let toolName = event.toolName,
+           CodexPermissionRules.isCodexEvent(event),
+           sessions[sessionId]?.alwaysAllowedTools.contains(toolName) == true {
+            continuation.resume(returning: Data(
+                #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#.utf8
+            ))
             return
         }
 
@@ -2113,11 +1974,13 @@ final class AppState {
         sessions[sessionId]?.currentTool = event.activityLabel
         sessions[sessionId]?.toolDescription = event.toolDescription
         sessions[sessionId]?.lastActivity = Date()
-        markMergedSubagentWaiting(sessionId: sessionId, agentId: event.agentId, status: .waitingApproval)
+        markMergedSubagentWaiting(sessionId: sessionId, event: event, status: .waitingApproval)
         // Backfill tool name/description from cached PreToolUse when the payload is thin.
         enrichPermissionRequestFromCache(sessionId: sessionId, event: event)
+        // The tool now up is this request's: its own PostToolUse takes it down.
+        sessions[sessionId]?.currentToolUseId = event.toolUseId
 
-        let request = PermissionRequest(event: event, continuation: continuation)
+        let request = PermissionRequest(event: event, continuation: continuation, hookConnectionId: hookConnectionId)
 
         // Replay deduplication: if the same tool_use_id is already queued, swap the
         // continuation in place and deny the previous waiter. Preserves card order.
@@ -2174,7 +2037,8 @@ final class AppState {
         // already in progress.
         let burstAlreadyInProgress = nextVisiblePermissionIndex() != nil
         permissionQueue.append(request)
-        pushPermissionQueued(event, sessionId: sessionId, smartSuppressed: !shouldAutoOpenPendingSurface(for: sessionId))
+        let attention = decideAttention(.approvalQueued(firstOfBurst: !burstAlreadyInProgress), sessionId: sessionId)
+        pushPermissionQueued(event, sessionId: sessionId, push: attention.push)
 
         // Show UI only when no approval card is already up to be stolen from.
         // showNextPending picks the first *visible* request, promotes it to the
@@ -2184,9 +2048,7 @@ final class AppState {
         if !approvalCardOnScreen {
             showNextPending()
         }
-        if !burstAlreadyInProgress {
-            SoundManager.shared.handleEvent("PermissionRequest")
-        }
+        playAttentionSound(attention, sessionId: sessionId)
         refreshDerivedState()
     }
 
@@ -2242,7 +2104,16 @@ final class AppState {
         }
         let responseData: Data
         if always, CodexPermissionRules.isCodexEvent(pending.event) {
-            _ = CodexPermissionRules().persistAlwaysAllowRule(for: pending.event)
+            if CodexPermissionRules.alwaysSavesRule(for: pending.event) {
+                _ = CodexPermissionRules().persistAlwaysAllowRule(for: pending.event)
+            } else if let toolName = pending.event.toolName, !toolName.isEmpty {
+                // A remote Codex reads its rules on its own host, and none
+                // may be written to this Mac's; and a local request no rule
+                // can describe has none to save. "Always" holds for this
+                // session instead — what the card said — and the island
+                // answers the session's next requests for the tool.
+                sessions[sessionId]?.alwaysAllowedTools.insert(toolName)
+            }
             let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
             responseData = Data(response.utf8)
         } else if always, Self.isZcodeEvent(pending.event) {
@@ -2402,58 +2273,8 @@ final class AppState {
         answerQuestion(answer, expectedSessionId: expectedSessionId)
     }
 
-    /// Find an existing session whose source matches and whose CLI PID equals
-    /// the supplied ppid. Used by HookServer to merge plugin-proxied events
-    /// (e.g. omo) into their main session when pluginSessionMode == "merge". (#123)
-    ///
-    /// We additionally require the candidate session to have been active in
-    /// the last 5 minutes. This guards against macOS PID reuse — a stale
-    /// session whose CLI long since exited could otherwise still match the
-    /// plugin event's `_ppid` if the OS recycled that PID for an unrelated
-    /// process. Live sessions update `lastActivity` on every event so the
-    /// window is generous; stale ones get skipped. (#123 review)
-    func findSessionId(
-        forSource source: String,
-        ppid: Int,
-        excluding excludedSessionId: String? = nil,
-        requireActive: Bool = false
-    ) -> String? {
-        let normalized = SessionSnapshot.normalizedSupportedSource(source)
-        let cutoff = Date().addingTimeInterval(-300)
-        return sessions
-            .filter { sessionId, snap in
-                let snapSource = SessionSnapshot.normalizedSupportedSource(snap.source)
-                return snapSource == normalized
-                    && snap.cliPid == pid_t(ppid)
-                    && snap.lastActivity >= cutoff
-                    && sessionId != excludedSessionId
-                    && (!requireActive || snap.status != .idle)
-            }
-            .sorted { lhs, rhs in
-                let lhsActive = lhs.value.status != .idle
-                let rhsActive = rhs.value.status != .idle
-                if lhsActive != rhsActive { return lhsActive }
-                return lhs.value.startTime < rhs.value.startTime
-            }
-            .first?.key
-    }
-
-    /// The card a subagent with this id is folded into, if any.
-    func sessionId(hostingSubagent agentId: String) -> String? {
-        sessions.first { $0.value.subagents[agentId] != nil }?.key
-    }
-
     func findSessionId(providerSessionId: String) -> String? {
-        if sessions[providerSessionId] != nil {
-            return providerSessionId
-        }
-        let codexAppId = AppState.codexAppSessionPrefix + providerSessionId
-        if sessions[codexAppId] != nil {
-            return codexAppId
-        }
-        return sessions.first(where: { _, snap in
-            snap.providerSessionId == providerSessionId
-        })?.key
+        SubsessionCards.cardId(forProviderSessionId: providerSessionId, in: sessions)
     }
 
     /// Resolve a Codex parent in the same Desktop/CLI namespace as its child.
@@ -2463,20 +2284,16 @@ final class AppState {
         providerSessionId: String,
         childTermBundleId: String?
     ) -> String? {
-        let childIsDesktop = childTermBundleId == Self.codexAppBundleId
-        let canonicalId = childIsDesktop
-            ? Self.codexAppSessionPrefix + providerSessionId
-            : providerSessionId
-        if let session = sessions[canonicalId],
-           session.source == "codex",
-           session.isNativeAppMode == childIsDesktop {
-            return canonicalId
-        }
-        return sessions.first(where: { _, snapshot in
-            snapshot.source == "codex"
-                && snapshot.providerSessionId == providerSessionId
-                && snapshot.isNativeAppMode == childIsDesktop
-        })?.key
+        SubsessionCards.codexParentCard(
+            threadId: providerSessionId,
+            childTermBundleId: childTermBundleId,
+            in: sessions
+        )
+    }
+
+    /// What Agent Sub-Sessions needs from the island to route one hook.
+    var subsessionContext: AppSubsessionContext {
+        AppSubsessionContext(cards: sessions, codexRollouts: codexRollouts)
     }
 
     /// `feedback` rides along as the deny's message — how a reviewed plan is
@@ -2533,7 +2350,11 @@ final class AppState {
         refreshDerivedState()
     }
 
-    func handleQuestion(_ event: HookEvent, continuation: CheckedContinuation<Data, Never>) {
+    func handleQuestion(
+        _ event: HookEvent,
+        continuation: CheckedContinuation<Data, Never>,
+        hookConnectionId: UUID? = nil
+    ) {
         let sessionId = event.sessionId ?? "default"
         if sessions[sessionId] == nil {
             sessions[sessionId] = SessionSnapshot()
@@ -2558,28 +2379,39 @@ final class AppState {
 
         sessions[sessionId]?.status = .waitingQuestion
         sessions[sessionId]?.lastActivity = Date()
-        markMergedSubagentWaiting(sessionId: sessionId, agentId: event.agentId, status: .waitingQuestion)
+        markMergedSubagentWaiting(sessionId: sessionId, event: event, status: .waitingQuestion)
 
-        let request = QuestionRequest(event: event, question: question, continuation: continuation)
+        let request = QuestionRequest(
+            event: event,
+            question: question,
+            continuation: continuation,
+            hookConnectionId: hookConnectionId
+        )
         questionQueue.append(request)
-        pushQuestionQueued(request, sessionId: sessionId, smartSuppressed: !shouldAutoOpenPendingSurface(for: sessionId))
-
         // First of a burst: nothing else visibly waiting. Not `count == 1` —
         // a closed question stays queued, and must not swallow every later
         // question's card and sound (the trap #309 fixed for approvals).
-        if nextVisibleQuestion?.id == request.id {
+        let firstOfBurst = nextVisibleQuestion?.id == request.id
+        let attention = decideAttention(.questionQueued(firstOfBurst: firstOfBurst), sessionId: sessionId)
+        pushQuestionQueued(request, sessionId: sessionId, push: attention.push)
+
+        if firstOfBurst {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion(), shouldAutoOpenPendingSurface(for: sessionId) {
                 withAnimation(NotchAnimation.open) {
                     surface = .questionCard(sessionId: sessionId)
                 }
             }
-            SoundManager.shared.handleEvent("PermissionRequest")
         }
+        playAttentionSound(attention, sessionId: sessionId)
         refreshDerivedState()
     }
 
-    func handleAskUserQuestion(_ event: HookEvent, continuation: CheckedContinuation<Data, Never>) {
+    func handleAskUserQuestion(
+        _ event: HookEvent,
+        continuation: CheckedContinuation<Data, Never>,
+        hookConnectionId: UUID? = nil
+    ) {
         let sessionId = event.sessionId ?? "default"
         if sessions[sessionId] == nil {
             sessions[sessionId] = SessionSnapshot()
@@ -2591,11 +2423,9 @@ final class AppState {
         }
         tryMonitorSession(sessionId)
 
+        // As for a closed subagent's permission request: no card, no decision.
         if shouldSuppressClosedSubagentUI(sessionId: sessionId, agentId: event.agentId) {
-            let denyResponse = Data(
-                #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8
-            )
-            continuation.resume(returning: denyResponse)
+            continuation.resume(returning: Self.noDecisionAnswer)
             return
         }
 
@@ -2680,7 +2510,7 @@ final class AppState {
 
         sessions[sessionId]?.status = .waitingQuestion
         sessions[sessionId]?.lastActivity = Date()
-        markMergedSubagentWaiting(sessionId: sessionId, agentId: event.agentId, status: .waitingQuestion)
+        markMergedSubagentWaiting(sessionId: sessionId, event: event, status: .waitingQuestion)
 
         let askState = AskUserQuestionState(items: askItems, answers: [:])
         let request = QuestionRequest(
@@ -2688,31 +2518,31 @@ final class AppState {
             question: askItems[0].payload,
             continuation: continuation,
             isFromPermission: true,
-            askUserQuestionState: askState
+            askUserQuestionState: askState,
+            hookConnectionId: hookConnectionId
         )
         questionQueue.append(request)
+        // First of a burst, as in `handleQuestion`.
+        let firstOfBurst = nextVisibleQuestion?.id == request.id
         // Smart Suppress alone: whether the island opens the card by itself
         // (the "auto-expand on question" switch) says nothing about whether
         // the person is looking at the question in their terminal.
-        pushQuestionQueued(
-            request,
+        let attention = decideAttention(
+            .questionQueued(firstOfBurst: firstOfBurst),
             sessionId: sessionId,
-            smartSuppressed: !shouldAutoOpenPendingSurface(
-                for: sessionId,
-                isTerminalFrontmost: questionTerminalFrontmostDetector
-            )
+            terminalFrontmost: questionTerminalFrontmostDetector
         )
+        pushQuestionQueued(request, sessionId: sessionId, push: attention.push)
 
-        // First of a burst, as in `handleQuestion`.
-        if nextVisibleQuestion?.id == request.id {
+        if firstOfBurst {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion(), shouldAutoOpenQuestionSurface(for: event) {
                 withAnimation(NotchAnimation.open) {
                     surface = .questionCard(sessionId: sessionId)
                 }
             }
-            SoundManager.shared.handleEvent("PermissionRequest")
         }
+        playAttentionSound(attention, sessionId: sessionId)
         refreshDerivedState()
     }
 
@@ -3003,27 +2833,32 @@ final class AppState {
         refreshDerivedState()
     }
 
-    /// Drain queued permissions for a specific session, resuming their continuations with deny.
-    /// `matches` narrows the drain by the request's event — background subagents share the
-    /// parent's session_id, so callers reacting to one agent pass an agent_id filter.
+    /// Drain queued permissions for a specific session, answering each with no
+    /// decision (``noDecisionAnswer``). The session ending, or its agent asking
+    /// something else, says nothing of what the user would choose — and on a
+    /// host whose agents run as other users, any of them can send the
+    /// SessionEnd: a drain must not decide someone else's request, deny
+    /// included. `matches` narrows the drain by the request's event —
+    /// background subagents share the parent's session_id, so callers reacting
+    /// to one agent pass an agent_id filter.
     private func drainPermissions(
         forSession sessionId: String,
         reason: String = "unknown",
         where matches: (HookEvent) -> Bool = { _ in true }
     ) {
         dismissedPermissionSessionIds.remove(sessionId)
-        let denyResponse = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8)
         permissionQueue.removeAll { item in
             guard item.event.sessionId == sessionId, matches(item.event) else { return false }
-            log.notice("⚠️ permission deny reason=drainPermissions(\(reason, privacy: .public)) session=\(sessionId, privacy: .public) toolUseId=\(item.toolUseId ?? "nil", privacy: .public) tool=\(item.event.toolName ?? "nil", privacy: .public)")
-            item.continuation.resume(returning: denyResponse)
+            log.notice("⚠️ permission dropped, no decision reason=drainPermissions(\(reason, privacy: .public)) session=\(sessionId, privacy: .public) toolUseId=\(item.toolUseId ?? "nil", privacy: .public) tool=\(item.event.toolName ?? "nil", privacy: .public)")
+            item.continuation.resume(returning: Self.noDecisionAnswer)
             return true
         }
     }
 
-    /// Called when the bridge socket disconnects — the question/permission was answered externally (e.g. user replied in terminal).
-    /// Only the disconnecting agent's requests are drained: the socket belonged to one agent,
-    /// and another agent's request in the same session is still waiting on the user.
+    /// Drains every pending request of one agent in a session, as if all its
+    /// hooks had gone at once; another agent's request in the same session
+    /// stays. A single hook that goes takes only its own request
+    /// (``handleHookGone(connectionId:)``).
     func handlePeerDisconnect(sessionId: String, agentId: String? = nil) {
         let sameAgent: (HookEvent) -> Bool = { $0.sessionId == sessionId && $0.agentId == agentId }
         let hadPending = questionQueue.contains(where: { sameAgent($0.event) })
@@ -3032,6 +2867,49 @@ final class AppState {
 
         drainQuestions(forSession: sessionId, reason: "peer-disconnect", where: sameAgent)
         drainPermissions(forSession: sessionId, reason: "peer-disconnect", where: sameAgent)
+        settleAfterWaitEnded(sessionId: sessionId)
+    }
+
+    /// A held request's hook is gone — killed, or its agent answered in the
+    /// terminal (``HookServer``). The request that hook waited on goes, and
+    /// only that one: its session's other requests — a parallel tool call's,
+    /// a subagent's — each have a hook of their own still waiting on the
+    /// user, and stay answerable.
+    func handleHookGone(connectionId: UUID) {
+        let sessionId: String
+        if let index = permissionQueue.firstIndex(where: { $0.hookConnectionId == connectionId }) {
+            let pending = permissionQueue.remove(at: index)
+            sessionId = pending.event.sessionId ?? "default"
+            log.notice("⚠️ permission deny reason=hookGone session=\(sessionId, privacy: .public) toolUseId=\(pending.toolUseId ?? "nil", privacy: .public) tool=\(pending.event.toolName ?? "nil", privacy: .public)")
+            // Nobody reads it, but the continuation must not leak.
+            pending.continuation.resume(returning: Data(
+                #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8
+            ))
+            // A dismissal goes with the last of the session's requests; the
+            // rest stay as the user left them.
+            if !permissionQueue.contains(where: { ($0.event.sessionId ?? "default") == sessionId }) {
+                dismissedPermissionSessionIds.remove(sessionId)
+            }
+        } else if let index = questionQueue.firstIndex(where: { $0.hookConnectionId == connectionId }) {
+            let pending = questionQueue.remove(at: index)
+            sessionId = pending.event.sessionId ?? "default"
+            if pending.isFromPermission {
+                log.notice("⚠️ permission deny reason=hookGone session=\(sessionId, privacy: .public) tool=AskUserQuestion")
+                pending.resolution.resumeHook(returning: Data(
+                    #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8
+                ))
+            } else {
+                pending.resolution.resumeHook(returning: Data("{}".utf8))
+            }
+        } else {
+            return  // answered already, or never queued
+        }
+        settleAfterWaitEnded(sessionId: sessionId)
+    }
+
+    /// After a disconnect took requests of `sessionId`: a session that was
+    /// waiting waits on what is still queued for it, else goes back to work.
+    private func settleAfterWaitEnded(sessionId: String) {
         let currentStatus = sessions[sessionId]?.status
         let wasWaiting = currentStatus == .waitingApproval || currentStatus == .waitingQuestion
         if wasWaiting, permissionQueue.contains(where: { $0.event.sessionId == sessionId }) {
@@ -3047,8 +2925,11 @@ final class AppState {
         refreshDerivedState()
     }
 
-    /// Drain all queued questions for a specific session.
-    /// AskUserQuestion-derived requests are denied; notification questions return empty.
+    /// Drain all queued questions for a specific session, deciding none: an
+    /// AskUserQuestion-derived request gets no decision (its agent asks in its
+    /// own prompt, as ``drainPermissions`` leaves a permission), a
+    /// notification question returns empty, and a Codex app-server request is
+    /// abandoned.
     private func drainQuestions(
         forSession sessionId: String,
         reason: String = "unknown",
@@ -3060,10 +2941,8 @@ final class AppState {
                 // Abandon the Codex app-server request so the server stops waiting.
                 item.resolveCodexAppServer(nil)
             } else if item.isFromPermission {
-                log.notice("⚠️ permission deny reason=drainQuestions(\(reason, privacy: .public)) session=\(sessionId, privacy: .public) tool=AskUserQuestion")
-                let denyData = Data(
-                    #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8)
-                item.resolution.resumeHook(returning: denyData)
+                log.notice("⚠️ permission dropped, no decision reason=drainQuestions(\(reason, privacy: .public)) session=\(sessionId, privacy: .public) tool=AskUserQuestion")
+                item.resolution.resumeHook(returning: Self.noDecisionAnswer)
             } else {
                 item.resolution.resumeHook(returning: Data("{}".utf8))
             }
@@ -3173,347 +3052,72 @@ final class AppState {
         return false
     }
 
-    /// Show the oldest queued completion whose session still exists.
+    /// Show the oldest queued completion whose session still exists, held to
+    /// Smart Suppress as a card shown at once is: with its terminal in front,
+    /// its tab is looked at off the main thread first, and a card whose own
+    /// tab is showing stays down while the queue moves on.
+    ///
+    /// Returns whether a card is on screen or on its way there, so callers
+    /// neither fold the island nor take another card out of the queue.
     private func showNextQueuedCompletion() -> Bool {
+        if queuedCompletionLookingAtTab != nil { return true }
         while let next = completionQueue.first {
             completionQueue.removeFirst()
-            if sessions[next] != nil {
+            guard let session = sessions[next] else { continue }
+            guard shouldSuppressAppLevel(for: next) else {
                 withAnimation(NotchAnimation.pop) { doShowCompletion(next) }
                 return true
             }
+            queuedCompletionLookingAtTab = next
+            let sessionCopy = session
+            Task.detached {
+                let tabVisible = TerminalVisibilityDetector.isSessionTabVisible(sessionCopy)
+                await MainActor.run { [weak self] in
+                    self?.finishLookingAtQueuedCompletionTab(next, tabVisible: tabVisible)
+                }
+            }
+            return true
         }
         return false
+    }
+
+    /// The tab of the queued completion on its way came back: pop its card,
+    /// or move on with the queue.
+    private func finishLookingAtQueuedCompletionTab(_ sessionId: String, tabVisible: Bool) {
+        // The queue was cancelled meanwhile.
+        guard queuedCompletionLookingAtTab == sessionId else { return }
+        queuedCompletionLookingAtTab = nil
+        switch surface {
+        case .approvalCard, .questionCard:
+            // An approval or question took the island meanwhile: the card
+            // waits behind it again, first in line.
+            if sessions[sessionId] != nil { completionQueue.insert(sessionId, at: 0) }
+        case .sessionList:
+            // The user opened the session list, which shows this finished
+            // turn as well: no card over it.
+            break
+        case .collapsed, .completionCard:
+            if sessions[sessionId] != nil, !tabVisible {
+                withAnimation(NotchAnimation.pop) { doShowCompletion(sessionId) }
+            } else if case .completionCard = surface {
+                // Its own tab is in front (or it is gone): the card whose time
+                // ran out moves on to the next one, or folds.
+                showNextCompletionOrCollapse()
+            } else {
+                _ = showNextQueuedCompletion()
+            }
+        }
     }
 
     /// Find the most recently active non-idle session
     private func mostActiveSessionId() -> String? {
         // Pick the most urgent session: highest status priority, then most recent activity
         sessions.max { a, b in
-            let pa = statusPriority(a.value.status)
-            let pb = statusPriority(b.value.status)
+            let pa = CompactBarRotation.statusPriority(a.value.status)
+            let pb = CompactBarRotation.statusPriority(b.value.status)
             if pa != pb { return pa < pb }
             return a.value.lastActivity < b.value.lastActivity
         }?.key
-    }
-
-    /// Check if Cursor is in YOLO mode by reading its settings
-    private static func detectCursorYoloMode() -> Bool {
-        let settingsPath = NSHomeDirectory() + "/Library/Application Support/Cursor/User/settings.json"
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: settingsPath),
-              let data = fm.contents(atPath: settingsPath),
-              let str = String(data: data, encoding: .utf8) else { return false }
-        let stripped = ConfigInstaller.stripJSONComments(str)
-        guard let strippedData = stripped.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: strippedData) as? [String: Any] else { return false }
-        if json["cursor.general.yoloMode"] as? Bool == true { return true }
-        if json["cursor.agent.enableYoloMode"] as? Bool == true { return true }
-        return false
-    }
-
-    /// Read Claude model from a session transcript file.
-    private nonisolated static func readModelFromTranscript(sessionId: String, cwd: String?) -> String? {
-        guard let cwd = cwd else { return nil }
-        let projectDir = cwd.claudeProjectDirEncoded()
-        // The transcript sits under whichever config dir (account) ran it.
-        guard let path = ClaudeConfigPaths.transcriptPath(projectDir: projectDir, sessionId: sessionId),
-              let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { handle.closeFile() }
-        let chunk = handle.readData(ofLength: 32768)
-        guard let text = String(data: chunk, encoding: .utf8) else { return nil }
-        for line in text.components(separatedBy: "\n") {
-            guard !line.isEmpty,
-                  let data = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let message = json["message"] as? [String: Any],
-                  let model = message["model"] as? String, !model.isEmpty
-            else { continue }
-            return model
-        }
-        return nil
-    }
-
-    private nonisolated static func readModelForSession(sessionId: String, session: SessionSnapshot) -> String? {
-        guard let source = SessionSnapshot.normalizedSupportedSource(session.source) else { return nil }
-        let processStart = session.cliStartTime ?? session.cliPid.flatMap { liveProcessIdentity(for: $0)?.startTime }
-
-        switch source {
-        case "claude":
-            return readModelFromTranscript(sessionId: sessionId, cwd: session.cwd)
-        case "qoder", "qoder-cli":
-            // ~/.qoder for the international build, ~/.qoder-cn for 国行 (#289).
-            return qoderConfigRoots.lazy.compactMap { root in
-                readModelFromProjectTranscript(
-                    sessionId: sessionId,
-                    cwd: session.cwd,
-                    basePath: FileManager.default.homeDirectoryForCurrentUser.path + "/\(root)/projects",
-                    projectEncoder: { $0.claudeProjectDirEncoded() },
-                    reader: readRecentFromTranscript(path:)
-                )
-            }.first
-
-        case "droid":
-            return readModelFromProjectTranscript(
-                sessionId: sessionId,
-                cwd: session.cwd,
-                basePath: FileManager.default.homeDirectoryForCurrentUser.path + "/.factory/sessions",
-                projectEncoder: { $0.claudeProjectDirEncoded() },
-                reader: readRecentFromFactoryTranscript(path:)
-            )
-        case "codebuddy":
-            return readModelFromProjectTranscript(
-                sessionId: sessionId,
-                cwd: session.cwd,
-                basePath: FileManager.default.homeDirectoryForCurrentUser.path + "/.codebuddy/projects",
-                projectEncoder: { $0.appProjectDirEncoded() },
-                reader: readRecentFromCodeBuddyTranscript(path:)
-            )
-        case "codex":
-            return readModelFromCodexStore(cwd: session.cwd, processStart: processStart)
-        case "gemini":
-            return readModelFromGeminiStore(cwd: session.cwd, processStart: processStart)
-        case "cursor", "cursor-cli":
-            return readModelFromCursorStore(cwd: session.cwd, processStart: processStart)
-        case "copilot":
-            return readModelFromCopilotStore(cwd: session.cwd, processStart: processStart)
-        case "opencode":
-            return readModelFromOpenCodeStore(cwd: session.cwd, processStart: processStart)
-        case "mimo":
-            // The plugin keys cards `mimo-<store session id>`. Read that row:
-            // the desktop holds several conversations per folder, and a
-            // subagent's card is a child row the cwd match skips.
-            return readModelFromOpenCodeStore(
-                cwd: session.cwd, processStart: processStart,
-                dbPath: mimoDatabasePath(), rootSessionsOnly: true,
-                storeSessionId: sessionId.hasPrefix("mimo-") ? String(sessionId.dropFirst("mimo-".count)) : nil
-            )
-        case "grok":
-            return readModelFromGrokStore(cwd: session.cwd, processStart: processStart)
-        default:
-            return nil
-        }
-    }
-
-    private nonisolated static func readModelFromProjectTranscript(
-        sessionId: String,
-        cwd: String?,
-        basePath: String,
-        projectEncoder: (String) -> String,
-        reader: (String) -> (String?, [ChatMessage])
-    ) -> String? {
-        guard let cwd else { return nil }
-        let path = "\(basePath)/\(projectEncoder(cwd))/\(sessionId).jsonl"
-        return reader(path).0
-    }
-
-    private nonisolated static func readModelFromCodexStore(cwd: String?, processStart: Date?) -> String? {
-        guard let cwd else { return nil }
-        let fm = FileManager.default
-        guard let path = codexStateRoots().lazy.compactMap({
-            findRecentCodexSession(base: "\($0)/sessions", cwd: cwd, after: processStart, fm: fm)
-        }).first else {
-            return nil
-        }
-        return readRecentFromCodexTranscript(path: path).0
-    }
-
-    private nonisolated static func codexLatestFinishedTurnTimestamp(
-        sessionId: String,
-        session: SessionSnapshot
-    ) -> Date? {
-        let effectiveSessionId: String
-        if let providerSessionId = session.providerSessionId?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !providerSessionId.isEmpty {
-            effectiveSessionId = providerSessionId
-        } else {
-            effectiveSessionId = sessionId
-        }
-        let processStart = session.cliStartTime ?? session.cliPid.flatMap { liveProcessIdentity(for: $0)?.startTime }
-
-        guard let transcriptPath = codexTranscriptPath(
-            sessionId: effectiveSessionId,
-            cwd: session.cwd,
-            processStart: processStart
-        ),
-              let tail = readTranscriptTail(path: transcriptPath, maxBytes: 131072) else {
-            return nil
-        }
-
-        return codexLatestTerminalTurnTimestamp(in: tail)
-    }
-
-    private nonisolated static func qoderLatestFinishedTurnTimestamp(
-        sessionId: String,
-        session: SessionSnapshot
-    ) -> Date? {
-        guard let transcriptPath = qoderTranscriptPath(sessionId: sessionId, cwd: session.cwd),
-              let tail = readTranscriptTail(path: transcriptPath, maxBytes: 131072) else {
-            return nil
-        }
-        return qoderLatestTerminalTurnTimestamp(in: tail)
-    }
-
-    private nonisolated static func codeBuddyLatestFinishedTurnTimestamp(
-        sessionId: String,
-        session: SessionSnapshot
-    ) -> Date? {
-        guard let transcriptPath = codeBuddyTranscriptPath(sessionId: sessionId, cwd: session.cwd),
-              let tail = readTranscriptTail(path: transcriptPath, maxBytes: 131072) else {
-            return nil
-        }
-        return codeBuddyLatestTerminalTurnTimestamp(in: tail)
-    }
-
-    private nonisolated static func nativeAppFinishedTurnTimestamp(
-        sessionId: String,
-        session: SessionSnapshot
-    ) -> Date? {
-        switch session.source {
-        case "codex":
-            return codexLatestFinishedTurnTimestamp(sessionId: sessionId, session: session)
-        case "qoder", "qoder-cli":
-            return qoderLatestFinishedTurnTimestamp(sessionId: sessionId, session: session)
-        case "codebuddy":
-            return codeBuddyLatestFinishedTurnTimestamp(sessionId: sessionId, session: session)
-        default:
-            return nil
-        }
-    }
-
-    private nonisolated static func codexTranscriptPath(
-        sessionId: String,
-        cwd: String?,
-        processStart: Date?
-    ) -> String? {
-        // The thread may belong to any Codex root (CODEX_HOME / account).
-        let roots = codexStateRoots()
-        for root in roots {
-            let statePath = "\(root)/state_5.sqlite"
-
-            if let path: String = withSQLiteDatabase(at: statePath, body: { db in
-                guard let statement = prepareSQLiteStatement(
-                    db: db,
-                    sql: """
-                        SELECT rollout_path
-                        FROM threads
-                        WHERE id = ?
-                        LIMIT 1;
-                        """
-                ) else {
-                    return nil
-                }
-                defer { sqlite3_finalize(statement) }
-
-                bindSQLiteText(sessionId, to: statement, index: 1)
-                guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
-                return sqliteColumnString(statement, index: 0)
-            }),
-               FileManager.default.fileExists(atPath: path) {
-                return path
-            }
-        }
-
-        guard let cwd else { return nil }
-        return roots.lazy.compactMap {
-            findRecentCodexSession(base: "\($0)/sessions", cwd: cwd, after: processStart, fm: .default)
-        }.first
-    }
-
-    /// Config roots a Qoder session's transcript can live under: the international
-    /// build uses ~/.qoder, the China build (`qoderclicn`) uses ~/.qoder-cn (#289).
-    private nonisolated static let qoderConfigRoots = [".qoder", ".qoder-cn"]
-
-    private nonisolated static func qoderTranscriptPath(sessionId: String, cwd: String?) -> String? {
-        guard let cwd else { return nil }
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let candidates = qoderConfigRoots.flatMap { root -> [String] in
-            let projectPath = home
-                .appendingPathComponent("\(root)/projects/\(cwd.claudeProjectDirEncoded())")
-            return [
-                projectPath.appendingPathComponent("\(sessionId).jsonl").path,
-                projectPath.appendingPathComponent("transcript/\(sessionId).jsonl").path,
-            ]
-        }
-
-        return candidates.first { FileManager.default.fileExists(atPath: $0) }
-    }
-
-    private nonisolated static func codeBuddyTranscriptPath(sessionId: String, cwd: String?) -> String? {
-        guard let cwd else { return nil }
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codebuddy/projects/\(cwd.appProjectDirEncoded())/\(sessionId).jsonl").path
-        return FileManager.default.fileExists(atPath: path) ? path : nil
-    }
-
-    private nonisolated static func readModelFromGeminiStore(cwd: String?, processStart: Date?) -> String? {
-        guard let cwd else { return nil }
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
-        let tmpBase = "\(home)/.gemini/tmp"
-        guard let projectDir = findGeminiProjectDirectory(
-            for: cwd,
-            tmpBase: tmpBase,
-            projects: readGeminiProjectsMap(path: "\(home)/.gemini/projects.json"),
-            fm: fm
-        ) else {
-            return nil
-        }
-        let chatsBase = "\(tmpBase)/\(projectDir)/chats"
-        guard let best = findMostRecentGeminiSession(in: chatsBase, after: processStart, fm: fm) else {
-            return nil
-        }
-        return readRecentFromGeminiTranscript(path: best.path).1
-    }
-
-    private nonisolated static func readModelFromCursorStore(cwd: String?, processStart: Date?) -> String? {
-        guard let cwd else { return nil }
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
-        let transcriptBase = "\(home)/.cursor/projects/\(cwd.appProjectDirEncoded())/agent-transcripts"
-        guard let best = findMostRecentCursorTranscript(in: transcriptBase, after: processStart, fm: fm) else {
-            return nil
-        }
-        return readRecentFromCursorTranscript(path: best.path).0
-    }
-
-    private nonisolated static func readModelFromCopilotStore(cwd: String?, processStart: Date?) -> String? {
-        guard let cwd else { return nil }
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
-        let sessionsBase = "\(home)/.copilot/session-state"
-        guard let best = findRecentCopilotSession(base: sessionsBase, cwd: cwd, after: processStart, fm: fm) else {
-            return nil
-        }
-        return readRecentFromCopilotTranscript(path: best.path).0
-    }
-
-    /// `storeSessionId`, when the card's key names the store row, is read
-    /// first; the cwd match is the fallback.
-    nonisolated static func readModelFromOpenCodeStore(
-        cwd: String?,
-        processStart: Date?,
-        dbPath: String = openCodeDatabasePath(),
-        rootSessionsOnly: Bool = false,
-        storeSessionId: String? = nil
-    ) -> String? {
-        return withSQLiteDatabase(at: dbPath) { db in
-            if let storeSessionId,
-               let model = readRecentFromOpenCodeSession(db: db, sessionId: storeSessionId).0 {
-                return model
-            }
-            guard let cwd, let session = findRecentOpenCodeSession(
-                in: db, cwd: cwd, after: processStart, rootSessionsOnly: rootSessionsOnly
-            ) else {
-                return nil
-            }
-            return readRecentFromOpenCodeSession(db: db, sessionId: session.sessionId).0
-        }
-    }
-
-    private nonisolated static func readModelFromGrokStore(cwd: String?, processStart: Date?) -> String? {
-        guard let cwd else { return nil }
-        return findRecentGrokSession(cwd: cwd, after: processStart)?.model
     }
 
     // MARK: - Session Discovery (FSEventStream + process scan)
@@ -3537,7 +3141,7 @@ final class AppState {
         let cutoff = Date().addingTimeInterval(-30 * 60) // 30 minutes
         for p in persisted where p.lastActivity > cutoff {
             guard let source = SessionSnapshot.normalizedSupportedSource(p.source) else { continue }
-            let restoredSessionId = Self.canonicalRestoredCodexSessionId(
+            let restoredSessionId = CodexDiscovery.canonicalRestoredCodexSessionId(
                 sessionId: p.sessionId,
                 source: source,
                 providerSessionId: p.providerSessionId,
@@ -3599,7 +3203,7 @@ final class AppState {
             // stale sessions reappearing briefly after the app or IDE restarts (#46).
             if let pid = p.cliPid, pid > 0 {
                 let identity = ProcessIdentity(pid: pid, startTime: p.cliStartTime)
-                if Self.isLiveProcess(identity) {
+                if ProcessTable.isLiveProcess(identity) {
                     snapshot.cliPid = pid
                     snapshot.cliStartTime = p.cliStartTime
                 }
@@ -3655,237 +3259,22 @@ final class AppState {
         return !closedSubagentIds.isEmpty
     }
 
-    private nonisolated static func findDiscoveredSessions() -> [DiscoveredSession] {
-        let candidatePids = allProcessIds()
-        var discovered: [DiscoveredSession] = []
-        if ConfigInstaller.isEnabled(source: "claude") {
-            discovered.append(contentsOf: findActiveClaudeSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "codex") {
-            discovered.append(contentsOf: findActiveCodexSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "gemini") {
-            discovered.append(contentsOf: findActiveGeminiSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "qoder") {
-            discovered.append(contentsOf: findActiveQoderSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "codebuddy") {
-            discovered.append(contentsOf: findActiveCodeBuddySessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "droid") {
-            discovered.append(contentsOf: findActiveFactorySessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "cursor") {
-            discovered.append(contentsOf: findActiveCursorSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "copilot") {
-            discovered.append(contentsOf: findActiveCopilotSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "opencode") {
-            discovered.append(contentsOf: findActiveOpenCodeSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "mimo") {
-            discovered.append(contentsOf: findActiveMimoSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "kimi") {
-            discovered.append(contentsOf: findActiveKimiSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "grok") {
-            discovered.append(contentsOf: findActiveGrokSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "cline") {
-            discovered.append(contentsOf: findActiveClineSessions(candidatePids: candidatePids))
-        }
-        return discovered
-    }
-
-    private nonisolated static func discoveryWatchRoots() -> [String] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let candidates: [(String, String)] = [
-            ("claude", ClaudeConfigPaths.projectsDir()),
-            ("codex", "\(home)/.codex/sessions"),
-            // $CODEX_HOME when CodeIsland itself was launched with one; the
-            // same path as above otherwise (duplicates are dropped below).
-            ("codex", "\(ConfigInstaller.codexHome())/sessions"),
-            ("gemini", "\(home)/.gemini/tmp"),
-            ("qoder", "\(home)/.qoder/projects"),
-            ("codebuddy", "\(home)/.codebuddy/projects"),
-            ("droid", "\(home)/.factory/sessions"),
-            ("cursor", "\(home)/.cursor/projects"),
-            ("copilot", "\(home)/.copilot/session-state"),
-            ("opencode", "\(home)/.local/share/opencode"),
-            ("mimo", "\(home)/.local/share/mimocode"),
-            ("kimi", "\(home)/.kimi-code/sessions"),
-            ("kimi", "\(home)/.kimi/sessions"),
-            ("grok", "\(ConfigInstaller.grokHome())/sessions"),
-        ]
-        let fm = FileManager.default
-        // By identity: an extra dir that is a primary one under another
-        // spelling (symlink, case) must not be watched twice.
-        var seenRoots = Set<String>()
-        var roots = (candidates + extraConfigDirWatchRoots()).compactMap { source, path -> String? in
-            guard ConfigInstaller.isEnabled(source: source), fm.fileExists(atPath: path),
-                  seenRoots.insert(ExtraConfigDirs.identity(of: path)).inserted else { return nil }
-            return path
-        }
-        if ConfigInstaller.isEnabled(source: "cline") {
-            let clineBase = Self.clineStorageRoot()
-            for sub in ["state", "tasks"] {
-                let p = "\(clineBase)/\(sub)"
-                if fm.fileExists(atPath: p) { roots.append(p) }
-            }
-        }
-        return roots
-    }
-
-    /// What a discovery scan runs. The real scan reads every process and the
-    /// agents' session stores under ~, and each session it returns gets a
-    /// process monitor — and the orphan reaper — on one of the user's real
-    /// CLIs. A test process scans nothing unless a test installs a scanner.
-    nonisolated(unsafe) static var discoveryScanner: @Sendable () -> [DiscoveredSession] = {
-        RuntimeEnvironment.isRunningTests ? [] : findDiscoveredSessions()
-    }
-
-    /// What builds the Cursor Agent Task index: a walk of `~/.cursor/projects`.
-    /// A test process indexes nothing unless a test installs a scanner.
-    nonisolated(unsafe) static var cursorSubagentIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
-        RuntimeEnvironment.isRunningTests
-            ? CursorSubagentTranscriptIndex(pathsBySessionId: [:], builtAt: Date())
-            : CursorSubagentTranscriptIndex.scan(home: FileManager.default.homeDirectoryForCurrentUser.path)
-    }
-
-    private func requestDiscoveryScan() {
-        if discoveryScanTask != nil {
-            pendingDiscoveryRescan = true
-            return
-        }
-
-        pendingDiscoveryRescan = false
-        discoveryScanTask = Task.detached { [weak self] in
-            let discovered = Self.discoveryScanner()
-            guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                guard !Task.isCancelled else {
-                    self.discoveryScanTask = nil
-                    return
-                }
-                self.integrateDiscovered(discovered)
-                self.discoveryScanTask = nil
-                if self.pendingDiscoveryRescan {
-                    self.pendingDiscoveryRescan = false
-                    self.requestDiscoveryScan()
-                }
-            }
-        }
-    }
-
-    /// FSEvents is not guaranteed to report every append below
-    /// `~/.codex/sessions` on all macOS/filesystem combinations. Reuse the
-    /// cleanup tick as a low-frequency fallback, but only while Codex Desktop
-    /// is running and only after the polling interval has elapsed.
-    nonisolated static func shouldPollCodexDesktopDiscovery(
-        runningBundleIdentifiers: Set<String>,
-        lastPollAt: Date?,
-        now: Date,
-        interval: TimeInterval = 6
-    ) -> Bool {
-        guard runningBundleIdentifiers.contains(codexAppBundleId) else { return false }
-        guard let lastPollAt else { return true }
-        return now.timeIntervalSince(lastPollAt) >= interval
-    }
-
-    func requestCodexDesktopDiscoveryScan() {
-        guard codexDesktopDiscoveryScanTask == nil else { return }
-        codexDesktopDiscoveryScanTask = Task.detached { [weak self] in
-            let discovered = ConfigInstaller.isEnabled(source: "codex")
-                ? Self.findRecentCodexDesktopSessions()
-                : []
-            guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                guard !Task.isCancelled else {
-                    self.codexDesktopDiscoveryScanTask = nil
-                    return
-                }
-                self.integrateDiscovered(discovered)
-                self.codexDesktopDiscoveryScanTask = nil
-            }
-        }
-    }
-
     func startSessionDiscovery() {
         startCleanupTimer()
         // Restore persisted sessions before process scan (deduped by scan)
         restoreSessions()
 
-        // Initial scan for already-running sessions, respecting per-source toggles.
-        requestDiscoveryScan()
-        // Watch all known session-store roots so discovery keeps working when hooks are missed.
-        startProjectsWatcher()
-    }
-
-    /// FSEventStream on known session-store roots — fires when transcript/event files change.
-    private func startProjectsWatcher() {
-        guard fsEventStream == nil else { return }
-        let watchRoots = Self.discoveryWatchRoots()
-        guard !watchRoots.isEmpty else { return }
-
-        let box = ProjectsWatcherBox()
-        box.appState = self
-
-        var context = FSEventStreamContext()
-        // Unretained box is owned by `projectsWatcherBox` until
-        // `tearDownProjectsWatcher()`; the weak back-pointer keeps callbacks
-        // safe across off-main `AppState` deinit.
-        context.info = Unmanaged.passUnretained(box).toOpaque()
-
-        let stream = FSEventStreamCreate(
-            nil,
-            { (_, info, _, _, _, _) in
-                guard let info = info else { return }
-                let box = Unmanaged<ProjectsWatcherBox>.fromOpaque(info).takeUnretainedValue()
-                box.handleChange()
-            },
-            &context,
-            watchRoots as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            2.0,  // 2-second latency (coalesces rapid writes)
-            FSEventStreamCreateFlags(
-                kFSEventStreamCreateFlagUseCFTypes
-                    | kFSEventStreamCreateFlagNoDefer
-                    | kFSEventStreamCreateFlagFileEvents
-            )
-        )
-
-        guard let stream = stream else { return }
-        FSEventStreamSetDispatchQueue(stream, .main)
-        FSEventStreamStart(stream)
-        self.projectsWatcherBox = box
-        self.fsEventStream = stream
-        log.info("Discovery watcher started on \(watchRoots.joined(separator: ", "))")
+        // Initial scan for already-running sessions, respecting per-source toggles,
+        // then watch all known session-store roots so discovery keeps working when
+        // hooks are missed.
+        discovery.start()
     }
 
     /// Re-arm discovery after the watched roots changed — an extra config dir
     /// was added, removed or paused in Settings → Hooks — and rescan at once so
     /// sessions already running under a newly added root show up.
     func restartProjectsWatcher() {
-        tearDownProjectsWatcher()
-        startProjectsWatcher()
-        requestDiscoveryScan()
-    }
-
-    /// Called by FSEventStream when a known session-store directory changes.
-    nonisolated fileprivate func handleProjectsDirChange() {
-        Task { @MainActor [weak self] in
-            guard let self = self else { return }
-            // FSEvents already coalesces writes with a two-second latency, and
-            // requestDiscoveryScan() coalesces events that arrive during a scan.
-            // Dropping events in an additional time window can miss the final
-            // lifecycle write and leave the island showing stale state.
-            self.requestDiscoveryScan()
-        }
+        discovery.restartProjectsWatcher()
     }
 
     /// Provider thread IDs are authoritative when both sides have one. Two
@@ -3973,7 +3362,7 @@ final class AppState {
                 source: info.source,
                 parentSessionId: info.parentSessionId,
                 status: info.status
-            ) {
+            ), !hasWaitingRequest(onCard: info.sessionId) {
                 if sessions[info.sessionId] != nil {
                     removeSession(info.sessionId)
                     didMutate = true
@@ -3992,12 +3381,12 @@ final class AppState {
                 if let pid = info.pid, pid > 0 {
                     let existingPid = sessions[info.sessionId]?.cliPid ?? 0
                     let existingProcess = resolvedSessionProcessIdentity(for: info.sessionId)
-                    let existingAlive = existingProcess.map(Self.isLiveProcess) ?? false
+                    let existingAlive = existingProcess.map(ProcessTable.isLiveProcess) ?? false
                     if existingAlive && existingPid != pid {
                         // Existing PID is alive and different — discovery PID is unreliable.
                     } else {
                         // No existing PID, or it's dead, or it matches — safe to use discovery PID.
-                        if !existingAlive, let process = Self.liveProcessIdentity(for: pid) {
+                        if !existingAlive, let process = ProcessTable.liveProcessIdentity(for: pid) {
                             setSessionProcessIdentity(process, for: info.sessionId)
                             didMutate = true
                         }
@@ -4007,6 +3396,9 @@ final class AppState {
                     didMutate = true
                 }
                 if applyDiscoveredMetadata(info, to: info.sessionId) {
+                    didMutate = true
+                }
+                if linkDiscoveredChild(info) {
                     didMutate = true
                 }
                 attachTranscriptTailerIfNeeded(sessionId: info.sessionId)
@@ -4026,7 +3418,11 @@ final class AppState {
             // Never merge a discovery (CLI) session with an existing native app session —
             // they're fundamentally different even if they share source + cwd.
             let duplicateKey = sessions.first(where: { (_, existing) in
-                guard existing.source == info.source,
+                // A process found on this Mac is never a remote session, however
+                // its cwd reads: merged in, its pid and transcript would be this
+                // Mac's on the remote card.
+                guard !existing.isRemote,
+                      existing.source == info.source,
                       existing.cwd != nil, existing.cwd == info.cwd else { return false }
                 guard Self.discoveryAppModesMayRepresentSameSession(
                     existingIsNativeAppMode: existing.isNativeAppMode,
@@ -4047,7 +3443,7 @@ final class AppState {
                 // Dead persisted PIDs should not block dedup / reattachment.
                 if let discoveredPid = info.pid, let existingPid = existing.cliPid,
                    discoveredPid != existingPid,
-                   Self.isLiveProcess(ProcessIdentity(pid: existingPid, startTime: existing.cliStartTime)) { return false }
+                   ProcessTable.isLiveProcess(ProcessIdentity(pid: existingPid, startTime: existing.cliStartTime)) { return false }
                 return true
             })?.key
 
@@ -4060,10 +3456,10 @@ final class AppState {
                 if let pid = info.pid, pid > 0 {
                     let existingPid = sessions[existingKey]?.cliPid ?? 0
                     let existingProcess = resolvedSessionProcessIdentity(for: existingKey)
-                    let existingAlive = existingProcess.map(Self.isLiveProcess) ?? false
+                    let existingAlive = existingProcess.map(ProcessTable.isLiveProcess) ?? false
                     if existingAlive && existingPid != pid {
                     } else {
-                        if !existingAlive, let process = Self.liveProcessIdentity(for: pid) {
+                        if !existingAlive, let process = ProcessTable.liveProcessIdentity(for: pid) {
                             setSessionProcessIdentity(process, for: existingKey)
                             didMutate = true
                         }
@@ -4093,7 +3489,7 @@ final class AppState {
             session.status = info.status ?? .idle
             session.lastActivity = info.modifiedAt
             session.termBundleId = info.termBundleId
-            if let pid = info.pid, let process = Self.liveProcessIdentity(for: pid) {
+            if let pid = info.pid, let process = ProcessTable.liveProcessIdentity(for: pid) {
                 session.cliPid = process.pid
                 session.cliStartTime = process.startTime
             } else {
@@ -4109,6 +3505,7 @@ final class AppState {
                 session.lastAssistantMessage = last.text
             }
             session.transcriptPath = info.transcriptPath
+            session.parentSessionId = discoveredParentCardId(info)
             sessions[info.sessionId] = session
             refreshProviderTitle(
                 for: info.sessionId,
@@ -4213,21 +3610,60 @@ final class AppState {
         return mutated
     }
 
+    /// Link the discovered thread's own card to its parent (see
+    /// ``discoveredParentCardId(_:)``). Never a card the discovery was merged
+    /// into as a duplicate: a Codex CLI discovery names no provider thread, so
+    /// that can be another thread's card — a root, which a link would silence.
+    @discardableResult
+    private func linkDiscoveredChild(_ info: DiscoveredSession) -> Bool {
+        guard sessions[info.sessionId]?.parentSessionId == nil,
+              let parent = discoveredParentCardId(info) else {
+            return false
+        }
+        sessions[info.sessionId]?.parentSessionId = parent
+        return true
+    }
+
+    /// The card a discovered Codex subagent thread works for: its parent
+    /// thread's card, or the card that thread's hooks would build. Agent
+    /// Sub-Sessions shows it on a card of its own only in Show separately (or
+    /// while Merge has no parent card to fold it into), where it stays quiet.
+    private func discoveredParentCardId(_ info: DiscoveredSession) -> String? {
+        guard info.source == "codex",
+              let parentThreadId = info.parentSessionId,
+              !parentThreadId.isEmpty else {
+            return nil
+        }
+        let parent = findCodexParentSessionId(
+            providerSessionId: parentThreadId,
+            childTermBundleId: info.termBundleId
+        ) ?? CodexDiscovery.codexDiscoveryIdentity(
+            rawSessionId: parentThreadId,
+            isDesktop: info.termBundleId == Self.codexAppBundleId
+        ).sessionId
+        return parent == info.sessionId ? nil : parent
+    }
+
     @discardableResult
     func applyCodexSubsessionModeToKnownSessions(statePath: String? = nil) -> Bool {
         let mode = Self.currentPluginSessionMode()
-        guard mode == "hide" || mode == "merge" else {
+        guard mode == .hide || mode == .merge else {
             return false
         }
 
-        let candidates = sessions.map { (sessionId: $0.key, session: $0.value) }
+        // This Mac's rollouts and state DB know nothing of a remote thread, and
+        // its transcript path names a file on its own host; its hooks place it
+        // (CodexThreadSubsession).
+        let candidates = sessions
+            .filter { !$0.value.isRemote }
+            .map { (sessionId: $0.key, session: $0.value) }
         var transcriptMetadata: [String: CodexSubagentMetadata] = [:]
         var databaseLookupIds: Set<String> = []
 
         for candidate in candidates where candidate.session.source == "codex" {
             let providerSessionId = candidate.session.providerSessionId ?? candidate.sessionId
             if let transcriptPath = candidate.session.transcriptPath {
-                switch Self.inspectCodexSubagentMetadata(inTranscriptPath: transcriptPath) {
+                switch codexRollouts.inspection(transcriptPath: transcriptPath) {
                 case .subagent(let metadata):
                     transcriptMetadata[candidate.sessionId] = metadata
                     databaseLookupIds.insert(providerSessionId)
@@ -4245,7 +3681,7 @@ final class AppState {
         }
         // One read-only DB connection for all candidates that genuinely need
         // relation/status fallback. Root transcripts never enter this query.
-        let databaseRecords = Self.codexSpawnEdgeRecords(
+        let databaseRecords = CodexDiscovery.codexSpawnEdgeRecords(
             threadIds: databaseLookupIds,
             statePath: statePath
         )
@@ -4255,11 +3691,12 @@ final class AppState {
             let providerSessionId = candidate.session.providerSessionId ?? candidate.sessionId
             guard let metadata = transcriptMetadata[candidate.sessionId]
                     ?? databaseRecords[providerSessionId]?.metadata,
-                  metadata.parentThreadId != providerSessionId else {
+                  metadata.parentThreadId != providerSessionId,
+                  !hasWaitingRequest(onCard: candidate.sessionId) else {
                 continue
             }
 
-            if mode == "hide" {
+            if mode == .hide {
                 if sessions[candidate.sessionId] != nil {
                     removeSession(candidate.sessionId)
                     didMutate = true
@@ -4304,6 +3741,8 @@ final class AppState {
             if candidate.session.lastActivity > subagent.lastActivity {
                 subagent.lastActivity = candidate.session.lastActivity
             }
+            // The thread's later hooks follow its row here.
+            subagent.subsessionKind = .codexThread
             sessions[parentKey]?.subagents[providerSessionId] = subagent
 
             if sessions[parentKey]?.status != .waitingApproval && sessions[parentKey]?.status != .waitingQuestion {
@@ -4321,13 +3760,22 @@ final class AppState {
         return didMutate
     }
 
+    /// Whether an approval or question on this card still waits for the user.
+    /// The passes over known cards leave such a card alone: removing or
+    /// folding it would deny the request unseen. The next pass after it is
+    /// answered moves the card as usual.
+    private func hasWaitingRequest(onCard sessionId: String) -> Bool {
+        permissionQueue.contains(where: { ($0.event.sessionId ?? "default") == sessionId })
+            || questionQueue.contains(where: { ($0.event.sessionId ?? "default") == sessionId })
+    }
+
     /// Apply Agent Sub-Sessions to known Cursor Task/subagent cards
     /// (`transcriptPath` is the parent chat; `session_id` is the child).
     /// `merge` / `hide` only; `separate` is handled by `separateMergedCursorSubagents()`.
     @discardableResult
     func applyCursorSubsessionModeToKnownSessions() -> Bool {
         let mode = Self.currentPluginSessionMode()
-        guard mode == "hide" || mode == "merge" else {
+        guard mode == .hide || mode == .merge else {
             return false
         }
 
@@ -4338,11 +3786,12 @@ final class AppState {
         // Refresh after rebrand so newly tagged cursor cards are included.
         let candidates = sessions.map { (sessionId: $0.key, session: $0.value) }
 
-        if mode == "hide" {
+        if mode == .hide {
             for candidate in candidates {
                 let source = candidate.session.source
                 guard source == "cursor" || source == "cursor-cli" else { continue }
-                guard cursorFoldIdentity(for: candidate) != nil else { continue }
+                guard cursorFoldIdentity(for: candidate) != nil,
+                      !hasWaitingRequest(onCard: candidate.sessionId) else { continue }
                 if sessions[candidate.sessionId] != nil {
                     removeSession(candidate.sessionId)
                     didMutate = true
@@ -4354,7 +3803,8 @@ final class AppState {
         for candidate in candidates {
             let source = candidate.session.source
             guard source == "cursor" || source == "cursor-cli" else { continue }
-            guard let fold = cursorFoldIdentity(for: candidate) else { continue }
+            guard let fold = cursorFoldIdentity(for: candidate),
+                  !hasWaitingRequest(onCard: candidate.sessionId) else { continue }
             let parentId = fold.parentId
             let childId = fold.childId
 
@@ -4382,6 +3832,8 @@ final class AppState {
                     parent.termApp = candidate.session.termApp
                     parent.termBundleId = candidate.session.termBundleId
                     parent.transcriptPath = candidate.session.transcriptPath
+                    parent.remoteHostId = candidate.session.remoteHostId
+                    parent.remoteHostName = candidate.session.remoteHostName
                     parent.providerSessionId = parentId
                     // Closed ids only — parent is not actively working.
                     parent.status = .idle
@@ -4420,6 +3872,10 @@ final class AppState {
                 parent.termApp = candidate.session.termApp
                 parent.termBundleId = candidate.session.termBundleId
                 parent.transcriptPath = candidate.session.transcriptPath
+                // A remote Task's chat runs on the same host. Unmarked, the
+                // card would have that host's transcript path read here.
+                parent.remoteHostId = candidate.session.remoteHostId
+                parent.remoteHostName = candidate.session.remoteHostName
                 // Do not copy the Task/subagent process identity onto the parent chat.
                 parent.providerSessionId = parentId
                 parent.status = candidate.session.status == .idle ? .processing : candidate.session.status
@@ -4453,6 +3909,8 @@ final class AppState {
             if candidate.session.lastActivity > subagent.lastActivity {
                 subagent.lastActivity = candidate.session.lastActivity
             }
+            // The Task's later hooks follow its row here.
+            subagent.subsessionKind = .cursorTask
             sessions[parentKey]?.subagents[childId] = subagent
 
             if sessions[parentKey]?.status != .waitingApproval
@@ -4492,15 +3950,30 @@ final class AppState {
 
     private func markMergedSubagentWaiting(
         sessionId: String,
-        agentId: String?,
+        event: HookEvent,
         status: AgentStatus
     ) {
-        guard let agentId else { return }
+        guard let agentId = event.agentId else { return }
         guard var session = sessions[sessionId] else { return }
+        // A row the request creates goes by the hook's own `agent_type` (a
+        // Codex thread's role, a pi child's agent). A child session Agent
+        // Sub-Sessions folded here is marked as one, so its later hooks
+        // follow this row.
+        let foldedKind = SubsessionRouter.foldedKind(of: event)
+        let agentType = (event.rawJSON["agent_type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         var subagent = session.subagents[agentId]
-            ?? SubagentState(agentId: agentId, agentType: "cursor-subagent")
+            ?? SubagentState(
+                agentId: agentId,
+                agentType: agentType.flatMap { $0.isEmpty ? nil : $0 }
+                    ?? foldedKind?.defaultAgentType
+                    ?? "cursor-subagent"
+            )
         subagent.status = status
         subagent.lastActivity = Date()
+        if let foldedKind {
+            subagent.subsessionKind = foldedKind
+        }
         session.subagents[agentId] = subagent
         sessions[sessionId] = session
     }
@@ -4657,7 +4130,7 @@ final class AppState {
         // `separate` folds nothing, so nothing is looked up; leaving it starts
         // every card's schedule afresh (`applyCurrentPluginSessionMode`).
         let mode = Self.currentPluginSessionMode()
-        guard mode == "merge" || mode == "hide" else {
+        guard mode == .merge || mode == .hide else {
             resetCursorSubagentLookups()
             return
         }
@@ -4710,9 +4183,10 @@ final class AppState {
     private func startCursorSubagentIndexRebuild() {
         guard cursorSubagentIndexTask == nil else { return }
         cancelCursorSubagentIndexRecheck()
+        let scan = discovery.scanners.cursorSubagentIndex
         cursorSubagentIndexTask = Task.detached(priority: .utility) { [weak self] in
             guard !Task.isCancelled else { return }
-            let index = Self.cursorSubagentIndexScanner()
+            let index = scan()
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 // Cancelled by teardown, which already dropped the handle.
@@ -4766,20 +4240,18 @@ final class AppState {
         var didMutate = false
 
         switch mode {
-        case "separate":
+        case .separate:
             // Back in merge or hide, every candidate card is looked up afresh.
             resetCursorSubagentLookups()
             didMutate = separateMergedCodexSubagents()
             didMutate = separateMergedCursorSubagents() || didMutate
-        case "merge":
+        case .merge:
             didMutate = applyCodexSubsessionModeToKnownSessions()
             didMutate = applyCursorSubsessionModeToKnownSessions() || didMutate
-        case "hide":
+        case .hide:
             didMutate = applyCodexSubsessionModeToKnownSessions()
             didMutate = hideMergedCodexSubagents() || didMutate
             didMutate = applyCursorSubsessionModeToKnownSessions() || didMutate
-        default:
-            return
         }
 
         if didMutate {
@@ -4794,10 +4266,10 @@ final class AppState {
     @discardableResult
     private func separateMergedCodexSubagents() -> Bool {
         let parentCandidates = sessions.map { (sessionId: $0.key, session: $0.value) }
-        let childIds = Set(parentCandidates.flatMap { $0.session.subagents.keys })
+        let childIds = Set(parentCandidates.filter { !$0.session.isRemote }.flatMap { $0.session.subagents.keys })
         // One DB connection for the whole mode transition; never open SQLite
         // once per child (each open carries a busy timeout).
-        let databaseRecords = Self.codexSpawnEdgeRecords(threadIds: childIds)
+        let databaseRecords = CodexDiscovery.codexSpawnEdgeRecords(threadIds: childIds)
         var didMutate = false
 
         for parent in parentCandidates where parent.session.source == "codex" && !parent.session.subagents.isEmpty {
@@ -4806,7 +4278,7 @@ final class AppState {
                 let childKey = findCodexParentSessionId(
                     providerSessionId: agentId,
                     childTermBundleId: parent.session.termBundleId
-                ) ?? Self.codexDiscoveryIdentity(
+                ) ?? CodexDiscovery.codexDiscoveryIdentity(
                     rawSessionId: agentId,
                     isDesktop: childIsDesktop
                 ).sessionId
@@ -4833,26 +4305,32 @@ final class AppState {
                 child.remoteHostName = child.remoteHostName ?? parent.session.remoteHostName
                 child.cliPid = child.cliPid ?? parent.session.cliPid
                 child.cliStartTime = child.cliStartTime ?? parent.session.cliStartTime
+                child.remotePid = child.remotePid ?? parent.session.remotePid
                 child.status = subagent.status
                 child.currentTool = subagent.currentTool
                 child.toolDescription = subagent.toolDescription ?? subagent.agentType
                 child.lastActivity = subagent.lastActivity
+                // Still the parent's child, on a card of its own: quiet.
+                child.parentSessionId = child.parentSessionId ?? parent.sessionId
 
-                let transcriptMetadata = child.transcriptPath.flatMap {
-                    Self.codexSubagentMetadata(inTranscriptPath: $0)
-                }
-                let metadata = transcriptMetadata ?? databaseRecords[agentId]?.metadata
+                // A remote child's rollout is on its own host: none of this
+                // Mac's rollouts, state DB or sessions folder is read for it.
+                let readsLocalStore = !parent.session.isRemote
+                let transcriptMetadata = readsLocalStore
+                    ? child.transcriptPath.flatMap { CodexDiscovery.codexSubagentMetadata(inTranscriptPath: $0) }
+                    : nil
+                let metadata = transcriptMetadata ?? (readsLocalStore ? databaseRecords[agentId]?.metadata : nil)
                 if child.sessionTitle == nil {
                     child.sessionTitle = metadata?.agentNickname ?? subagent.toolDescription ?? subagent.agentType
                 }
-                if child.transcriptPath == nil {
+                if readsLocalStore, child.transcriptPath == nil {
                     if let statePath = databaseRecords[agentId]?.transcriptPath,
                        FileManager.default.fileExists(atPath: statePath) {
                         child.transcriptPath = statePath
                     } else if let cwd = parent.session.cwd {
                         let base = FileManager.default.homeDirectoryForCurrentUser
                             .appendingPathComponent(".codex/sessions").path
-                        child.transcriptPath = Self.findRecentCodexSession(
+                        child.transcriptPath = CodexDiscovery.findRecentCodexSession(
                             base: base,
                             cwd: cwd,
                             after: parent.session.cliStartTime,
@@ -4860,8 +4338,8 @@ final class AppState {
                         )
                     }
                 }
-                if let transcriptPath = child.transcriptPath {
-                    let (model, messages) = Self.readRecentFromCodexTranscript(path: transcriptPath)
+                if readsLocalStore, let transcriptPath = child.transcriptPath {
+                    let (model, messages) = CodexDiscovery.readRecentFromCodexTranscript(path: transcriptPath)
                     child.model = child.model ?? model
                     if !messages.isEmpty {
                         child.recentMessages = messages
@@ -4945,6 +4423,8 @@ final class AppState {
                 child.currentTool = subagent.currentTool
                 child.toolDescription = subagent.toolDescription ?? subagent.agentType
                 child.lastActivity = subagent.lastActivity
+                // Still the chat's Task, on a card of its own: quiet.
+                child.parentSessionId = child.parentSessionId ?? parent.sessionId
                 if child.sessionTitle == nil {
                     child.sessionTitle = subagent.toolDescription ?? subagent.agentType
                 }
@@ -5005,16 +4485,19 @@ final class AppState {
     private func routeDiscoveredSubsessionIfNeeded(_ info: DiscoveredSession) -> Bool {
         guard info.source == "codex",
               let parentSessionId = info.parentSessionId,
-              !parentSessionId.isEmpty else {
+              !parentSessionId.isEmpty,
+              // A thread whose request waits on its own card stays there
+              // until it is answered; discovery just keeps the card current.
+              !hasWaitingRequest(onCard: info.sessionId) else {
             return false
         }
 
         let mode = Self.currentPluginSessionMode()
-        guard mode == "hide" || mode == "merge" else {
+        guard mode == .hide || mode == .merge else {
             return false
         }
 
-        if mode == "hide" {
+        if mode == .hide {
             if sessions[info.sessionId] != nil {
                 removeSession(info.sessionId)
             }
@@ -5048,6 +4531,8 @@ final class AppState {
         subagent.status = .running
         subagent.toolDescription = info.agentNickname
         subagent.lastActivity = info.modifiedAt
+        // The thread's hooks follow its row here.
+        subagent.subsessionKind = .codexThread
         sessions[parentKey]?.subagents[providerSessionId] = subagent
 
         if sessions[parentKey]?.status != .waitingApproval && sessions[parentKey]?.status != .waitingQuestion {
@@ -5064,3558 +4549,44 @@ final class AppState {
     }
 
     func stopSessionDiscovery() {
-        tearDownProjectsWatcher()
-        rotationTimer?.invalidate()
-        rotationTimer = nil
+        discovery.stop()
+        rotation.stopTimer()
         cleanupTimer?.invalidate()
         cleanupTimer = nil
         saveTimer?.invalidate()
         saveTimer = nil
-        discoveryScanTask?.cancel()
-        discoveryScanTask = nil
-        pendingDiscoveryRescan = false
-        codexDesktopDiscoveryScanTask?.cancel()
-        codexDesktopDiscoveryScanTask = nil
-        lastCodexDesktopDiscoveryPollAt = nil
         cursorSubagentIndexTask?.cancel()
         cursorSubagentIndexTask = nil
         cancelCursorSubagentIndexRecheck()
-        for key in Array(processMonitors.keys) { stopMonitor(key) }
-    }
-
-    /// Stops the FSEvents watcher on the main queue so Stop/Invalidate cannot
-    /// race a queued callback. Safe to call from `deinit` (any thread).
-    nonisolated private func tearDownProjectsWatcher() {
-        let run = { [self] in tearDownProjectsWatcherAssumingMain() }
-        if Thread.isMainThread {
-            run()
-        } else {
-            DispatchQueue.main.sync(execute: run)
-        }
-    }
-
-    /// FSEvents teardown; caller must already be on the main queue.
-    nonisolated private func tearDownProjectsWatcherAssumingMain() {
-        // Flip cancel before stopping so any already-queued callback no-ops
-        // instead of touching a dying AppState / freed box.
-        projectsWatcherBox?.cancel()
-        if let stream = fsEventStream {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            fsEventStream = nil
-        }
-        let box = projectsWatcherBox
-        projectsWatcherBox = nil
-        // Keep the box alive until after previously queued main-queue
-        // callbacks drain (Invalidate does not flush them).
-        if let box {
-            DispatchQueue.main.async { _ = box }
-        }
+        processMonitor.stopAll()
     }
 
     deinit {
         // Must not use MainActor.assumeIsolated: async callers (notably XCTest)
-        // can release AppState off the main actor via ARC. Weak-boxed FSEvents
-        // + main-synced Timer/FSEvents teardown keep discovery crash-free.
+        // can release AppState off the main actor via ARC. Main-synced Timer
+        // teardown keeps it crash-free. The discovery coordinator (FSEvents,
+        // scans) and the process monitor (exit sources) tear down their own
+        // when they are released.
         tearDownMainThreadResources()
-        discoveryScanTask?.cancel()
-        codexDesktopDiscoveryScanTask?.cancel()
         cursorSubagentIndexTask?.cancel()
         cursorSubagentIndexRecheck?.cancel()
         codexAppServerReconnectTask?.cancel()
-        for (_, monitor) in processMonitors {
-            monitor.source.cancel()
-        }
     }
 
-    /// Invalidates main-run-loop Timers and the FSEvents watcher in one main-queue
-    /// hop. Safe from any thread so `deinit` stays uniformly main-safe.
+    /// Invalidates main-run-loop Timers in one main-queue hop. Safe from any
+    /// thread so `deinit` stays uniformly main-safe.
     nonisolated private func tearDownMainThreadResources() {
         let teardown = { [self] in
-            rotationTimer?.invalidate()
-            rotationTimer = nil
+            rotation.tearDownAssumingMain()
             cleanupTimer?.invalidate()
             cleanupTimer = nil
             saveTimer?.invalidate()
             saveTimer = nil
-            tearDownProjectsWatcherAssumingMain()
         }
         if Thread.isMainThread {
             teardown()
         } else {
             DispatchQueue.main.sync(execute: teardown)
         }
-    }
-
-    struct DiscoveredSession {
-        let sessionId: String
-        let cwd: String
-        let tty: String?
-        let model: String?
-        let pid: pid_t?
-        let modifiedAt: Date
-        let recentMessages: [ChatMessage]
-        var source: String = "claude"
-        /// Absolute path to the JSONL transcript this session was discovered from.
-        /// When non-nil and the session is still live, AppState registers a JSONLTailer
-        /// so incremental assistant appends reach the UI without another full scan.
-        var transcriptPath: String? = nil
-        var parentSessionId: String? = nil
-        var subagentStatus: String? = nil
-        var agentType: String? = nil
-        var agentNickname: String? = nil
-        /// Optional status inferred by a provider-specific discovery path.
-        var status: AgentStatus? = nil
-        /// Native host bundle when discovery represents an app session.
-        var termBundleId: String? = nil
-        /// Provider's raw thread ID when the tracking key uses a namespace prefix.
-        var providerSessionId: String? = nil
-    }
-
-    /// Find running `claude` processes, match to transcript files, extract recent messages
-    private nonisolated static func findActiveClaudeSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        // Step 1: find running claude processes using native APIs
-        let claudePids = findClaudePids(candidatePids: candidatePids)
-        guard !claudePids.isEmpty else { return [] }
-
-        let fm = FileManager.default
-        let processes = claudePids.compactMap { pid -> ClaudeDiscoveryProcess? in
-            guard let cwd = getCwd(for: pid), !cwd.isEmpty else { return nil }
-            // Skip subagent worktrees — they are child tasks, not independent sessions
-            if cwd.contains("/.claude/worktrees/agent-") || cwd.contains("/.git/worktrees/agent-") {
-                return nil
-            }
-            // Process start time filters stale transcript files
-            return ClaudeDiscoveryProcess(pid: pid, cwd: cwd, startTime: getProcessStartTime(pid))
-        }
-
-        // Each process is matched in the config dir it writes to (its
-        // CLAUDE_CONFIG_DIR); ConfigRootDiscovery places the ones whose
-        // environment cannot be read and skips paused dirs.
-        let scan = configRootScan(for: .claude)
-        // Processes in the same cwd share a project dir (a dozen terminals in ~
-        // is common): list each dir once per scan, not once per process.
-        var listings: [String: [ClaudeTranscriptFile]] = [:]
-        func transcripts(in projectPath: String) -> [ClaudeTranscriptFile]? {
-            if let cached = listings[projectPath] { return cached }
-            guard let files = claudeTranscriptFiles(in: projectPath, fm: fm) else { return nil }
-            listings[projectPath] = files
-            return files
-        }
-        return ConfigRootDiscovery.run(
-            processes: processes,
-            lookup: { scan.lookup(pid: $0.pid) },
-            fallbackRoots: scan.fallbackRoots,
-            discover: { root, group, claimed in
-                var taken = claimed
-                return group.compactMap { process in
-                    guard let session = claudeSession(
-                        for: process, root: root, excluding: taken, transcripts: transcripts(in:)
-                    ) else {
-                        return nil
-                    }
-                    taken.insert(session.sessionId)
-                    return session
-                }
-            },
-            sessionId: \.sessionId,
-            belongsTo: { $0.pid == $1.pid }
-        )
-    }
-
-    struct ClaudeDiscoveryProcess {
-        let pid: pid_t
-        let cwd: String
-        let startTime: Date?
-    }
-
-    struct ClaudeTranscriptFile {
-        let name: String
-        let modified: Date
-    }
-
-    /// The `.jsonl` transcripts in one Claude project dir with their mtimes,
-    /// read in one bulk directory listing instead of a stat per file.
-    ///
-    /// Unlike `contentsOfDirectory(atPath:)`, the URL listing fails on a
-    /// project dir that is itself a symlink, so resolve the dir first. Entries
-    /// are not resolved: a symlinked transcript still reports its own mtime,
-    /// as the per-file stat did.
-    nonisolated static func claudeTranscriptFiles(in projectPath: String, fm: FileManager) -> [ClaudeTranscriptFile]? {
-        guard let urls = try? fm.contentsOfDirectory(
-            at: URL(fileURLWithPath: projectPath, isDirectory: true).resolvingSymlinksInPath(),
-            includingPropertiesForKeys: [.contentModificationDateKey]
-        ) else { return nil }
-        return urls.compactMap { url in
-            let name = url.lastPathComponent
-            guard name.hasSuffix(".jsonl"),
-                  let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-            else { return nil }
-            return ClaudeTranscriptFile(name: name, modified: modified)
-        }
-    }
-
-    /// One claude process → its CWD → the single most recent .jsonl under `root`.
-    private nonisolated static func claudeSession(
-        for process: ClaudeDiscoveryProcess,
-        root: String,
-        excluding claimed: Set<String>,
-        transcripts: (_ projectPath: String) -> [ClaudeTranscriptFile]?
-    ) -> DiscoveredSession? {
-        let projectPath = "\(root)/projects/\(process.cwd.claudeProjectDirEncoded())"
-        guard let files = transcripts(projectPath) else { return nil }
-
-        // Find the most recently modified .jsonl that was written AFTER this process started
-        var bestFile: String?
-        var bestDate = Date.distantPast
-        for file in files where file.modified > bestDate {
-            // Skip files from old sessions: must be modified after process started
-            if let start = process.startTime, file.modified < start.addingTimeInterval(-10) {
-                continue
-            }
-            bestDate = file.modified
-            bestFile = file.name
-        }
-
-        guard let file = bestFile else { return nil }
-
-        // Skip stale transcripts: only show sessions active within last 5 minutes.
-        // When processStart is unknown (proc_pidinfo failed), use a tighter 30s window
-        // to avoid resurrecting zombie sessions from stale transcript files.
-        let freshnessLimit: TimeInterval = process.startTime != nil ? -300 : -30
-        if bestDate.timeIntervalSinceNow < freshnessLimit { return nil }
-
-        let sessionId = String(file.dropLast(6))
-        guard !claimed.contains(sessionId) else { return nil }
-
-        let fullPath = "\(projectPath)/\(file)"
-        let (model, messages) = readRecentFromTranscript(path: fullPath)
-
-        return DiscoveredSession(
-            sessionId: sessionId,
-            cwd: process.cwd,
-            tty: nil,
-            model: model,
-            pid: process.pid,
-            modifiedAt: bestDate,
-            recentMessages: messages,
-            transcriptPath: fullPath
-        )
-    }
-
-    private nonisolated static func allProcessIds() -> [pid_t] {
-        var bufferSize = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
-        guard bufferSize > 0 else { return [] }
-        var pids = [pid_t](repeating: 0, count: Int(bufferSize) / MemoryLayout<pid_t>.size + 10)
-        bufferSize = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids, bufferSize)
-        let count = Int(bufferSize) / MemoryLayout<pid_t>.size
-        return Array(pids.prefix(count)).filter { $0 > 0 }
-    }
-
-    private nonisolated static func executablePath(for pid: pid_t) -> String? {
-        var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        let len = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
-        guard len > 0 else { return nil }
-        return String(cString: pathBuffer)
-    }
-
-    private nonisolated static func findPids(
-        matchingPathSubstrings pathSubstrings: [String],
-        argSubstrings: [String] = [],
-        candidatePids: [pid_t]? = nil
-    ) -> [pid_t] {
-        let loweredPaths = pathSubstrings.map { $0.lowercased() }
-        let loweredArgs = argSubstrings.map { $0.lowercased() }
-        guard !loweredPaths.isEmpty || !loweredArgs.isEmpty else { return [] }
-
-        var matched: [pid_t] = []
-        for pid in candidatePids ?? allProcessIds() {
-            guard let path = executablePath(for: pid)?.lowercased() else { continue }
-            if loweredPaths.contains(where: { path.contains($0) }) {
-                matched.append(pid)
-                continue
-            }
-            guard !loweredArgs.isEmpty,
-                  let args = getProcessArgs(pid)?.map({ $0.lowercased() }) else { continue }
-            if args.contains(where: { arg in loweredArgs.contains(where: { arg.contains($0) }) }) {
-                matched.append(pid)
-            }
-        }
-        return matched
-    }
-
-    /// Get PIDs of running Claude Code processes
-    /// Claude's binary is named by version (e.g. "2.1.91") under ~/.local/share/claude/versions/
-    private nonisolated static func findClaudePids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        let claudeVersionsDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/share/claude/versions").path
-
-        var claudePids: [pid_t] = []
-
-        for pid in candidatePids ?? allProcessIds() {
-            guard let path = executablePath(for: pid) else { continue }
-            // Match processes whose executable is under claude's versions directory
-            if path.hasPrefix(claudeVersionsDir) {
-                claudePids.append(pid)
-            }
-        }
-        return claudePids
-    }
-
-    private nonisolated static func findGeminiPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [],
-            argSubstrings: [
-                "/gemini-cli/bundle/gemini.js",
-                "/opt/homebrew/bin/gemini",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findCursorPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/cursor.app/contents/macos/cursor",
-                "/cursor.app/contents/frameworks/cursor helper",
-                "/.local/share/cursor-agent/versions/",
-            ],
-            argSubstrings: ["/cursor-agent/index.js"],
-            candidatePids: candidatePids
-        )
-    }
-
-    /// Standalone Cursor CLI agent — must not match the desktop IDE/helper
-    /// processes that `findCursorPids` also covers (#248).
-    private nonisolated static func findCursorCliPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/.local/share/cursor-agent/versions/",
-            ],
-            argSubstrings: ["/cursor-agent/index.js"],
-            candidatePids: candidatePids
-        )
-    }
-
-    /// The IDE's main and helper processes, under either bundle name (#327).
-    /// The executable was renamed alongside the bundle (`Electron` → `Qoder`),
-    /// so the main process is matched by its `MacOS/` directory rather than by
-    /// a binary name that also changed.
-    private nonisolated static func findQoderPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: qoderIDEBundlePrefixes.flatMap {
-                ["\($0)macos/", "\($0)frameworks/qoder helper"]
-            } + ["/.qoder/bin/qodercli/"],
-            candidatePids: candidatePids
-        )
-    }
-
-    /// Standalone Qoder CLI — must not match the desktop IDE/helper (#248).
-    /// Both Qoder CLI builds: the international `qodercli` under ~/.qoder and the
-    /// China build `qoderclicn` under ~/.qoder-cn. Same hook contract, one source
-    /// (#289) — the CN binary is a separate build, so its own paths are needed.
-    private nonisolated static func findQoderCliPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/.qoder/bin/qodercli/",
-                "/@qoder-ai/qodercli",
-                "/.qoder-cn/bin/qoderclicn/",
-                "/@qoder-ai/qoderclicn",
-            ],
-            argSubstrings: [
-                "/opt/homebrew/bin/qodercli",
-                "/usr/local/bin/qodercli",
-                "/.local/bin/qodercli",
-                "/opt/homebrew/bin/qoderclicn",
-                "/usr/local/bin/qoderclicn",
-                "/.local/bin/qoderclicn",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    /// QoderWork desktop app (#249). Bundle layout is assumed from the standard
-    /// /Applications/QoderWork.app install — no public bundle id / binary name
-    /// docs, pending real-install verification. "/qoderwork.app/" never collides
-    /// with the IDE's "/qoder.app/" substrings.
-    private nonisolated static func findQoderWorkPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/qoderwork.app/contents/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findFactoryPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/factory.app/contents/macos/electron",
-                "/factory.app/contents/frameworks/factory helper",
-                "/.local/bin/droid",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findCodeBuddyPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/codebuddy.app/contents/macos/electron",
-                "/codebuddy.app/contents/frameworks/codebuddy helper",
-            ],
-            argSubstrings: [
-                "/@tencent-ai/codebuddy-code/bin/codebuddy",
-                "/opt/homebrew/bin/codebuddy",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findCodyBuddyCNPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/codebuddycn.app/contents/macos/electron",
-                "/codebuddycn.app/contents/frameworks/codebuddycn helper",
-                "/.codybuddycn/",
-                "/.codebuddycn/",
-            ],
-            argSubstrings: [
-                "/.codybuddycn/",
-                "/.codebuddycn/",
-                "/opt/homebrew/bin/codybuddycn",
-                "/opt/homebrew/bin/codebuddycn",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findStepFunPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/stepfun.app/contents/macos/stepfun",
-                "/.stepfun/",
-            ],
-            argSubstrings: [
-                "/opt/homebrew/bin/stepfun",
-                "/.stepfun/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findTraePids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/trae.app/contents/macos/trae",
-                "/trae.app/contents/frameworks/trae helper",
-                "/.trae/",
-            ],
-            argSubstrings: [
-                "/opt/homebrew/bin/trae",
-                "/.trae/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findTraeCNPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: CLIProcessResolver.traeCNBundlePathMarkers + [
-                "/trae-cn.app/contents/macos/trae",
-                "/.traecn/",
-                "/.trae-cn/",
-            ],
-            argSubstrings: [
-                "/opt/homebrew/bin/traecn",
-                "/opt/homebrew/bin/trae-cn",
-                "/.traecn/",
-                "/.trae-cn/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findTraeCliPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/opt/homebrew/bin/coco",
-                "/opt/homebrew/bin/traecli",
-                "/usr/local/bin/coco",
-                "/usr/local/bin/traecli",
-                "/.local/bin/coco",
-                "/.local/bin/traecli",
-            ],
-            argSubstrings: [
-                "/opt/homebrew/bin/coco",
-                "/opt/homebrew/bin/traecli",
-                "/usr/local/bin/coco",
-                "/usr/local/bin/traecli",
-                "/.local/bin/coco",
-                "/.local/bin/traecli",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findAntiGravityPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/.antigravity/antigravity/bin/antigravity",
-                "/antigravity.app/contents/macos/antigravity",
-            ],
-            argSubstrings: [
-                "/.antigravity/antigravity/bin/antigravity",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    /// Google Antigravity (Gemini-based IDE/CLI, #215). The actionable agent is the
-    /// `agy` CLI (pypi google-antigravity) launched from the IDE's integrated
-    /// terminal; the IDE itself is Antigravity.app (com.google.antigravity).
-    /// We match the IDE app *only* via the Google-specific .app path component to
-    /// avoid colliding with the existing "antigravity" Claude-fork CLI (which lives
-    /// under ~/.antigravity, never in an .app named exactly "antigravity").
-    private nonisolated static func findGoogleAntigravityPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/antigravity.app/contents/macos/",
-                "/bin/agy",
-            ],
-            argSubstrings: [
-                "/google-antigravity/",
-                "/antigravity-cli/",
-                "/bin/agy",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findWorkBuddyPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/workbuddy.app/contents/macos/workbuddy",
-                "/.workbuddy/",
-            ],
-            argSubstrings: [
-                "/opt/homebrew/bin/workbuddy",
-                "/.workbuddy/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findHermesPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/.local/bin/hermes",
-                "/hermes.app/contents/macos/hermes",
-                "/.hermes/hermes-agent/",
-            ],
-            argSubstrings: [
-                "/.local/bin/hermes",
-                "/.hermes/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    // Electron app (.dmg distribution) — packaged executable path unverified
-    // on a real machine; best-effort guess pending field report (#245).
-    private nonisolated static func findZcodePids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/zcode.app/contents/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findQwenPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/.local/bin/qwen",
-                "/.bun/bin/qwen",
-            ],
-            argSubstrings: [
-                "/@qwen-code/qwen-code/",
-                "/.qwen/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findKimiPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/.kimi-code/bin/kimi",
-                "/.local/bin/kimi",
-                "/.local/share/uv/tools/kimi-cli/",
-            ],
-            argSubstrings: [
-                "/kimi-cli/",
-                "kimi_cli",
-                "/.kimi-code/",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findGrokPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        (candidatePids ?? allProcessIds()).filter { pid in
-            guard let path = executablePath(for: pid) else { return false }
-            return CLIProcessResolver.sourceMatchesExecutablePath(path, source: "grok")
-        }
-    }
-
-    private nonisolated static func findMinimaxPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        // mcode is a Node script, so proc_pidpath is the node binary; the
-        // Node runtime renames its process title to `minimax-code`, which is
-        // what argv carries. Match whole arguments, not substrings: helpers
-        // mcode spawns in the session's cwd live under the same package
-        // (bundled ripgrep in .../@minimax-ai/code/node_modules/, the
-        // `mcode-tools` bin), and binding the card to one of those would end
-        // it when the helper exits.
-        (candidatePids ?? allProcessIds()).filter { pid in
-            getProcessArgs(pid).map(isMinimaxProcessArgs) ?? false
-        }
-    }
-
-    nonisolated static func isMinimaxProcessArgs(_ args: [String]) -> Bool {
-        args.contains { arg in
-            let lowered = arg.lowercased()
-            return lowered == "minimax-code"
-                || lowered.hasSuffix("/bin/mcode")
-                || lowered.hasSuffix("/@minimax-ai/code/cli.js")
-        }
-    }
-
-    private nonisolated static func findPiPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/pi-coding-agent/",
-                "/.local/bin/pi",
-                "/.local/bin/omp",
-                "/bin/pi",
-                "/bin/omp",
-            ],
-            argSubstrings: [
-                "pi-coding-agent",
-                "/.local/bin/omp",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func md5Hash(of string: String) -> String {
-        let digest = Insecure.MD5.hash(data: Data(string.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private nonisolated static func findActiveKimiSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let kimiPids = findKimiPids(candidatePids: candidatePids)
-        guard !kimiPids.isEmpty else { return [] }
-
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
-        // Legacy kimi-cli hashes cwd under sessions/; kimi-code may only need
-        // session_index.jsonl, so do not bail when these dirs are absent.
-        let sessionsBases = ["\(home)/.kimi-code/sessions", "\(home)/.kimi/sessions"]
-            .filter { fm.fileExists(atPath: $0) }
-
-        var results: [DiscoveredSession] = []
-        var seenSessionIds: Set<String> = []
-
-        for pid in kimiPids {
-            guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { continue }
-            let processStart = getProcessStartTime(pid)
-
-            // Prefer kimi-code session_index.jsonl (workDir → sessionDir mapping).
-            if let indexed = discoverKimiCodeSessionFromIndex(
-                home: home,
-                cwd: cwd,
-                pid: pid,
-                processStart: processStart,
-                fm: fm
-            ), !seenSessionIds.contains(indexed.sessionId) {
-                seenSessionIds.insert(indexed.sessionId)
-                results.append(indexed)
-                continue
-            }
-
-            // Legacy kimi-cli: ~/.kimi/sessions/<md5(cwd)>/<sessionId>/wire.jsonl
-            let workdirHash = md5Hash(of: cwd)
-            for sessionsBase in sessionsBases {
-                let workdirPath = "\(sessionsBase)/\(workdirHash)"
-                guard fm.fileExists(atPath: workdirPath),
-                      let sessionDirs = try? fm.contentsOfDirectory(atPath: workdirPath) else { continue }
-
-                var bestPath: String?
-                var bestDate = Date.distantPast
-                var bestSessionId: String?
-
-                for sessionId in sessionDirs {
-                    let wirePath = "\(workdirPath)/\(sessionId)/wire.jsonl"
-                    guard fm.fileExists(atPath: wirePath),
-                          let attrs = try? fm.attributesOfItem(atPath: wirePath),
-                          let modified = attrs[.modificationDate] as? Date,
-                          modified > bestDate else { continue }
-                    if let start = processStart, modified < start.addingTimeInterval(-10) {
-                        continue
-                    }
-                    bestPath = wirePath
-                    bestDate = modified
-                    bestSessionId = sessionId
-                }
-
-                guard let path = bestPath, let sessionId = bestSessionId else { continue }
-                let freshnessLimit: TimeInterval = processStart != nil ? -300 : -30
-                if bestDate.timeIntervalSinceNow < freshnessLimit { continue }
-
-                let (_, messages) = readRecentFromKimiTranscript(path: path)
-                guard !seenSessionIds.contains(sessionId) else { continue }
-                seenSessionIds.insert(sessionId)
-
-                results.append(DiscoveredSession(
-                    sessionId: sessionId,
-                    cwd: cwd,
-                    tty: nil,
-                    model: nil,
-                    pid: pid,
-                    modifiedAt: bestDate,
-                    recentMessages: messages,
-                    source: "kimi"
-                ))
-                break
-            }
-        }
-
-        return results
-    }
-
-    /// kimi-code tracks sessions in `~/.kimi-code/session_index.jsonl` with
-    /// `{ sessionId, sessionDir, workDir }` — workdir folders are no longer md5(cwd).
-    /// `home` is the user home directory (fixture-injectable for tests).
-    private nonisolated static func discoverKimiCodeSessionFromIndex(
-        home: String,
-        cwd: String,
-        pid: pid_t,
-        processStart: Date?,
-        fm: FileManager
-    ) -> DiscoveredSession? {
-        let indexPath = "\(home)/.kimi-code/session_index.jsonl"
-        guard fm.fileExists(atPath: indexPath),
-              let data = fm.contents(atPath: indexPath),
-              let text = String(data: data, encoding: .utf8) else { return nil }
-
-        var best: (sessionId: String, sessionDir: String, modified: Date)?
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let workDir = json["workDir"] as? String,
-                  workDir == cwd,
-                  let sessionId = json["sessionId"] as? String,
-                  let sessionDir = json["sessionDir"] as? String
-            else { continue }
-
-            let statePath = "\(sessionDir)/state.json"
-            let stampPath = fm.fileExists(atPath: statePath) ? statePath : sessionDir
-            guard let attrs = try? fm.attributesOfItem(atPath: stampPath),
-                  let modified = attrs[.modificationDate] as? Date else { continue }
-            if let start = processStart, modified < start.addingTimeInterval(-10) {
-                continue
-            }
-            if best == nil || modified > best!.modified {
-                best = (sessionId, sessionDir, modified)
-            }
-        }
-
-        guard let match = best else { return nil }
-        let freshnessLimit: TimeInterval = processStart != nil ? -300 : -30
-        if match.modified.timeIntervalSinceNow < freshnessLimit { return nil }
-
-        // kimi-code keeps the transcript under agents/main/wire.jsonl.
-        let wirePath = "\(match.sessionDir)/agents/main/wire.jsonl"
-        let messages: [ChatMessage]
-        if fm.fileExists(atPath: wirePath) {
-            messages = readRecentFromKimiTranscript(path: wirePath).1
-        } else {
-            messages = []
-        }
-
-        return DiscoveredSession(
-            sessionId: match.sessionId,
-            cwd: cwd,
-            tty: nil,
-            model: nil,
-            pid: pid,
-            modifiedAt: match.modified,
-            recentMessages: messages,
-            source: "kimi"
-        )
-    }
-
-    /// Test seam for ``discoverKimiCodeSessionFromIndex`` without exposing
-    /// private ``DiscoveredSession``.
-    internal nonisolated static func discoverKimiCodeSessionFromIndexForTesting(
-        home: String,
-        cwd: String,
-        pid: pid_t,
-        processStart: Date?,
-        fm: FileManager
-    ) -> (sessionId: String, cwd: String, pid: pid_t?, source: String, messageTexts: [String])? {
-        guard let match = discoverKimiCodeSessionFromIndex(
-            home: home,
-            cwd: cwd,
-            pid: pid,
-            processStart: processStart,
-            fm: fm
-        ) else { return nil }
-        return (
-            match.sessionId,
-            match.cwd,
-            match.pid,
-            match.source,
-            match.recentMessages.map(\.text)
-        )
-    }
-
-    /// Parse recent chat turns from a Kimi wire.jsonl transcript.
-    /// Supports legacy kimi-cli (`message.type = TurnBegin|ContentPart|TurnEnd`)
-    /// and kimi-code (`turn.prompt` / `context.append_message` / `content.part`).
-    internal nonisolated static func readRecentFromKimiTranscript(path: String) -> (String?, [ChatMessage]) {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, []) }
-        defer { handle.closeFile() }
-
-        let fileSize = handle.seekToEndOfFile()
-        let readSize: UInt64 = min(fileSize, 262_144)
-        handle.seek(toFileOffset: fileSize - readSize)
-        let data = handle.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return (nil, []) }
-
-        var messages: [ChatMessage] = []
-        var previousUserText: String?
-        var previousAssistantText: String = ""
-        /// True when the current open turn was started by `context.append_message`
-        /// rather than `turn.prompt` — used so a later `turn.prompt` can replace
-        /// the user text without flushing a duplicate line.
-        var turnOpenedByAppend = false
-
-        func flushTurn() {
-            if let userText = previousUserText, !userText.isEmpty {
-                messages.append(ChatMessage(isUser: true, text: userText))
-                if !previousAssistantText.isEmpty {
-                    messages.append(ChatMessage(isUser: false, text: previousAssistantText))
-                }
-            }
-            previousUserText = nil
-            previousAssistantText = ""
-            turnOpenedByAppend = false
-        }
-
-        func textParts(from value: Any?) -> String {
-            let parts: [[String: Any]]
-            if let typed = value as? [[String: Any]] {
-                parts = typed
-            } else if let anyParts = value as? [Any] {
-                parts = anyParts.compactMap { $0 as? [String: Any] }
-            } else {
-                return ""
-            }
-            return parts.compactMap { part -> String? in
-                if let type = part["type"] as? String, type != "text" { return nil }
-                return part["text"] as? String
-            }.joined()
-        }
-
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
-            else { continue }
-
-            // Legacy kimi-cli envelope: { "message": { "type": "TurnBegin"|... } }
-            if let message = json["message"] as? [String: Any],
-               let type = message["type"] as? String {
-                switch type {
-                case "TurnBegin":
-                    flushTurn()
-                    if let payload = message["payload"] as? [String: Any] {
-                        previousUserText = textParts(from: payload["user_input"])
-                    }
-                case "ContentPart":
-                    if let payload = message["payload"] as? [String: Any],
-                       payload["type"] as? String == "text",
-                       let textContent = payload["text"] as? String {
-                        previousAssistantText += textContent
-                    }
-                case "TurnEnd":
-                    flushTurn()
-                default:
-                    break
-                }
-                continue
-            }
-
-            // kimi-code wire protocol (v1.4+).
-            // Observed order: turn.prompt opens a turn, then optional
-            // context.append_message (same user text), then content.part replies.
-            // Prefer turn.prompt when both exist. If append_message arrives first
-            // (defensive), mark the turn so the later turn.prompt replaces the
-            // user text instead of flushing a duplicate user line.
-            switch json["type"] as? String {
-            case "turn.prompt":
-                let promptText = textParts(from: json["input"])
-                if turnOpenedByAppend && previousAssistantText.isEmpty {
-                    // Replace append-opened user text only when turn.prompt has
-                    // content; an empty prompt must not wipe the append line.
-                    if !promptText.isEmpty {
-                        previousUserText = promptText
-                    }
-                } else {
-                    flushTurn()
-                    previousUserText = promptText
-                }
-                turnOpenedByAppend = false
-            case "context.append_message":
-                if let message = json["message"] as? [String: Any],
-                   message["role"] as? String == "user" {
-                    let userText = textParts(from: message["content"])
-                    if !userText.isEmpty {
-                        // Prefer turn.prompt when both exist for the same turn;
-                        // only start a turn here if we don't already have one open.
-                        if previousUserText == nil {
-                            previousUserText = userText
-                            turnOpenedByAppend = true
-                        }
-                    }
-                }
-            case "context.append_loop_event":
-                if let event = json["event"] as? [String: Any],
-                   event["type"] as? String == "content.part",
-                   let part = event["part"] as? [String: Any],
-                   part["type"] as? String == "text",
-                   let textContent = part["text"] as? String {
-                    previousAssistantText += textContent
-                }
-            default:
-                break
-            }
-        }
-
-        flushTurn()
-        return (nil, Array(messages.suffix(3)))
-    }
-
-    /// Grok percent-encodes the full cwd into a single directory component,
-    /// including `/` as `%2F` (for example `/Users/me` -> `%2FUsers%2Fme`).
-    nonisolated static func grokEncodedCwd(_ cwd: String) -> String? {
-        GrokSessionPaths.encodedCwd(cwd)
-    }
-
-    struct GrokSessionCandidate {
-        let sessionId: String
-        /// `sessions/<encoded-cwd>/<id>`; nil when only Grok's search index
-        /// knows the session, so there is no transcript to read or tail.
-        let directory: String?
-        let model: String?
-        let createdAt: Date?
-        let activityAt: Date
-    }
-
-    /// Grok mints UUIDv7 session ids (a client may pass its own with `-s`),
-    /// whose leading 48 bits are the creation time in Unix milliseconds. That
-    /// stands in for `summary.json`'s `created_at` when it is missing, and is
-    /// the only creation time for a session known only to the search index.
-    nonisolated static func grokSessionCreationDate(fromSessionId sessionId: String) -> Date? {
-        guard let uuid = UUID(uuidString: sessionId)?.uuid,
-              uuid.6 >> 4 == 7,
-              uuid.8 & 0xC0 == 0x80 else { return nil }
-        let milliseconds = [uuid.0, uuid.1, uuid.2, uuid.3, uuid.4, uuid.5]
-            .reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
-        return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1000)
-    }
-
-    /// Sessions that Grok's search index (`sessions/session_search.sqlite`,
-    /// table `session_docs`) records for `cwd`, most recently updated first.
-    /// Grok writes the index live in WAL mode, so it is opened read-only
-    /// through SQLite (never `immutable`, which would skip the WAL), and an
-    /// unexpected schema yields no rows rather than a guess.
-    nonisolated static func grokIndexedSessions(
-        databasePath: String,
-        cwd: String,
-        limit: Int = 50
-    ) -> [(sessionId: String, updatedAt: Date)] {
-        withSQLiteDatabase(at: databasePath) { db -> [(sessionId: String, updatedAt: Date)]? in
-            let columns = sqliteTableColumns(db: db, tableName: "session_docs")
-            guard columns.isSuperset(of: ["session_id", "cwd", "updated_at"]),
-                  let statement = prepareSQLiteStatement(
-                    db: db,
-                    sql: """
-                        SELECT session_id, updated_at
-                        FROM session_docs
-                        WHERE cwd = ?
-                        ORDER BY updated_at DESC
-                        LIMIT ?;
-                        """
-                  ) else {
-                return nil
-            }
-            defer { sqlite3_finalize(statement) }
-            bindSQLiteText(cwd, to: statement, index: 1)
-            sqlite3_bind_int(statement, 2, Int32(clamping: limit))
-
-            var rows: [(sessionId: String, updatedAt: Date)] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                guard let sessionId = sqliteColumnString(statement, index: 0),
-                      !sessionId.isEmpty else { continue }
-                let raw = sqlite3_column_int64(statement, 1)
-                guard raw > 0 else { continue }
-                // Schema v4 stores Unix seconds; tolerate milliseconds.
-                let seconds = raw > 100_000_000_000 ? Double(raw) / 1000 : Double(raw)
-                rows.append((sessionId, Date(timeIntervalSince1970: seconds)))
-            }
-            return rows
-        } ?? []
-    }
-
-    /// Score a metadata session against a live Grok process. Grok's native
-    /// hooks are authoritative once a turn starts; discovery is only a recovery
-    /// path, so it must prefer missing a late `/new` over attaching a completed
-    /// one-shot session to an unrelated long-lived process in the same cwd.
-    nonisolated static func grokSessionProcessMatchScore(
-        createdAt: Date?,
-        activityAt: Date,
-        processStart: Date?,
-        now: Date = Date()
-    ) -> TimeInterval? {
-        guard let processStart else {
-            let age = now.timeIntervalSince(activityAt)
-            guard age >= -10, age <= 30 else { return nil }
-            return 1_000 + max(age, 0)
-        }
-
-        guard activityAt >= processStart.addingTimeInterval(-10) else { return nil }
-
-        if let createdAt {
-            let creationDelta = createdAt.timeIntervalSince(processStart)
-            if abs(creationDelta) <= 120 {
-                return abs(creationDelta)
-            }
-
-            // A resumed session was created before this process. Accept it only
-            // while its first recovered activity is still close to launch.
-            if createdAt < processStart {
-                let activityDelta = activityAt.timeIntervalSince(processStart)
-                if activityDelta >= -10, activityDelta <= 120 {
-                    return 300 + abs(activityDelta)
-                }
-            }
-            return nil
-        }
-
-        let activityDelta = activityAt.timeIntervalSince(processStart)
-        guard activityDelta >= -10, activityDelta <= 120 else { return nil }
-        return 600 + abs(activityDelta)
-    }
-
-    /// Produce a one-to-one mapping for Grok processes that share a cwd. The
-    /// newest viable session is assigned first and prefers its closest process
-    /// start. An augmenting path may move an earlier assignment to its next-best
-    /// process when that is required to keep another viable session visible.
-    nonisolated static func matchGrokSessionsToProcesses(
-        processes: [(pid: pid_t, startedAt: Date?)],
-        sessions: [(id: String, createdAt: Date?, activityAt: Date)],
-        now: Date = Date()
-    ) -> [String: pid_t] {
-        typealias Edge = (pid: pid_t, score: TimeInterval)
-        let orderedSessions = sessions.sorted { lhs, rhs in
-            if lhs.activityAt != rhs.activityAt {
-                return lhs.activityAt > rhs.activityAt
-            }
-            return lhs.id < rhs.id
-        }
-        var edgesBySession: [String: [Edge]] = [:]
-
-        for session in orderedSessions where edgesBySession[session.id] == nil {
-            edgesBySession[session.id] = processes.compactMap { process in
-                guard let score = grokSessionProcessMatchScore(
-                    createdAt: session.createdAt,
-                    activityAt: session.activityAt,
-                    processStart: process.startedAt,
-                    now: now
-                ) else { return nil }
-                return (process.pid, score)
-            }.sorted { lhs, rhs in
-                if lhs.score != rhs.score {
-                    return lhs.score < rhs.score
-                }
-                return lhs.pid < rhs.pid
-            }
-        }
-
-        var sessionByPid: [pid_t: String] = [:]
-
-        func assign(_ sessionId: String, visitedPids: inout Set<pid_t>) -> Bool {
-            guard let edges = edgesBySession[sessionId] else { return false }
-
-            // Preserve earlier (newer) choices when this session has an unused
-            // viable PID of its own.
-            if let freeEdge = edges.first(where: {
-                !visitedPids.contains($0.pid) && sessionByPid[$0.pid] == nil
-            }) {
-                visitedPids.insert(freeEdge.pid)
-                sessionByPid[freeEdge.pid] = sessionId
-                return true
-            }
-
-            // Otherwise find an augmenting path: move the current owner to its
-            // next-best PID, then claim the newly released one.
-            for edge in edges where visitedPids.insert(edge.pid).inserted {
-                guard let displacedSession = sessionByPid[edge.pid] else {
-                    sessionByPid[edge.pid] = sessionId
-                    return true
-                }
-                if assign(displacedSession, visitedPids: &visitedPids) {
-                    sessionByPid[edge.pid] = sessionId
-                    return true
-                }
-            }
-            return false
-        }
-
-        var attemptedSessions: Set<String> = []
-        for session in orderedSessions where attemptedSessions.insert(session.id).inserted {
-            var visitedPids: Set<pid_t> = []
-            _ = assign(session.id, visitedPids: &visitedPids)
-        }
-
-        return Dictionary(uniqueKeysWithValues: sessionByPid.map { ($0.value, $0.key) })
-    }
-
-    /// Grok sessions recorded for `cwd`. The per-session directories are
-    /// Grok's session store and carry the transcript; `session_search.sqlite`
-    /// is Grok's search index over sessions and only adds ones without a
-    /// readable directory here (a cwd too long for one path component is
-    /// stored under a slug+hash name, and a machine can hold sessions whose
-    /// directories are gone). Both layouts can coexist on one machine.
-    nonisolated static func grokSessionCandidates(
-        cwd: String,
-        sessionsRoot: String = "\(ConfigInstaller.grokHome())/sessions",
-        includeIndex: Bool = true,
-        fm: FileManager = .default
-    ) -> [GrokSessionCandidate] {
-        var candidates = grokDirectorySessionCandidates(cwd: cwd, sessionsRoot: sessionsRoot, fm: fm)
-        let indexPath = "\(sessionsRoot)/session_search.sqlite"
-        guard includeIndex, fm.fileExists(atPath: indexPath) else { return candidates }
-
-        let known = Set(candidates.map(\.sessionId))
-        for row in grokIndexedSessions(databasePath: indexPath, cwd: cwd)
-        where !known.contains(row.sessionId) {
-            candidates.append(GrokSessionCandidate(
-                sessionId: row.sessionId,
-                directory: nil,
-                model: nil,
-                createdAt: grokSessionCreationDate(fromSessionId: row.sessionId),
-                activityAt: row.updatedAt
-            ))
-        }
-        return candidates
-    }
-
-    private nonisolated static func grokDirectorySessionCandidates(
-        cwd: String,
-        sessionsRoot: String,
-        fm: FileManager
-    ) -> [GrokSessionCandidate] {
-        guard let encodedCwd = grokEncodedCwd(cwd) else { return [] }
-        let cwdDirectory = "\(sessionsRoot)/\(encodedCwd)"
-        guard let sessionDirectories = try? fm.contentsOfDirectory(atPath: cwdDirectory) else { return [] }
-
-        var candidates: [GrokSessionCandidate] = []
-        for directoryName in sessionDirectories {
-            let directory = "\(cwdDirectory)/\(directoryName)"
-            let summaryPath = "\(directory)/summary.json"
-            guard let data = fm.contents(atPath: summaryPath),
-                  let summary = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let info = summary["info"] as? [String: Any],
-                  let summaryCwd = info["cwd"] as? String,
-                  summaryCwd == cwd else { continue }
-
-            let sessionId = (info["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? directoryName
-            let createdAt = (summary["created_at"] as? String).flatMap(parseISO8601Timestamp)
-                ?? grokSessionCreationDate(fromSessionId: sessionId)
-            let timestamps = ["last_active_at", "updated_at", "created_at"]
-                .compactMap { summary[$0] as? String }
-                .compactMap(parseISO8601Timestamp)
-            var activityAt = timestamps.max() ?? .distantPast
-
-            // File mtimes catch a turn that has started writing events before
-            // summary.json has been refreshed.
-            for filename in ["summary.json", "events.jsonl", "updates.jsonl", "chat_history.jsonl"] {
-                let path = "\(directory)/\(filename)"
-                if let attrs = try? fm.attributesOfItem(atPath: path),
-                   let modified = attrs[.modificationDate] as? Date,
-                   modified > activityAt {
-                    activityAt = modified
-                }
-            }
-
-            candidates.append(GrokSessionCandidate(
-                sessionId: sessionId,
-                directory: directory,
-                model: (summary["current_model_id"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-                createdAt: createdAt,
-                activityAt: activityAt
-            ))
-        }
-        return candidates
-    }
-
-    private nonisolated static func findRecentGrokSession(
-        cwd: String,
-        after processStart: Date?,
-        fm: FileManager = .default
-    ) -> GrokSessionCandidate? {
-        // Model backfill runs on the main actor, and the index has no model.
-        ConfigInstaller.grokHomes()
-            .flatMap { grokSessionCandidates(cwd: cwd, sessionsRoot: "\($0)/sessions", includeIndex: false, fm: fm) }
-            .filter {
-                grokSessionProcessMatchScore(
-                    createdAt: $0.createdAt,
-                    activityAt: $0.activityAt,
-                    processStart: processStart
-                ) != nil
-            }
-            .max { $0.activityAt < $1.activityAt }
-    }
-
-    private nonisolated static func findActiveGrokSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let grokPids = findGrokPids(candidatePids: candidatePids)
-        guard !grokPids.isEmpty else { return [] }
-
-        let fm = FileManager.default
-        let liveProcesses = grokPids.compactMap { pid -> GrokDiscoveryProcess? in
-            guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { return nil }
-            return GrokDiscoveryProcess(pid: pid, cwd: cwd, startedAt: getProcessStartTime(pid))
-        }
-        // Processes compete for sessions only within one root (their
-        // GROK_HOME, grouped by identity) and one cwd: two accounts working in
-        // the same project keep separate stores. See ConfigRootDiscovery for
-        // processes whose environment cannot be read and for paused roots.
-        let scan = configRootScan(for: .grok)
-        return ConfigRootDiscovery.run(
-            processes: liveProcesses,
-            lookup: { scan.lookup(pid: $0.pid) },
-            fallbackRoots: scan.fallbackRoots,
-            discover: { root, processes, claimed in
-                grokSessions(for: processes, sessionsRoot: "\(root)/sessions", excluding: claimed, fm: fm)
-            },
-            sessionId: \.sessionId,
-            belongsTo: { $0.pid == $1.pid }
-        )
-    }
-
-    struct GrokDiscoveryProcess {
-        let pid: pid_t
-        let cwd: String
-        let startedAt: Date?
-    }
-
-    /// Grok sessions under one sessions root for `processes`, matched per cwd.
-    /// Sessions in `claimed` (already taken by another root's processes) are
-    /// not offered, so the matcher can hand a process its next-best one.
-    private nonisolated static func grokSessions(
-        for processes: [GrokDiscoveryProcess],
-        sessionsRoot: String,
-        excluding claimed: Set<String>,
-        fm: FileManager
-    ) -> [DiscoveredSession] {
-        var results: [DiscoveredSession] = []
-        for (cwd, sameCwd) in Dictionary(grouping: processes, by: \.cwd) {
-            let candidates = grokSessionCandidates(cwd: cwd, sessionsRoot: sessionsRoot, fm: fm)
-                .filter { !claimed.contains($0.sessionId) }
-            let assignments = matchGrokSessionsToProcesses(
-                processes: sameCwd.map { ($0.pid, $0.startedAt) },
-                sessions: candidates.map { ($0.sessionId, $0.createdAt, $0.activityAt) }
-            )
-
-            for candidate in candidates {
-                guard let pid = assignments[candidate.sessionId] else { continue }
-                // Index-only sessions have no transcript; never point the
-                // tailer at a file that is not there.
-                let chatPath = candidate.directory
-                    .map { "\($0)/chat_history.jsonl" }
-                    .flatMap { fm.fileExists(atPath: $0) ? $0 : nil }
-                let messages = chatPath.map { readRecentFromTranscript(path: $0).1 } ?? []
-                results.append(grokDiscoveredSession(
-                    sessionId: candidate.sessionId,
-                    cwd: cwd,
-                    model: candidate.model,
-                    pid: pid,
-                    modifiedAt: candidate.activityAt,
-                    recentMessages: messages,
-                    transcriptPath: chatPath
-                ))
-            }
-        }
-        return results
-    }
-
-    /// Grok hooks and Grok discovery both key a card by Grok's own session id,
-    /// so the discovered id doubles as the provider id. Carrying it stops the
-    /// same-PID dedup in `integrateDiscovered` from folding a different Grok
-    /// session — such as the one `/resume` just loaded — into an existing card
-    /// and rewriting that card's identity, transcript and messages (#318).
-    nonisolated static func grokDiscoveredSession(
-        sessionId: String,
-        cwd: String,
-        model: String?,
-        pid: pid_t,
-        modifiedAt: Date,
-        recentMessages: [ChatMessage],
-        transcriptPath: String?
-    ) -> DiscoveredSession {
-        DiscoveredSession(
-            sessionId: sessionId,
-            cwd: cwd,
-            tty: nil,
-            model: model,
-            pid: pid,
-            modifiedAt: modifiedAt,
-            recentMessages: recentMessages,
-            source: "grok",
-            transcriptPath: transcriptPath,
-            providerSessionId: sessionId
-        )
-    }
-
-    private nonisolated static func findCopilotPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [],
-            argSubstrings: [
-                "/@github/copilot/npm-loader.js",
-                "/opt/homebrew/bin/copilot",
-            ],
-            candidatePids: candidatePids
-        )
-    }
-
-    private nonisolated static func findClinePids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        // Cline is a VSCode extension — it has no standalone CLI process.
-        // Do NOT monitor VSCode main process as that causes crashes.
-        // Session discovery still works via file-based scanning (taskHistory.json).
-        return []
-    }
-
-    private nonisolated static func findOpenCodePids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findPids(
-            matchingPathSubstrings: [
-                "/opencode.app/contents/macos/opencode",
-                "/opencode.app/contents/macos/opencode-cli",
-                "/.opencode/bin/opencode",
-            ],
-            candidatePids: candidatePids
-        ).filter { pid in
-            // OpenCode 2's shared background service is the same executable as
-            // the TUI and inherits the first client's cwd, so a cwd match can
-            // land on it. It is not a session's process: it outlives the client
-            // that spawned it, and once reparented to launchd the orphan sweep
-            // would SIGTERM it — every session with it (#332).
-            guard let args = getProcessArgs(pid) else { return true }
-            return !isOpenCodeSharedService(arguments: args)
-        }
-    }
-
-    /// The `mimo` CLI (MiMo Code). The Xiaomi MiMo desktop app is left out on
-    /// purpose: its engine shares the app's main process, whose cwd is `/`, so
-    /// a cwd match could never pick one of its sessions — its plugin reports
-    /// the process instead.
-    private nonisolated static func findMimoPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        (candidatePids ?? allProcessIds()).filter { pid in
-            guard let path = executablePath(for: pid) else { return false }
-            return CLIProcessResolver.isMimoCLIPath(path)
-        }
-    }
-
-    /// `opencode serve --service` — OpenCode 2's per-user shared server.
-    nonisolated static func isOpenCodeSharedService(arguments: [String]) -> Bool {
-        arguments.contains("serve") && arguments.contains("--service")
-    }
-
-    /// Get the current working directory of a process using proc_pidinfo
-    private nonisolated static func getCwd(for pid: pid_t) -> String? {
-        var pathInfo = proc_vnodepathinfo()
-        let size = MemoryLayout<proc_vnodepathinfo>.size
-        let ret = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &pathInfo, Int32(size))
-        guard ret > 0 else { return nil }
-        return withUnsafePointer(to: pathInfo.pvi_cdir.vip_path) {
-            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) {
-                String(cString: $0)
-            }
-        }
-    }
-
-    /// Get the start time of a process using proc_pidinfo
-    private nonisolated static func getProcessStartTime(_ pid: pid_t) -> Date? {
-        var info = proc_bsdinfo()
-        let ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
-        guard ret > 0 else { return nil }
-        return Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec))
-    }
-
-    private nonisolated static func isSubagentWorktree(_ cwd: String) -> Bool {
-        cwd.contains("/.claude/worktrees/agent-") || cwd.contains("/.git/worktrees/agent-")
-    }
-
-    private nonisolated static func findMostRecentJSONLFile(
-        in directory: String,
-        after processStart: Date?,
-        fm: FileManager
-    ) -> (path: String, modified: Date)? {
-        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return nil }
-
-        var bestPath: String?
-        var bestDate = Date.distantPast
-        for file in files where file.hasSuffix(".jsonl") {
-            let fullPath = "\(directory)/\(file)"
-            guard let attrs = try? fm.attributesOfItem(atPath: fullPath),
-                  let modified = attrs[.modificationDate] as? Date,
-                  modified > bestDate else { continue }
-            if let start = processStart, modified < start.addingTimeInterval(-10) {
-                continue
-            }
-            bestPath = fullPath
-            bestDate = modified
-        }
-
-        guard let bestPath else { return nil }
-        return (bestPath, bestDate)
-    }
-
-    private nonisolated static func findFlatStoreSessions(
-        pids: [pid_t],
-        basePath: String,
-        source: String,
-        projectEncoder: (String) -> String,
-        transcriptReader: (String) -> (String?, [ChatMessage])
-    ) -> [DiscoveredSession] {
-        guard !pids.isEmpty else { return [] }
-
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: basePath) else { return [] }
-
-        var results: [DiscoveredSession] = []
-        var seenSessionIds: Set<String> = []
-
-        for pid in pids {
-            guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { continue }
-            let processStart = getProcessStartTime(pid)
-            let projectPath = "\(basePath)/\(projectEncoder(cwd))"
-            guard let best = findMostRecentJSONLFile(in: projectPath, after: processStart, fm: fm) else { continue }
-            if best.modified.timeIntervalSinceNow < -300 { continue }
-
-            let sessionId = ((best.path as NSString).lastPathComponent as NSString).deletingPathExtension
-            guard !sessionId.isEmpty, !seenSessionIds.contains(sessionId) else { continue }
-            seenSessionIds.insert(sessionId)
-
-            let (model, messages) = transcriptReader(best.path)
-            results.append(DiscoveredSession(
-                sessionId: sessionId,
-                cwd: cwd,
-                tty: nil,
-                model: model,
-                pid: pid,
-                modifiedAt: best.modified,
-                recentMessages: messages,
-                source: source
-            ))
-        }
-
-        return results
-    }
-
-    private nonisolated static func findActiveGeminiSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let geminiPids = findGeminiPids(candidatePids: candidatePids)
-        guard !geminiPids.isEmpty else { return [] }
-
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
-        let tmpBase = "\(home)/.gemini/tmp"
-        guard fm.fileExists(atPath: tmpBase) else { return [] }
-
-        let projects = readGeminiProjectsMap(path: "\(home)/.gemini/projects.json")
-        var results: [DiscoveredSession] = []
-        var seenSessionIds: Set<String> = []
-
-        for pid in geminiPids {
-            guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { continue }
-            guard let projectDir = findGeminiProjectDirectory(for: cwd, tmpBase: tmpBase, projects: projects, fm: fm) else {
-                continue
-            }
-
-            let processStart = getProcessStartTime(pid)
-            let chatsBase = "\(tmpBase)/\(projectDir)/chats"
-            guard let best = findMostRecentGeminiSession(in: chatsBase, after: processStart, fm: fm) else { continue }
-            let geminiFreshnessLimit: TimeInterval = processStart != nil ? -300 : -30
-            if best.modified.timeIntervalSinceNow < geminiFreshnessLimit { continue }
-
-            let (sessionId, model, messages) = readRecentFromGeminiTranscript(path: best.path)
-            guard !sessionId.isEmpty, !seenSessionIds.contains(sessionId) else { continue }
-            seenSessionIds.insert(sessionId)
-
-            results.append(DiscoveredSession(
-                sessionId: sessionId,
-                cwd: cwd,
-                tty: nil,
-                model: model,
-                pid: pid,
-                modifiedAt: best.modified,
-                recentMessages: messages,
-                source: "gemini"
-            ))
-        }
-
-        return results
-    }
-
-    private nonisolated static func readGeminiProjectsMap(path: String) -> [String: String] {
-        guard let data = FileManager.default.contents(atPath: path),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let projects = json["projects"] as? [String: String] else {
-            return [:]
-        }
-        return projects
-    }
-
-    private nonisolated static func findGeminiProjectDirectory(
-        for cwd: String,
-        tmpBase: String,
-        projects: [String: String],
-        fm: FileManager
-    ) -> String? {
-        if let mapped = projects[cwd], fm.fileExists(atPath: "\(tmpBase)/\(mapped)") {
-            return mapped
-        }
-
-        guard let dirs = try? fm.contentsOfDirectory(atPath: tmpBase) else { return nil }
-        for dir in dirs {
-            let projectRootPath = "\(tmpBase)/\(dir)/.project_root"
-            guard let data = fm.contents(atPath: projectRootPath),
-                  let root = String(data: data, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                  root == cwd else { continue }
-            return dir
-        }
-        return nil
-    }
-
-    private nonisolated static func findMostRecentGeminiSession(
-        in directory: String,
-        after processStart: Date?,
-        fm: FileManager
-    ) -> (path: String, modified: Date)? {
-        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return nil }
-
-        var bestPath: String?
-        var bestDate = Date.distantPast
-        for file in files where file.hasPrefix("session-") && file.hasSuffix(".json") {
-            let fullPath = "\(directory)/\(file)"
-            guard let attrs = try? fm.attributesOfItem(atPath: fullPath),
-                  let modified = attrs[.modificationDate] as? Date,
-                  modified > bestDate else { continue }
-            if let start = processStart, modified < start.addingTimeInterval(-10) {
-                continue
-            }
-            bestPath = fullPath
-            bestDate = modified
-        }
-
-        guard let bestPath else { return nil }
-        return (bestPath, bestDate)
-    }
-
-    private nonisolated static func readRecentFromGeminiTranscript(path: String) -> (String, String?, [ChatMessage]) {
-        guard let data = FileManager.default.contents(atPath: path),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return (((path as NSString).lastPathComponent as NSString).deletingPathExtension, nil, [])
-        }
-
-        let sessionId = (json["sessionId"] as? String)
-            ?? (((path as NSString).lastPathComponent as NSString).deletingPathExtension)
-        let model = json["model"] as? String
-        let messages = (json["messages"] as? [[String: Any]]) ?? []
-
-        var combined: [(Int, ChatMessage)] = []
-        for (index, message) in messages.enumerated() {
-            let type = (message["type"] as? String)?.lowercased() ?? ""
-            let text = extractTextContent(from: message["content"])
-                ?? (message["content"] as? String)
-            guard let text, !text.isEmpty else { continue }
-
-            if type == "user" {
-                combined.append((index, ChatMessage(isUser: true, text: text)))
-            } else {
-                combined.append((index, ChatMessage(isUser: false, text: text)))
-            }
-        }
-
-        combined.sort { $0.0 < $1.0 }
-        return (sessionId, model, Array(combined.suffix(3).map { $0.1 }))
-    }
-
-    private nonisolated static func findActiveQoderSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return findFlatStoreSessions(
-            pids: findQoderPids(candidatePids: candidatePids),
-            basePath: "\(home)/.qoder/projects",
-            source: "qoder",
-            projectEncoder: { $0.claudeProjectDirEncoded() },
-            transcriptReader: { readRecentFromTranscript(path: $0) }
-        )
-    }
-
-    private nonisolated static func findActiveCodeBuddySessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return findFlatStoreSessions(
-            pids: findCodeBuddyPids(candidatePids: candidatePids),
-            basePath: "\(home)/.codebuddy/projects",
-            source: "codebuddy",
-            projectEncoder: { $0.appProjectDirEncoded() },
-            transcriptReader: { readRecentFromCodeBuddyTranscript(path: $0) }
-        )
-    }
-
-    private nonisolated static func findActiveFactorySessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return findFlatStoreSessions(
-            pids: findFactoryPids(candidatePids: candidatePids),
-            basePath: "\(home)/.factory/sessions",
-            source: "droid",
-            projectEncoder: { $0.claudeProjectDirEncoded() },
-            transcriptReader: { readRecentFromFactoryTranscript(path: $0) }
-        )
-    }
-
-    private nonisolated static func findActiveCursorSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let cursorPids = findCursorPids(candidatePids: candidatePids)
-        guard !cursorPids.isEmpty else { return [] }
-
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
-        let projectsBase = "\(home)/.cursor/projects"
-        guard fm.fileExists(atPath: projectsBase) else { return [] }
-
-        var results: [DiscoveredSession] = []
-        var seenSessionIds: Set<String> = []
-
-        for pid in cursorPids {
-            guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { continue }
-            let processStart = getProcessStartTime(pid)
-            let transcriptBase = "\(projectsBase)/\(cwd.appProjectDirEncoded())/agent-transcripts"
-            guard let best = findMostRecentCursorTranscript(in: transcriptBase, after: processStart, fm: fm) else { continue }
-            let cursorFreshnessLimit: TimeInterval = processStart != nil ? -300 : -30
-            if best.modified.timeIntervalSinceNow < cursorFreshnessLimit { continue }
-
-            let sessionId = ((best.path as NSString).lastPathComponent as NSString).deletingPathExtension
-            guard !sessionId.isEmpty, !seenSessionIds.contains(sessionId) else { continue }
-            seenSessionIds.insert(sessionId)
-
-            let (model, messages) = readRecentFromCursorTranscript(path: best.path)
-            results.append(DiscoveredSession(
-                sessionId: sessionId,
-                cwd: cwd,
-                tty: nil,
-                model: model,
-                pid: pid,
-                modifiedAt: best.modified,
-                recentMessages: messages,
-                source: "cursor",
-                transcriptPath: best.path
-            ))
-        }
-
-        return results
-    }
-
-    private nonisolated static func findMostRecentCursorTranscript(
-        in transcriptsBase: String,
-        after processStart: Date?,
-        fm: FileManager
-    ) -> (path: String, modified: Date)? {
-        guard let sessionDirs = try? fm.contentsOfDirectory(atPath: transcriptsBase) else { return nil }
-
-        var best: (path: String, modified: Date)?
-        for sessionDir in sessionDirs {
-            let dirPath = "\(transcriptsBase)/\(sessionDir)"
-            guard let candidate = findMostRecentJSONLFile(in: dirPath, after: processStart, fm: fm) else { continue }
-            if best == nil || candidate.modified > best!.modified {
-                best = candidate
-            }
-        }
-        return best
-    }
-
-    private nonisolated static func findActiveCopilotSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let copilotPids = findCopilotPids(candidatePids: candidatePids)
-        guard !copilotPids.isEmpty else { return [] }
-
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
-        let sessionsBase = "\(home)/.copilot/session-state"
-        guard fm.fileExists(atPath: sessionsBase) else { return [] }
-
-        var results: [DiscoveredSession] = []
-        var seenSessionIds: Set<String> = []
-
-        for pid in copilotPids {
-            guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { continue }
-            let processStart = getProcessStartTime(pid)
-            guard let best = findRecentCopilotSession(base: sessionsBase, cwd: cwd, after: processStart, fm: fm) else {
-                continue
-            }
-            if best.modified.timeIntervalSinceNow < -300 { continue }
-
-            let sessionDir = (best.path as NSString).deletingLastPathComponent
-            let sessionId = (sessionDir as NSString).lastPathComponent
-            guard !sessionId.isEmpty, !seenSessionIds.contains(sessionId) else { continue }
-            seenSessionIds.insert(sessionId)
-
-            let (model, messages) = readRecentFromCopilotTranscript(path: best.path)
-            results.append(DiscoveredSession(
-                sessionId: sessionId,
-                cwd: cwd,
-                tty: nil,
-                model: model,
-                pid: pid,
-                modifiedAt: best.modified,
-                recentMessages: messages,
-                source: "copilot"
-            ))
-        }
-
-        return results
-    }
-
-    // MARK: - Cline (VSCode extension saoudrizwan.claude-dev)
-
-    private nonisolated static func clineStorageRoot() -> String {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.path ?? ""
-        return "\(appSupport)/Code/User/globalStorage/saoudrizwan.claude-dev"
-    }
-
-    private nonisolated static func findActiveClineSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let clineRoot = clineStorageRoot()
-        let fm = FileManager.default
-        let historyPath = "\(clineRoot)/state/taskHistory.json"
-        guard fm.fileExists(atPath: historyPath),
-              let data = try? Data(contentsOf: URL(fileURLWithPath: historyPath)),
-              let history = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-              !history.isEmpty
-        else { return [] }
-
-        // Sort by ts descending, take the most recent task
-        let sorted = history.sorted {
-            ($0["ts"] as? Double ?? 0) > ($1["ts"] as? Double ?? 0)
-        }
-        guard let latest = sorted.first,
-              let taskId = latest["id"] as? String
-        else { return [] }
-
-        // Use the conversation file's mtime for freshness — more accurate than taskHistory ts.
-        let conversationPath = "\(clineRoot)/tasks/\(taskId)/api_conversation_history.json"
-        let fileDate: Date
-        if let attrs = try? fm.attributesOfItem(atPath: conversationPath),
-           let mtime = attrs[.modificationDate] as? Date {
-            fileDate = mtime
-        } else if let taskTs = latest["ts"] as? Double {
-            fileDate = Date(timeIntervalSince1970: taskTs / 1000.0)
-        } else {
-            return []
-        }
-
-        // Cline has no process monitor — allow 10 min staleness
-        let freshnessLimit: TimeInterval = -600
-        guard fileDate.timeIntervalSinceNow > freshnessLimit else { return [] }
-
-        let (model, messages) = readRecentFromClineHistory(
-            path: conversationPath,
-            modelFromHistory: latest["modelId"] as? String
-        )
-
-        let cwd = latest["cwdOnTaskInitialization"] as? String ?? ""
-        // No PID for Cline — it's a VSCode extension, not a CLI process
-        let pid: pid_t? = nil
-
-        return [DiscoveredSession(
-            sessionId: taskId,
-            cwd: cwd,
-            tty: nil,
-            model: model,
-            pid: pid,
-            modifiedAt: fileDate,
-            recentMessages: messages,
-            source: "cline"
-        )]
-    }
-
-    private nonisolated static func readRecentFromClineHistory(
-        path: String,
-        modelFromHistory: String?
-    ) -> (String?, [ChatMessage]) {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-        else { return (modelFromHistory, []) }
-
-        var userMessages: [(Int, String)] = []
-        var assistantMessages: [(Int, String)] = []
-        var index = 0
-
-        for entry in entries {
-            guard let role = entry["role"] as? String,
-                  let textContent = extractTextContent(from: entry["content"])
-            else { continue }
-
-            if role == "user" {
-                userMessages.append((index, textContent))
-            } else if role == "assistant" {
-                assistantMessages.append((index, textContent))
-            }
-            index += 1
-        }
-
-        var combined: [(Int, ChatMessage)] = []
-        for (i, text) in userMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: true, text: text)))
-        }
-        for (i, text) in assistantMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: false, text: text)))
-        }
-        combined.sort { $0.0 < $1.0 }
-        return (modelFromHistory, Array(combined.suffix(3).map { $0.1 }))
-    }
-
-    private nonisolated static func findRecentCopilotSession(
-        base: String,
-        cwd: String,
-        after processStart: Date?,
-        fm: FileManager
-    ) -> (path: String, modified: Date)? {
-        guard let dirs = try? fm.contentsOfDirectory(atPath: base) else { return nil }
-
-        let candidates = dirs.compactMap { dir -> (path: String, modified: Date)? in
-            let fullPath = "\(base)/\(dir)/events.jsonl"
-            guard let attrs = try? fm.attributesOfItem(atPath: fullPath),
-                  let modified = attrs[.modificationDate] as? Date else { return nil }
-            return (fullPath, modified)
-        }.sorted { $0.modified > $1.modified }
-
-        for candidate in candidates.prefix(50) {
-            if let start = processStart, candidate.modified < start.addingTimeInterval(-10) {
-                continue
-            }
-            if copilotSessionMatchesCwd(path: candidate.path, cwd: cwd) {
-                return candidate
-            }
-        }
-        return nil
-    }
-
-    private nonisolated static func copilotSessionMatchesCwd(path: String, cwd: String) -> Bool {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
-        defer { handle.closeFile() }
-
-        let data = handle.readData(ofLength: 32768)
-        guard let text = String(data: data, encoding: .utf8) else { return false }
-
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let type = json["type"] as? String,
-                  let payload = json["data"] as? [String: Any] else { continue }
-
-            if type == "session.start",
-               let context = payload["context"] as? [String: Any],
-               let sessionCwd = context["cwd"] as? String, sessionCwd == cwd {
-                return true
-            }
-
-            if type == "hook.start",
-               let input = payload["input"] as? [String: Any],
-               let sessionCwd = input["cwd"] as? String, sessionCwd == cwd {
-                return true
-            }
-        }
-        return false
-    }
-
-    nonisolated static func openCodeDatabasePath() -> String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/share/opencode/opencode.db").path
-    }
-
-    /// MiMo Code keeps OpenCode's SQLite layout under its own name; release
-    /// builds (channels latest / beta / prod) write `mimocode.db`.
-    nonisolated static func mimoDatabasePath() -> String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/share/mimocode/mimocode.db").path
-    }
-
-    private nonisolated static func findActiveOpenCodeSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        findActiveOpenCodeStoreSessions(
-            pids: findOpenCodePids(candidatePids: candidatePids),
-            dbPath: openCodeDatabasePath(),
-            source: "opencode",
-            sessionIdPrefix: "",
-            rootSessionsOnly: false
-        )
-    }
-
-    /// Running `mimo` CLIs, matched to their session in MiMo Code's store.
-    /// Keyed `mimo-<id>`, the id the plugin reports, so a session found here
-    /// and the plugin's events for it land on one card.
-    private nonisolated static func findActiveMimoSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        findActiveOpenCodeStoreSessions(
-            pids: findMimoPids(candidatePids: candidatePids),
-            dbPath: mimoDatabasePath(),
-            source: "mimo",
-            sessionIdPrefix: "mimo-",
-            rootSessionsOnly: true
-        )
-    }
-
-    private nonisolated static func findActiveOpenCodeStoreSessions(
-        pids: [pid_t],
-        dbPath: String,
-        source: String,
-        sessionIdPrefix: String,
-        rootSessionsOnly: Bool
-    ) -> [DiscoveredSession] {
-        guard !pids.isEmpty else { return [] }
-        guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
-
-        return withSQLiteDatabase(at: dbPath) { db in
-            var results: [DiscoveredSession] = []
-            var seenSessionIds: Set<String> = []
-
-            for pid in pids {
-                guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { continue }
-                let processStart = getProcessStartTime(pid)
-                guard let session = findRecentOpenCodeSession(
-                    in: db, cwd: cwd, after: processStart, rootSessionsOnly: rootSessionsOnly
-                ) else { continue }
-                guard !seenSessionIds.contains(session.sessionId) else { continue }
-                seenSessionIds.insert(session.sessionId)
-
-                let (model, messages) = readRecentFromOpenCodeSession(db: db, sessionId: session.sessionId)
-                results.append(DiscoveredSession(
-                    sessionId: sessionIdPrefix + session.sessionId,
-                    cwd: cwd,
-                    tty: nil,
-                    model: model,
-                    pid: pid,
-                    modifiedAt: session.modifiedAt,
-                    recentMessages: messages,
-                    source: source
-                ))
-            }
-
-            return results
-        } ?? []
-    }
-
-    nonisolated static func withSQLiteDatabase<T>(
-        at path: String,
-        body: (OpaquePointer) -> T?
-    ) -> T? {
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK,
-              let db else {
-            if let db { sqlite3_close_v2(db) }
-            return nil
-        }
-        sqlite3_busy_timeout(db, 1000)
-        defer { sqlite3_close_v2(db) }
-        return body(db)
-    }
-
-    private nonisolated static func prepareSQLiteStatement(db: OpaquePointer, sql: String) -> OpaquePointer? {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            if let statement { sqlite3_finalize(statement) }
-            return nil
-        }
-        return statement
-    }
-
-    private nonisolated static func sqliteTableColumns(
-        db: OpaquePointer,
-        tableName: String
-    ) -> Set<String> {
-        guard tableName.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }),
-              let statement = prepareSQLiteStatement(
-                db: db,
-                sql: "PRAGMA table_info(\(tableName));"
-              ) else {
-            return []
-        }
-        defer { sqlite3_finalize(statement) }
-
-        var columns = Set<String>()
-        while sqlite3_step(statement) == SQLITE_ROW {
-            if let name = sqliteColumnString(statement, index: 1) {
-                columns.insert(name)
-            }
-        }
-        return columns
-    }
-
-    private nonisolated static func bindSQLiteText(_ text: String, to statement: OpaquePointer, index: Int32) {
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        _ = text.withCString { pointer in
-            sqlite3_bind_text(statement, index, pointer, -1, transient)
-        }
-    }
-
-    private nonisolated static func sqliteColumnString(_ statement: OpaquePointer, index: Int32) -> String? {
-        guard let value = sqlite3_column_text(statement, index) else { return nil }
-        return String(cString: UnsafeRawPointer(value).assumingMemoryBound(to: CChar.self))
-    }
-
-    /// `rootSessionsOnly` skips child sessions (`parent_id` set): MiMo Code
-    /// spawns subagent sessions in the same directory, and while one runs it
-    /// is the most recently updated row — but it is never the CLI's own.
-    nonisolated static func findRecentOpenCodeSession(
-        in db: OpaquePointer,
-        cwd: String,
-        after processStart: Date?,
-        rootSessionsOnly: Bool = false
-    ) -> (sessionId: String, modifiedAt: Date)? {
-        let rootFilter = rootSessionsOnly ? "AND parent_id IS NULL" : ""
-        let sql = """
-            SELECT id, time_updated
-            FROM session
-            WHERE time_archived IS NULL
-              \(rootFilter)
-              AND (
-                directory = ?
-                OR EXISTS (
-                    SELECT 1
-                    FROM message m
-                    WHERE m.session_id = session.id
-                      AND json_extract(m.data, '$.path.cwd') = ?
-                )
-              )
-            ORDER BY time_updated DESC
-            LIMIT 20;
-            """
-        guard let statement = prepareSQLiteStatement(db: db, sql: sql) else { return nil }
-        defer { sqlite3_finalize(statement) }
-
-        bindSQLiteText(cwd, to: statement, index: 1)
-        bindSQLiteText(cwd, to: statement, index: 2)
-
-        let minUpdatedAtMs = processStart.map { Int64($0.timeIntervalSince1970 * 1000) - 10_000 }
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let sessionId = sqliteColumnString(statement, index: 0) else { continue }
-            let updatedAtMs = sqlite3_column_int64(statement, 1)
-            if let minUpdatedAtMs, updatedAtMs < minUpdatedAtMs { continue }
-            let modifiedAt = Date(timeIntervalSince1970: TimeInterval(updatedAtMs) / 1000)
-            return (sessionId, modifiedAt)
-        }
-        return nil
-    }
-
-    private nonisolated static func readRecentFromOpenCodeSession(
-        db: OpaquePointer,
-        sessionId: String
-    ) -> (String?, [ChatMessage]) {
-        var model: String?
-
-        if let messageStatement = prepareSQLiteStatement(
-            db: db,
-            sql: """
-                SELECT data
-                FROM message
-                WHERE session_id = ?
-                ORDER BY time_updated DESC
-                LIMIT 12;
-                """
-        ) {
-            defer { sqlite3_finalize(messageStatement) }
-            bindSQLiteText(sessionId, to: messageStatement, index: 1)
-            while sqlite3_step(messageStatement) == SQLITE_ROW {
-                guard model == nil,
-                      let data = sqliteColumnString(messageStatement, index: 0),
-                      let jsonData = data.data(using: .utf8),
-                      let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
-                model = json["modelID"] as? String
-                if model == nil,
-                   let modelInfo = json["model"] as? [String: Any] {
-                    model = modelInfo["modelID"] as? String
-                }
-            }
-        }
-
-        var seenMessageIds: Set<String> = []
-        var combined: [(Int64, ChatMessage)] = []
-        if let partStatement = prepareSQLiteStatement(
-            db: db,
-            sql: """
-                SELECT p.message_id, json_extract(m.data, '$.role'), p.time_created, p.data
-                FROM part p
-                JOIN message m ON m.id = p.message_id
-                WHERE p.session_id = ?
-                ORDER BY p.time_created DESC
-                LIMIT 80;
-                """
-        ) {
-            defer { sqlite3_finalize(partStatement) }
-            bindSQLiteText(sessionId, to: partStatement, index: 1)
-            while sqlite3_step(partStatement) == SQLITE_ROW {
-                guard let messageId = sqliteColumnString(partStatement, index: 0),
-                      !seenMessageIds.contains(messageId),
-                      let role = sqliteColumnString(partStatement, index: 1),
-                      let data = sqliteColumnString(partStatement, index: 3),
-                      let jsonData = data.data(using: .utf8),
-                      let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                      json["type"] as? String == "text",
-                      let text = json["text"] as? String, !text.isEmpty else { continue }
-
-                let isUser = role == "user"
-                guard isUser || role == "assistant" else { continue }
-
-                seenMessageIds.insert(messageId)
-                combined.append((sqlite3_column_int64(partStatement, 2), ChatMessage(isUser: isUser, text: text)))
-            }
-        }
-
-        combined.sort { $0.0 < $1.0 }
-        return (model, Array(combined.suffix(3).map { $0.1 }))
-    }
-
-    // MARK: - Codex Session Discovery
-
-    /// Find running Codex processes.
-    /// Checks both executable path (Desktop app) and command-line args (npm/Homebrew: node script).
-    nonisolated static func isCodexExecutablePath(_ path: String) -> Bool {
-        let executableURL = URL(fileURLWithPath: path).standardizedFileURL
-        let lowerPath = executableURL.path.lowercased()
-        let resourceSuffix = "/contents/resources/codex"
-        guard lowerPath.hasSuffix(resourceSuffix) else { return false }
-
-        let appURL = executableURL
-            .deletingLastPathComponent() // Resources
-            .deletingLastPathComponent() // Contents
-            .deletingLastPathComponent() // *.app
-        return isCodexHostAppBundle(appURL)
-    }
-
-    /// The Codex binary newer ChatGPT releases bundle in place of
-    /// `Contents/Resources/codex`. Desktop's app-server, ChatGPT's terminal
-    /// launcher (`codex-cli/bin/codex`) and its cloud `exec-server` all run
-    /// this one file, so the path says Codex, not Desktop.
-    nonisolated static func isBundledCodexCLIPath(_ path: String) -> Bool {
-        let executableURL = URL(fileURLWithPath: path).standardizedFileURL
-        let suffix = "/" + bundledCodexCLIRelativePath.lowercased()
-        guard executableURL.path.lowercased().hasSuffix(suffix) else { return false }
-        var appURL = executableURL
-        for _ in bundledCodexCLIRelativePath.split(separator: "/") {
-            appURL.deleteLastPathComponent()
-        }
-        return isCodexHostAppBundle(appURL)
-    }
-
-    private nonisolated static func isCodexHostAppBundle(_ appURL: URL) -> Bool {
-        // Since Codex was folded into ChatGPT Desktop, the same com.openai.codex
-        // bundle can now be installed as ChatGPT.app instead of Codex.app. Read
-        // the bundle identifier first so future app renames continue to work.
-        if Bundle(url: appURL)?.bundleIdentifier == AppState.codexAppBundleId {
-            return true
-        }
-
-        // Keep the legacy path check for synthetic/test bundles without an
-        // Info.plist and for older installations whose bundle cannot be read.
-        let appName = appURL.deletingPathExtension().lastPathComponent.lowercased()
-        return appName == "codex" || appName == "chatgpt"
-    }
-
-    /// Codex Desktop's shared app-server is launched with `/` as its cwd. Its
-    /// rollout metadata contains the project cwd, so desktop discovery must
-    /// use that value instead of comparing every transcript to `/`.
-    nonisolated static func codexDiscoveryUsesTranscriptCwd(processCwd: String?) -> Bool {
-        guard let processCwd, !processCwd.isEmpty else { return true }
-        return processCwd == "/"
-    }
-
-    /// Codex Desktop currently invokes some hooks without a payload, or with
-    /// the shared app-server's root cwd. Those events contain no session data
-    /// and would overwrite a session discovered from its rollout transcript.
-    nonisolated static func isCodexPlaceholderHook(
-        source: String?,
-        cwd: String?,
-        hasTranscriptPath: Bool
-    ) -> Bool {
-        guard source?.lowercased() == "codex", !hasTranscriptPath else { return false }
-        return cwd == nil || cwd?.trimmingCharacters(in: .whitespacesAndNewlines) == "/"
-    }
-
-    /// Keep all three Codex Desktop discovery channels on one stable tracking
-    /// key while leaving CLI sessions in the provider's raw namespace.
-    nonisolated static func codexDiscoveryIdentity(
-        rawSessionId: String,
-        isDesktop: Bool
-    ) -> CodexDiscoveryIdentity {
-        if isDesktop {
-            return CodexDiscoveryIdentity(
-                sessionId: codexAppSessionPrefix + rawSessionId,
-                providerSessionId: rawSessionId,
-                termBundleId: codexAppBundleId
-            )
-        }
-        return CodexDiscoveryIdentity(
-            sessionId: rawSessionId,
-            providerSessionId: nil,
-            termBundleId: nil
-        )
-    }
-
-    /// Upgrade pre-namespace persisted Desktop hook cards without touching raw
-    /// Codex CLI ids. `termBundleId` is the reliable discriminator retained by
-    /// #267-era snapshots.
-    nonisolated static func canonicalRestoredCodexSessionId(
-        sessionId: String,
-        source: String,
-        providerSessionId: String?,
-        termBundleId: String?
-    ) -> String {
-        guard source == "codex", termBundleId == codexAppBundleId else {
-            return sessionId
-        }
-        if sessionId.hasPrefix(codexAppSessionPrefix) {
-            return sessionId
-        }
-        let rawId = providerSessionId?.isEmpty == false ? providerSessionId! : sessionId
-        return codexAppSessionPrefix + rawId
-    }
-
-    /// Read only the rollout's first `session_meta` row to distinguish Desktop
-    /// rollouts from CLI rollouts when both exist under `~/.codex/sessions`.
-    /// Unknown future shapes remain eligible for the owning process as a
-    /// best-effort fallback instead of being dropped.
-    nonisolated static func codexTranscriptOrigin(path: String) -> CodexTranscriptOrigin {
-        guard let firstLine = readFirstLine(path: path),
-              let data = firstLine.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let payload = json["payload"] as? [String: Any] else {
-            return .unknown
-        }
-
-        let originator = (payload["originator"] as? String)?.lowercased() ?? ""
-        let source = (payload["source"] as? String)?.lowercased() ?? ""
-        if originator.contains("desktop") {
-            return .desktop
-        }
-        // Codex records every app-server client under `vscode`/`appServer`,
-        // and a spawned thread keeps its parent's originator under an object
-        // source. A client that names itself something other than Desktop
-        // (Claude Code's Codex plugin sends "Claude Code") runs its own
-        // `codex app-server`, so the rollout belongs to that process like a
-        // CLI one.
-        let isAppServerSource = source == "vscode" || source == "appserver"
-        let isSubagentSource = payload["source"] is [String: Any]
-        if !originator.isEmpty, isAppServerSource || isSubagentSource {
-            return .cli
-        }
-        if isAppServerSource {
-            return .desktop
-        }
-        if originator.contains("cli") || source == "cli" || source == "exec" {
-            return .cli
-        }
-        return .unknown
-    }
-
-    private nonisolated static func findCodexPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        findCodexProcesses(candidatePids: candidatePids).map(\.pid)
-    }
-
-    /// Running Codex processes discovery maps rollouts to, and whether each
-    /// is Codex Desktop's shared app-server.
-    nonisolated static func findCodexProcesses(candidatePids: [pid_t]? = nil) -> [(pid: pid_t, isDesktop: Bool)] {
-        var processes: [(pid: pid_t, isDesktop: Bool)] = []
-
-        for pid in candidatePids ?? allProcessIds() {
-            guard let path = executablePath(for: pid) else { continue }
-            let pathLower = path.lowercased()
-
-            // Match 1: Codex Desktop app (native binary). The executable may
-            // live under Codex.app or ChatGPT.app depending on the release.
-            if isCodexExecutablePath(path) {
-                processes.append((pid, true))
-                continue
-            }
-
-            // Match 2: the binary newer ChatGPT releases bundle, shared by
-            // Desktop's app-server and Codex CLI; argv and parent tell them apart.
-            if isBundledCodexCLIPath(path) {
-                if let role = bundledCodexProcessRole(pid: pid, executablePath: path) {
-                    processes.append((pid, role == .desktopHost))
-                }
-                continue
-            }
-
-            // Match 3: npm/Homebrew install — node running @openai/codex script.
-            // proc_pidpath returns the node binary, so check command-line args instead.
-            if pathLower.hasSuffix("/node") {
-                if let args = getProcessArgs(pid),
-                   args.contains(where: { $0.contains("@openai/codex") || $0.contains("openai-codex") }) {
-                    processes.append((pid, false))
-                }
-            }
-        }
-        return processes
-    }
-
-    private nonisolated static func bundledCodexProcessRole(pid: pid_t, executablePath path: String) -> CodexProcessRole? {
-        let parent = parentPid(of: pid)
-        // CodeIsland's own app-server client runs this binary too, from `/`;
-        // as a session process it would claim every CLI rollout.
-        if parent == getpid() { return nil }
-
-        var ancestry = [ProcessAncestor(pid: pid, executablePath: path, arguments: getProcessArgs(pid) ?? [])]
-        if let parent, let parentPath = executablePath(for: parent) {
-            ancestry.append(ProcessAncestor(
-                pid: parent,
-                executablePath: parentPath,
-                bundleIdentifier: HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath)
-                    .flatMap { Bundle(path: $0)?.bundleIdentifier }
-            ))
-        }
-        return CLIProcessResolver.codexBundledProcessRole(ancestry: ancestry)
-    }
-
-    /// Get command-line arguments for a process via sysctl KERN_PROCARGS2.
-    private nonisolated static func getProcessArgs(_ pid: pid_t) -> [String]? {
-        var mib = [CTL_KERN, KERN_PROCARGS2, pid]
-        var size = 0
-        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return nil }
-        var buffer = [UInt8](repeating: 0, count: size)
-        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return nil }
-
-        // First 4 bytes = argc (as int32)
-        guard size > MemoryLayout<Int32>.size else { return nil }
-        let argc = buffer.withUnsafeBytes { $0.load(as: Int32.self) }
-        guard argc > 0, argc < 256 else { return nil }
-
-        // Skip past argc + executable path + padding nulls to reach argv
-        var offset = MemoryLayout<Int32>.size
-        // Skip executable path
-        while offset < size && buffer[offset] != 0 { offset += 1 }
-        // Skip null padding
-        while offset < size && buffer[offset] == 0 { offset += 1 }
-
-        // Parse null-terminated argv strings
-        var args: [String] = []
-        var argStart = offset
-        for _ in 0..<argc {
-            while offset < size && buffer[offset] != 0 { offset += 1 }
-            if offset > argStart {
-                args.append(String(bytes: buffer[argStart..<offset], encoding: .utf8) ?? "")
-            }
-            offset += 1
-            argStart = offset
-        }
-        return args
-    }
-
-    /// Scan a rollout backwards in chunks until the latest lifecycle marker is
-    /// found. This avoids both a full-file read and a fixed-tail limit while
-    /// reusing `JSONLTailer`'s canonical Codex event interpretation.
-    nonisolated static func latestCodexTurnStatus(
-        path: String,
-        chunkSize: UInt64 = 256 * 1024,
-        maxBytesToScan: UInt64 = 64 * 1024 * 1024,
-        maxLineBytes: Int = 4 * 1024 * 1024
-    ) -> ConversationTurnStatus? {
-        guard chunkSize > 0, maxBytesToScan > 0, maxLineBytes > 0 else { return nil }
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { handle.closeFile() }
-
-        let fileSize = handle.seekToEndOfFile()
-        let lowerBound = fileSize > maxBytesToScan ? fileSize - maxBytesToScan : 0
-        var cursor = fileSize
-        var leadingFragment = Data()
-        var discardingOversizedLine = false
-
-        while cursor > lowerBound {
-            let readSize = min(cursor - lowerBound, chunkSize)
-            cursor -= readSize
-            handle.seek(toFileOffset: cursor)
-            let chunk = handle.readData(ofLength: Int(readSize))
-            var combined: Data
-            if discardingOversizedLine {
-                // We are walking backwards through one over-budget line. Drop
-                // its bytes until the previous newline, then resume with older
-                // complete lines instead of retaining/copying an unbounded blob.
-                guard let newline = chunk.lastIndex(of: 0x0A) else { continue }
-                combined = Data(chunk[...newline])
-                discardingOversizedLine = false
-            } else {
-                combined = chunk
-                combined.append(leadingFragment)
-            }
-
-            var lines: [Data] = []
-            var lineStart = combined.startIndex
-            for index in combined.indices where combined[index] == 0x0A {
-                lines.append(Data(combined[lineStart..<index]))
-                lineStart = combined.index(after: index)
-            }
-            lines.append(Data(combined[lineStart..<combined.endIndex]))
-            if cursor > lowerBound, !lines.isEmpty {
-                let fragment = lines.removeFirst()
-                if fragment.count > maxLineBytes {
-                    leadingFragment.removeAll(keepingCapacity: true)
-                    discardingOversizedLine = true
-                } else {
-                    leadingFragment = fragment
-                }
-            } else {
-                leadingFragment.removeAll(keepingCapacity: true)
-                // A capped scan begins in the middle of an unknown line. Never
-                // parse that boundary fragment as if it were complete JSON.
-                if lowerBound > 0, !lines.isEmpty {
-                    lines.removeFirst()
-                }
-            }
-
-            for line in lines.reversed()
-            where !line.isEmpty && line.count <= maxLineBytes {
-                if let status = codexTurnStatus(fromCompleteLine: line) {
-                    return status
-                }
-            }
-        }
-
-        return nil
-    }
-
-    private nonisolated static func codexTurnStatus(fromCompleteLine line: Data) -> ConversationTurnStatus? {
-        var newlineTerminated = line
-        newlineTerminated.append(0x0A)
-        return JSONLTailer.latestTurnStatus(in: newlineTerminated)
-    }
-
-    /// Load recently touched Codex Desktop threads from Codex's own state DB.
-    /// Desktop app-server processes use `/` as CWD in current releases, making
-    /// the process-to-project matcher insufficient on its own.
-    nonisolated static func recentCodexDesktopThreadRecords(
-        statePath overrideStatePath: String? = nil,
-        now: Date = Date(),
-        freshnessWindow: TimeInterval = 600,
-        completionSettleWindow: TimeInterval = 30,
-        fileManager: FileManager = .default
-    ) -> [CodexDesktopThreadRecord] {
-        let statePath = overrideStatePath ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/state_5.sqlite").path
-        // `has_user_event` is not a reliable visibility bit for Desktop threads:
-        // current ChatGPT/Codex builds may keep it at 0 while a user turn is
-        // actively writing to the rollout. Pull a slightly wider DB candidate
-        // window, then enforce the tighter freshness window from DB/file mtimes.
-        let candidateWindow = max(freshnessWindow, 60 * 60)
-        let cutoff = now.addingTimeInterval(-candidateWindow).timeIntervalSince1970
-
-        return withSQLiteDatabase(at: statePath) { db in
-            let columns = sqliteTableColumns(db: db, tableName: "threads")
-            let requiredColumns: Set<String> = [
-                "id", "rollout_path", "cwd", "archived", "source",
-            ]
-            guard requiredColumns.isSubset(of: columns) else { return [] }
-
-            let updatedAtExpression: String
-            if columns.contains("updated_at_ms"), columns.contains("updated_at") {
-                updatedAtExpression = "COALESCE(NULLIF(updated_at_ms, 0) / 1000.0, updated_at)"
-            } else if columns.contains("updated_at_ms") {
-                updatedAtExpression = "updated_at_ms / 1000.0"
-            } else if columns.contains("updated_at") {
-                updatedAtExpression = "updated_at"
-            } else {
-                return []
-            }
-            let modelExpression = columns.contains("model") ? "model" : "NULL"
-            let spawnColumns = sqliteTableColumns(db: db, tableName: "thread_spawn_edges")
-            let hasSpawnStatus = Set(["child_thread_id", "status"]).isSubset(of: spawnColumns)
-            let spawnJoin = hasSpawnStatus
-                ? "LEFT JOIN thread_spawn_edges edge ON edge.child_thread_id = thread.id"
-                : ""
-            let spawnStatusExpression = hasSpawnStatus ? "edge.status" : "NULL"
-
-            guard let statement = prepareSQLiteStatement(
-                db: db,
-                sql: """
-                    SELECT thread.id, thread.rollout_path, thread.cwd,
-                           \(updatedAtExpression), \(modelExpression),
-                           \(spawnStatusExpression), thread.source
-                    FROM threads AS thread
-                    \(spawnJoin)
-                    WHERE thread.archived = 0
-                      AND \(updatedAtExpression) >= ?
-                      AND (
-                        thread.source = 'vscode'
-                        OR thread.source = 'appServer'
-                        OR thread.source LIKE '{"subagent"%'
-                      )
-                      ORDER BY \(updatedAtExpression) DESC
-                      LIMIT 50;
-                    """
-            ) else { return [] }
-            defer { sqlite3_finalize(statement) }
-            sqlite3_bind_double(statement, 1, cutoff)
-
-            var records: [CodexDesktopThreadRecord] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                guard let sessionId = sqliteColumnString(statement, index: 0),
-                      let transcriptPath = sqliteColumnString(statement, index: 1),
-                      let cwd = sqliteColumnString(statement, index: 2),
-                      fileManager.fileExists(atPath: transcriptPath) else { continue }
-                // JSON `source` rows can also belong to a concurrent Codex CLI
-                // subagent. Never re-key an explicitly CLI-origin rollout into
-                // the Desktop namespace merely because the Desktop host is open.
-                let transcriptOrigin = codexTranscriptOrigin(path: transcriptPath)
-                let databaseSource = sqliteColumnString(statement, index: 6) ?? ""
-                if databaseSource.hasPrefix("{\"subagent") {
-                    // JSON source alone does not identify the owning surface.
-                    // Require positive Desktop provenance before namespacing it.
-                    guard transcriptOrigin == .desktop else { continue }
-                } else {
-                    guard transcriptOrigin != .cli else { continue }
-                }
-
-                let dbUpdatedAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
-                let fileModifiedAt = (try? fileManager.attributesOfItem(atPath: transcriptPath))?[.modificationDate] as? Date
-                let modifiedAt = max(dbUpdatedAt, fileModifiedAt ?? dbUpdatedAt)
-                guard modifiedAt >= now.addingTimeInterval(-freshnessWindow) else { continue }
-
-                let dbModel = sqliteColumnString(statement, index: 4)
-                let (transcriptModel, messages) = readRecentFromCodexTranscript(path: transcriptPath)
-                let turnStatus = latestCodexTurnStatus(path: transcriptPath)
-                let isFresh = now.timeIntervalSince(modifiedAt) <= 300
-                let isActive = isFresh && turnStatus == .processing
-                if !isActive,
-                   now.timeIntervalSince(modifiedAt) > completionSettleWindow {
-                    continue
-                }
-
-                records.append(CodexDesktopThreadRecord(
-                    sessionId: sessionId,
-                    cwd: cwd,
-                    model: dbModel ?? transcriptModel,
-                    modifiedAt: modifiedAt,
-                    recentMessages: messages,
-                    transcriptPath: transcriptPath,
-                    status: isActive ? .processing : .idle,
-                    subagentMetadata: codexSubagentMetadata(inTranscriptPath: transcriptPath),
-                    subagentStatus: sqliteColumnString(statement, index: 5)
-                ))
-            }
-            return records
-        } ?? []
-    }
-
-    /// Find active Codex sessions by matching running processes to session files
-    private nonisolated static func findActiveCodexSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let codexProcesses = findCodexProcesses(candidatePids: candidatePids)
-        guard !codexProcesses.isEmpty else { return [] }
-
-        let processes = codexProcesses.map { process in
-            CodexProcessDiscoveryCandidate(
-                pid: process.pid,
-                cwd: getCwd(for: process.pid),
-                startTime: getProcessStartTime(process.pid),
-                isDesktop: process.isDesktop
-            )
-        }
-
-        // Each process is matched against the root it runs with (its
-        // CODEX_HOME, grouped by identity). One whose environment cannot be
-        // read lands in the first fallback root that has a session for it —
-        // never in every root. Paused roots are skipped (ConfigRootDiscovery).
-        let scan = configRootScan(for: .codex)
-        return ConfigRootDiscovery.run(
-            processes: processes,
-            lookup: { scan.lookup(pid: $0.pid) },
-            fallbackRoots: scan.fallbackRoots,
-            discover: { root, group, _ in
-                discoverCodexSessions(
-                    processes: group,
-                    sessionsBase: "\(root)/sessions",
-                    statePath: "\(root)/state_5.sqlite"
-                )
-            },
-            sessionId: \.sessionId,
-            // Desktop threads come from the state DB without a pid.
-            belongsTo: { session, process in
-                session.pid == process.pid || (session.pid == nil && process.isDesktop)
-            }
-        )
-    }
-
-    /// Filesystem/state-DB portion of Codex discovery, split from process
-    /// inspection so root-CWD fallback and DB degradation can be tested without
-    /// relying on live PIDs.
-    nonisolated static func discoverCodexSessions(
-        processes: [CodexProcessDiscoveryCandidate],
-        sessionsBase: String,
-        statePath: String,
-        now: Date = Date(),
-        fileManager fm: FileManager = .default
-    ) -> [DiscoveredSession] {
-        var results: [DiscoveredSession] = []
-        var seenDiscoveryIds: Set<String> = []
-        var seenDesktopSessionIds: Set<String> = []
-        var claimedUnknownSessionIds: Set<String> = []
-
-        // Prefer the native host for unknown-origin root rollouts. Explicit CLI
-        // and Desktop metadata is filtered below, so concurrent modes remain
-        // distinct even when they share a project directory.
-        let orderedProcesses = processes.sorted {
-            $0.isDesktop && !$1.isDesktop
-        }
-        for process in orderedProcesses {
-            let processCwd = process.cwd
-            let useTranscriptCwd = codexDiscoveryUsesTranscriptCwd(processCwd: processCwd)
-            if !useTranscriptCwd,
-               let processCwd,
-               isSubagentWorktree(processCwd) {
-                continue
-            }
-
-            // Codex stores sessions in date-based dirs: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
-            // A terminal process maps to one cwd; the shared Desktop app-server
-            // may own several sessions, so inspect all fresh rollouts instead.
-            let candidates = fm.fileExists(atPath: sessionsBase)
-                ? findRecentCodexSessions(base: sessionsBase, after: process.startTime, fm: fm)
-                : []
-            let files: [String]
-            if useTranscriptCwd {
-                files = candidates.filter { file in
-                    switch codexTranscriptOrigin(path: file) {
-                    case .desktop: return process.isDesktop
-                    case .cli: return !process.isDesktop
-                    case .unknown: return true
-                    }
-                }
-            } else if let processCwd {
-                files = Array(candidates.filter { file in
-                    guard codexSessionMatchesCwd(path: file, cwd: processCwd) else { return false }
-                    switch codexTranscriptOrigin(path: file) {
-                    case .desktop: return process.isDesktop
-                    case .cli: return !process.isDesktop
-                    case .unknown: return true
-                    }
-                }.prefix(1))
-            } else {
-                files = []
-            }
-
-            for file in files {
-                let fileName = (file as NSString).lastPathComponent
-                let rawSessionId = extractCodexSessionId(from: fileName)
-                guard !rawSessionId.isEmpty else { continue }
-                let identity = codexDiscoveryIdentity(
-                    rawSessionId: rawSessionId,
-                    isDesktop: process.isDesktop
-                )
-                guard !seenDiscoveryIds.contains(identity.sessionId) else { continue }
-                let transcriptOrigin = codexTranscriptOrigin(path: file)
-                if transcriptOrigin == .unknown,
-                   claimedUnknownSessionIds.contains(rawSessionId) {
-                    continue
-                }
-
-                let modifiedAt = (try? fm.attributesOfItem(atPath: file))?[.modificationDate] as? Date ?? now
-                let codexFreshnessLimit: TimeInterval = process.startTime != nil ? -300 : -30
-                if modifiedAt.timeIntervalSince(now) < codexFreshnessLimit { continue }
-
-                let transcriptCwd = codexSessionCwd(path: file)
-                let sessionCwd = useTranscriptCwd ? transcriptCwd : (transcriptCwd ?? processCwd)
-                guard let sessionCwd, !sessionCwd.isEmpty, !isSubagentWorktree(sessionCwd) else { continue }
-
-                let (model, messages) = readRecentFromCodexTranscript(path: file)
-                let subagentMetadata = codexSubagentMetadata(inTranscriptPath: file)
-                let turnStatus = latestCodexTurnStatus(path: file)
-
-                results.append(DiscoveredSession(
-                    sessionId: identity.sessionId,
-                    cwd: sessionCwd,
-                    tty: nil,
-                    model: model,
-                    pid: process.pid,
-                    modifiedAt: modifiedAt,
-                    recentMessages: messages,
-                    source: "codex",
-                    transcriptPath: file,
-                    parentSessionId: subagentMetadata?.parentThreadId,
-                    subagentStatus: nil,
-                    agentType: subagentMetadata?.agentType,
-                    agentNickname: subagentMetadata?.agentNickname,
-                    status: turnStatus.map { $0 == .processing ? .processing : .idle },
-                    termBundleId: identity.termBundleId,
-                    providerSessionId: identity.providerSessionId
-                ))
-                // Only accepted candidates exclude a matching DB record. A stale
-                // or malformed rollout must not hide a valid state-backed thread.
-                seenDiscoveryIds.insert(identity.sessionId)
-                if transcriptOrigin == .unknown {
-                    claimedUnknownSessionIds.insert(rawSessionId)
-                }
-                if process.isDesktop {
-                    seenDesktopSessionIds.insert(rawSessionId)
-                }
-            }
-        }
-
-        // Only actual active subagents need the optional spawn-edge status.
-        // Resolve all of them through one read-only SQLite connection; terminal
-        // transcript state already wins without consulting the database.
-        let activeSubagentIds = Set(results.compactMap { result -> String? in
-            guard result.parentSessionId != nil, result.status != .idle else { return nil }
-            return result.providerSessionId ?? result.sessionId
-        })
-        if !activeSubagentIds.isEmpty {
-            let spawnRecords = codexSpawnEdgeRecords(
-                threadIds: activeSubagentIds,
-                statePath: statePath
-            )
-            for index in results.indices {
-                let providerSessionId = results[index].providerSessionId ?? results[index].sessionId
-                results[index].subagentStatus = spawnRecords[providerSessionId]?.status
-            }
-        }
-
-        // Native Codex Desktop / ChatGPT sessions cannot be mapped by process
-        // CWD because its app-server runs from `/`. Hydrate recent threads from
-        // state_5.sqlite and let transcript activity drive running/idle state.
-        if processes.contains(where: { $0.isDesktop }) {
-            results.append(contentsOf: findRecentCodexDesktopSessions(
-                excluding: seenDesktopSessionIds,
-                statePath: statePath,
-                now: now,
-                fileManager: fm
-            ))
-        }
-        return results
-    }
-
-    private nonisolated static func findRecentCodexDesktopSessions(
-        excluding excludedSessionIds: Set<String> = [],
-        statePath: String? = nil,
-        now: Date = Date(),
-        fileManager: FileManager = .default
-    ) -> [DiscoveredSession] {
-        let resolvedStatePath = statePath ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/state_5.sqlite").path
-
-        return recentCodexDesktopThreadRecords(
-            statePath: resolvedStatePath,
-            now: now,
-            fileManager: fileManager
-        ).compactMap { record in
-            guard !excludedSessionIds.contains(record.sessionId) else { return nil }
-            let identity = codexDiscoveryIdentity(rawSessionId: record.sessionId, isDesktop: true)
-            return DiscoveredSession(
-                sessionId: identity.sessionId,
-                cwd: record.cwd,
-                tty: nil,
-                model: record.model,
-                pid: nil,
-                modifiedAt: record.modifiedAt,
-                recentMessages: record.recentMessages,
-                source: "codex",
-                transcriptPath: record.transcriptPath,
-                parentSessionId: record.subagentMetadata?.parentThreadId,
-                subagentStatus: record.subagentStatus,
-                agentType: record.subagentMetadata?.agentType,
-                agentNickname: record.subagentMetadata?.agentNickname,
-                status: record.status,
-                termBundleId: identity.termBundleId,
-                providerSessionId: identity.providerSessionId
-            )
-        }
-    }
-
-    private nonisolated static func inspectCodexSubagentMetadata(
-        inTranscriptPath path: String
-    ) -> CodexTranscriptSubagentInspection {
-        guard let firstLine = readFirstLine(path: path),
-              let data = firstLine.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              json["type"] as? String == "session_meta",
-              let payload = json["payload"] as? [String: Any] else {
-            return .unavailable
-        }
-
-        guard let source = payload["source"] as? [String: Any] else {
-            return .root
-        }
-        let payloadParent = (payload["parent_thread_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        // Unit variants (`review`, `compact`, `memory_consolidation`) serialize as
-        // a bare string and only record their parent on the payload. Without
-        // one there is no spawn edge to fall back to either.
-        if let label = source["subagent"] as? String, !label.isEmpty {
-            guard let payloadParent else { return .root }
-            return .subagent(CodexSubagentMetadata(
-                parentThreadId: payloadParent,
-                agentType: label,
-                agentNickname: nil
-            ))
-        }
-        guard let subagent = source["subagent"] as? [String: Any],
-              !subagent.isEmpty else {
-            return .root
-        }
-        // Spawned workers nest the parent under `source.subagent.thread_spawn`;
-        // auto-review (guardian) threads record it on the payload itself.
-        let parent = firstStringRecursively(in: subagent, key: "parent_thread_id")
-            ?? payloadParent
-        guard let parent, !parent.isEmpty else { return .unavailable }
-
-        let agentType = firstStringRecursively(in: subagent, key: "agent_role")
-            ?? subagent["other"] as? String
-            ?? subagent.keys.sorted().first
-        let nickname = firstStringRecursively(in: subagent, key: "agent_nickname")
-        return .subagent(CodexSubagentMetadata(
-            parentThreadId: parent,
-            agentType: agentType,
-            agentNickname: nickname
-        ))
-    }
-
-    nonisolated static func codexSubagentMetadata(inTranscriptPath path: String) -> CodexSubagentMetadata? {
-        guard case .subagent(let metadata) = inspectCodexSubagentMetadata(
-            inTranscriptPath: path
-        ) else {
-            return nil
-        }
-        return metadata
-    }
-
-    nonisolated static func codexSubagentMetadata(
-        threadId: String,
-        transcriptPath: String?,
-        statePath overrideStatePath: String? = nil
-    ) -> CodexSubagentMetadata? {
-        if let transcriptPath {
-            switch inspectCodexSubagentMetadata(inTranscriptPath: transcriptPath) {
-            case .subagent(let metadata):
-                return metadata
-            case .root:
-                return nil
-            case .unavailable:
-                break
-            }
-        }
-
-        return codexSpawnEdgeRecords(
-            threadIds: [threadId],
-            statePath: overrideStatePath
-        )[threadId]?.metadata
-    }
-
-    /// Resolve spawn relations/statuses in one read-only connection. Queries are
-    /// chunked to keep SQLite variable counts bounded when restoring many cards.
-    private nonisolated static func codexSpawnEdgeRecords(
-        threadIds: Set<String>,
-        statePath overrideStatePath: String? = nil
-    ) -> [String: CodexSpawnEdgeRecord] {
-        guard !threadIds.isEmpty else { return [:] }
-        guard let statePath = overrideStatePath else {
-            // A thread can live in any Codex root; the first root that knows it wins.
-            var merged: [String: CodexSpawnEdgeRecord] = [:]
-            for root in codexStateRoots() {
-                let unresolved = threadIds.subtracting(merged.keys)
-                guard !unresolved.isEmpty else { break }
-                let found = codexSpawnEdgeRecords(threadIds: unresolved, statePath: "\(root)/state_5.sqlite")
-                merged.merge(found) { current, _ in current }
-            }
-            return merged
-        }
-        return withSQLiteDatabase(at: statePath) { db in
-            let edgeColumns = sqliteTableColumns(db: db, tableName: "thread_spawn_edges")
-            guard Set(["parent_thread_id", "child_thread_id", "status"]).isSubset(of: edgeColumns) else {
-                return [:]
-            }
-            let threadColumns = sqliteTableColumns(db: db, tableName: "threads")
-            let canJoinThreads = threadColumns.contains("id")
-            let roleExpression = canJoinThreads && threadColumns.contains("agent_role")
-                ? "thread.agent_role" : "NULL"
-            let nicknameExpression = canJoinThreads && threadColumns.contains("agent_nickname")
-                ? "thread.agent_nickname" : "NULL"
-            let sourceExpression = canJoinThreads && threadColumns.contains("source")
-                ? "thread.source" : "NULL"
-            let transcriptExpression = canJoinThreads && threadColumns.contains("rollout_path")
-                ? "thread.rollout_path" : "NULL"
-            let join = canJoinThreads
-                ? "LEFT JOIN threads AS thread ON thread.id = edge.child_thread_id"
-                : ""
-
-            let orderedIds = threadIds.sorted()
-            let chunkSize = 200
-            var records: [String: CodexSpawnEdgeRecord] = [:]
-            for start in stride(from: 0, to: orderedIds.count, by: chunkSize) {
-                let end = min(start + chunkSize, orderedIds.count)
-                let chunk = Array(orderedIds[start..<end])
-                let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
-                let sql = """
-                    SELECT edge.child_thread_id, edge.parent_thread_id, edge.status,
-                           \(roleExpression), \(nicknameExpression), \(sourceExpression),
-                           \(transcriptExpression)
-                    FROM thread_spawn_edges AS edge
-                    \(join)
-                    WHERE edge.child_thread_id IN (\(placeholders))
-                    """
-                guard let statement = prepareSQLiteStatement(db: db, sql: sql) else { continue }
-                for (offset, threadId) in chunk.enumerated() {
-                    bindSQLiteText(threadId, to: statement, index: Int32(offset + 1))
-                }
-                while sqlite3_step(statement) == SQLITE_ROW {
-                    guard let child = nonEmptySQLiteColumnString(statement, index: 0),
-                          let parent = nonEmptySQLiteColumnString(statement, index: 1) else {
-                        continue
-                    }
-                    var agentType = nonEmptySQLiteColumnString(statement, index: 3)
-                    var nickname = nonEmptySQLiteColumnString(statement, index: 4)
-                    if let source = nonEmptySQLiteColumnString(statement, index: 5),
-                       let data = source.data(using: .utf8),
-                       let json = try? JSONSerialization.jsonObject(with: data) {
-                        agentType = agentType ?? firstStringRecursively(in: json, key: "agent_role")
-                        nickname = nickname ?? firstStringRecursively(in: json, key: "agent_nickname")
-                    }
-                    records[child] = CodexSpawnEdgeRecord(
-                        metadata: CodexSubagentMetadata(
-                            parentThreadId: parent,
-                            agentType: agentType,
-                            agentNickname: nickname
-                        ),
-                        status: nonEmptySQLiteColumnString(statement, index: 2),
-                        transcriptPath: nonEmptySQLiteColumnString(statement, index: 6)
-                    )
-                }
-                sqlite3_finalize(statement)
-            }
-            return records
-        } ?? [:]
-    }
-
-    private nonisolated static func readFirstLine(path: String, maxBytes: Int = 2_000_000) -> String? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { handle.closeFile() }
-
-        var data = Data()
-        while data.count < maxBytes {
-            let chunk = handle.readData(ofLength: 64 * 1024)
-            if chunk.isEmpty { break }
-            if let newline = chunk.firstIndex(of: UInt8(ascii: "\n")) {
-                data.append(chunk[..<newline])
-                break
-            }
-            data.append(chunk)
-        }
-        guard !data.isEmpty else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    private nonisolated static func firstStringRecursively(in value: Any, key: String) -> String? {
-        if let dict = value as? [String: Any] {
-            if let string = dict[key] as? String,
-               !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return string
-            }
-            for child in dict.values {
-                if let found = firstStringRecursively(in: child, key: key) {
-                    return found
-                }
-            }
-        } else if let array = value as? [Any] {
-            for child in array {
-                if let found = firstStringRecursively(in: child, key: key) {
-                    return found
-                }
-            }
-        }
-        return nil
-    }
-
-    private nonisolated static func nonEmptySQLiteColumnString(_ statement: OpaquePointer, index: Int32) -> String? {
-        guard let value = sqliteColumnString(statement, index: index)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
-            return nil
-        }
-        return value
-    }
-
-    /// Find the most recent Codex session file matching a CWD
-    /// Scans back up to 7 days to cover long-running sessions that span day boundaries
-    private nonisolated static func findRecentCodexSession(base: String, cwd: String, after: Date?, fm: FileManager) -> String? {
-        findRecentCodexSessions(base: base, after: after, fm: fm)
-            .first(where: { codexSessionMatchesCwd(path: $0, cwd: cwd) })
-    }
-
-    private nonisolated static func findRecentCodexSessions(base: String, after: Date?, fm: FileManager) -> [String] {
-        let cal = Calendar.current
-        let now = Date()
-        var dirs: [String] = []
-        for daysBack in 0..<7 {
-            guard let date = cal.date(byAdding: .day, value: -daysBack, to: now) else { continue }
-            let y = String(format: "%04d", cal.component(.year, from: date))
-            let m = String(format: "%02d", cal.component(.month, from: date))
-            let d = String(format: "%02d", cal.component(.day, from: date))
-            let dir = "\(base)/\(y)/\(m)/\(d)"
-            if fm.fileExists(atPath: dir) {
-                dirs.append(dir)
-            }
-        }
-        guard !dirs.isEmpty else { return [] }
-        return scanCodexDir(dirs: dirs, after: after, fm: fm)
-    }
-
-    private nonisolated static func scanCodexDir(dirs: [String], after: Date?, fm: FileManager) -> [String] {
-        var results: [String] = []
-        for dir in dirs {
-            guard let files = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            // Sort descending to check newest first
-            let jsonlFiles = files.filter { $0.hasSuffix(".jsonl") }.sorted(by: >)
-
-            for file in jsonlFiles.prefix(20) {
-                let fullPath = "\(dir)/\(file)"
-                if let start = after,
-                   let attrs = try? fm.attributesOfItem(atPath: fullPath),
-                   let modified = attrs[.modificationDate] as? Date,
-                   modified < start.addingTimeInterval(-10) {
-                    continue
-                }
-                results.append(fullPath)
-            }
-        }
-        return results
-    }
-
-    /// Check if a Codex session file's CWD matches the target
-    private nonisolated static func codexSessionMatchesCwd(path: String, cwd: String) -> Bool {
-        codexSessionCwd(path: path) == cwd
-    }
-
-    nonisolated static func codexSessionCwd(path: String) -> String? {
-        guard let firstLine = readFirstLine(path: path),
-              let lineData = firstLine.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-              let payload = json["payload"] as? [String: Any],
-              let sessionCwd = payload["cwd"] as? String else { return nil }
-        return sessionCwd
-    }
-
-    /// Extract session ID from Codex filename: rollout-2026-04-04T20-54-48-{uuid}.jsonl
-    private nonisolated static func extractCodexSessionId(from filename: String) -> String {
-        // Format: rollout-YYYY-MM-DDThh-mm-ss-{uuid}.jsonl
-        let name = filename.replacingOccurrences(of: ".jsonl", with: "")
-        // The UUID is the last 36 chars (8-4-4-4-12)
-        // Pattern: after the datetime portion, everything from the 4th dash group onwards is the UUID
-        let parts = name.split(separator: "-")
-        // rollout-YYYY-MM-DDThh-mm-ss-{8}-{4}-{4}-{4}-{12}
-        // That's: [rollout, YYYY, MM, DDThh, mm, ss, uuid1, uuid2, uuid3, uuid4, uuid5]
-        if parts.count >= 11 {
-            return parts.suffix(5).joined(separator: "-")
-        }
-        return name
-    }
-
-    private nonisolated static func extractTextContent(from rawContent: Any?) -> String? {
-        if let text = rawContent as? String, !text.isEmpty {
-            return text
-        }
-        if let items = rawContent as? [[String: Any]] {
-            for item in items {
-                if let text = item["text"] as? String, !text.isEmpty {
-                    return text
-                }
-                if let output = item["output"] as? [String: Any],
-                   let text = output["text"] as? String, !text.isEmpty {
-                    return text
-                }
-            }
-        }
-        return nil
-    }
-
-    nonisolated static func readRecentFromCursorTranscript(path: String) -> (String?, [ChatMessage]) {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, []) }
-        defer { handle.closeFile() }
-
-        let fileSize = handle.seekToEndOfFile()
-        let readSize: UInt64 = min(fileSize, 65536)
-        handle.seek(toFileOffset: fileSize - readSize)
-        let data = handle.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return (nil, []) }
-
-        var userMessages: [(Int, String)] = []
-        var assistantMessages: [(Int, String)] = []
-        var index = 0
-
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let role = json["role"] as? String,
-                  let message = json["message"] as? [String: Any],
-                  let textContent = JSONLTailer.normalizedCursorChatText(from: message["content"])
-                    ?? extractTextContent(from: message["content"])
-            else { continue }
-
-            if role == "user" {
-                userMessages.append((index, textContent))
-            } else if role == "assistant" {
-                assistantMessages.append((index, textContent))
-            }
-            index += 1
-        }
-
-        var combined: [(Int, ChatMessage)] = []
-        for (i, text) in userMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: true, text: text)))
-        }
-        for (i, text) in assistantMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: false, text: text)))
-        }
-        combined.sort { $0.0 < $1.0 }
-        return (nil, Array(combined.suffix(3).map { $0.1 }))
-    }
-
-    private nonisolated static func readRecentFromCodeBuddyTranscript(path: String) -> (String?, [ChatMessage]) {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, []) }
-        defer { handle.closeFile() }
-
-        let fileSize = handle.seekToEndOfFile()
-        let readSize: UInt64 = min(fileSize, 65536)
-        handle.seek(toFileOffset: fileSize - readSize)
-        let data = handle.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return (nil, []) }
-
-        var model: String?
-        var userMessages: [(Int, String)] = []
-        var assistantMessages: [(Int, String)] = []
-        var index = 0
-
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  json["type"] as? String == "message",
-                  let role = json["role"] as? String,
-                  let textContent = extractTextContent(from: json["content"])
-            else { continue }
-
-            if model == nil,
-               let providerData = json["providerData"] as? [String: Any],
-               let messageModel = providerData["model"] as? String, !messageModel.isEmpty {
-                model = messageModel
-            }
-
-            if role == "user" {
-                userMessages.append((index, textContent))
-            } else if role == "assistant" {
-                assistantMessages.append((index, textContent))
-            }
-            index += 1
-        }
-
-        var combined: [(Int, ChatMessage)] = []
-        for (i, text) in userMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: true, text: text)))
-        }
-        for (i, text) in assistantMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: false, text: text)))
-        }
-        combined.sort { $0.0 < $1.0 }
-        return (model, Array(combined.suffix(3).map { $0.1 }))
-    }
-
-    private nonisolated static func readRecentFromFactoryTranscript(path: String) -> (String?, [ChatMessage]) {
-        let sidecarPath = path.replacingOccurrences(of: ".jsonl", with: ".settings.json")
-        var model: String?
-        if let data = FileManager.default.contents(atPath: sidecarPath),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let foundModel = json["model"] as? String, !foundModel.isEmpty {
-            model = foundModel
-        }
-        let (_, messages) = readRecentFromTranscript(path: path)
-        return (model, messages)
-    }
-
-    private nonisolated static func readRecentFromCopilotTranscript(path: String) -> (String?, [ChatMessage]) {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, []) }
-        defer { handle.closeFile() }
-
-        let fileSize = handle.seekToEndOfFile()
-        let readSize: UInt64 = min(fileSize, 65536)
-        handle.seek(toFileOffset: fileSize - readSize)
-        let data = handle.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return (nil, []) }
-
-        var model: String?
-        var userMessages: [(Int, String)] = []
-        var assistantMessages: [(Int, String)] = []
-        var index = 0
-
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let type = json["type"] as? String,
-                  let payload = json["data"] as? [String: Any]
-            else { continue }
-
-            if model == nil {
-                if let currentModel = payload["currentModel"] as? String, !currentModel.isEmpty {
-                    model = currentModel
-                } else if let eventModel = payload["model"] as? String, !eventModel.isEmpty {
-                    model = eventModel
-                } else if let metrics = payload["modelMetrics"] as? [String: Any],
-                          let metricModel = metrics.keys.sorted().last, !metricModel.isEmpty {
-                    model = metricModel
-                }
-            }
-
-            if type == "user.message",
-               let textContent = payload["content"] as? String, !textContent.isEmpty {
-                userMessages.append((index, textContent))
-            } else if type == "assistant.message",
-                      let textContent = payload["content"] as? String, !textContent.isEmpty {
-                assistantMessages.append((index, textContent))
-            }
-            index += 1
-        }
-
-        var combined: [(Int, ChatMessage)] = []
-        for (i, text) in userMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: true, text: text)))
-        }
-        for (i, text) in assistantMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: false, text: text)))
-        }
-        combined.sort { $0.0 < $1.0 }
-        return (model, Array(combined.suffix(3).map { $0.1 }))
-    }
-
-    private nonisolated static func readTranscriptTail(path: String, maxBytes: UInt64 = 65536) -> String? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { handle.closeFile() }
-
-        let fileSize = handle.seekToEndOfFile()
-        let readSize: UInt64 = min(fileSize, maxBytes)
-        handle.seek(toFileOffset: fileSize - readSize)
-        let data = handle.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)
-    }
-
-    private nonisolated static func parseISO8601Timestamp(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) {
-            return date
-        }
-
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: value)
-    }
-
-    nonisolated static func codexLatestTerminalTurnTimestamp(in transcriptTail: String) -> Date? {
-        let terminalEventTypes: Set<String> = ["task_complete", "turn_aborted", "turn_failed"]
-        var latest: Date?
-
-        for line in transcriptTail.components(separatedBy: "\n") {
-            guard !line.isEmpty,
-                  let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  (json["type"] as? String) == "event_msg",
-                  let payload = json["payload"] as? [String: Any],
-                  let eventType = payload["type"] as? String,
-                  terminalEventTypes.contains(eventType),
-                  let timestamp = json["timestamp"] as? String,
-                  let date = parseISO8601Timestamp(timestamp) else { continue }
-
-            if latest == nil || date > latest! {
-                latest = date
-            }
-        }
-
-        return latest
-    }
-
-    nonisolated static func qoderLatestTerminalTurnTimestamp(in transcriptTail: String) -> Date? {
-        var latest: Date?
-
-        for line in transcriptTail.components(separatedBy: "\n") {
-            guard !line.isEmpty,
-                  let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let timestamp = json["timestamp"] as? String,
-                  let date = parseISO8601Timestamp(timestamp) else { continue }
-
-            let type = json["type"] as? String ?? ""
-            if type == "progress",
-               let data = json["data"] as? [String: Any] {
-                let hookEvent = (data["hookEvent"] as? String) ?? (data["hookName"] as? String) ?? ""
-                if hookEvent == "Stop" || hookEvent == "SessionEnd" {
-                    if latest == nil || date > latest! {
-                        latest = date
-                    }
-                    continue
-                }
-            }
-
-            if type == "assistant",
-               let message = json["message"] as? [String: Any],
-               (message["role"] as? String) == "assistant",
-               extractTextContent(from: message["content"]) != nil {
-                if latest == nil || date > latest! {
-                    latest = date
-                }
-            }
-        }
-
-        return latest
-    }
-
-    nonisolated static func codeBuddyLatestTerminalTurnTimestamp(in transcriptTail: String) -> Date? {
-        var latest: Date?
-
-        for line in transcriptTail.components(separatedBy: "\n") {
-            guard !line.isEmpty,
-                  let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  (json["type"] as? String) == "message",
-                  (json["role"] as? String) == "assistant",
-                  (json["status"] as? String) == "completed",
-                  extractTextContent(from: json["content"]) != nil else { continue }
-
-            let date: Date?
-            if let rawTimestamp = json["timestamp"] as? NSNumber {
-                date = Date(timeIntervalSince1970: rawTimestamp.doubleValue / 1000)
-            } else if let rawTimestamp = json["timestamp"] as? Double {
-                date = Date(timeIntervalSince1970: rawTimestamp / 1000)
-            } else if let rawTimestamp = json["timestamp"] as? Int64 {
-                date = Date(timeIntervalSince1970: TimeInterval(rawTimestamp) / 1000)
-            } else {
-                date = nil
-            }
-
-            guard let date else { continue }
-            if latest == nil || date > latest! {
-                latest = date
-            }
-        }
-
-        return latest
-    }
-
-    /// Read model and recent messages from a Codex transcript file
-    nonisolated static func readRecentFromCodexTranscript(path: String) -> (String?, [ChatMessage]) {
-        guard let text = readTranscriptTail(path: path) else { return (nil, []) }
-
-        var model: String?
-        var turnModel: String?
-        var userMessages: [(Int, String)] = []
-        var assistantMessages: [(Int, String)] = []
-        var index = 0
-
-        for line in text.components(separatedBy: "\n") {
-            guard !line.isEmpty,
-                  let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
-
-            let type = json["type"] as? String ?? ""
-
-            // Extract model from session_meta
-            if type == "session_meta", model == nil,
-               let payload = json["payload"] as? [String: Any] {
-                model = payload["model"] as? String
-                    ?? payload["model_provider"] as? String
-            }
-            // turn_context names the model each turn actually ran on; current
-            // session_meta only has the provider ("openai"), which is no label.
-            if type == "turn_context",
-               let payload = json["payload"] as? [String: Any],
-               let observation = ModelObservation.from(model: payload["model"], effort: nil) {
-                turnModel = observation.model
-            }
-
-            // Prefer event_msg (cleaner user messages from Codex).
-            if type == "event_msg",
-               let payload = json["payload"] as? [String: Any],
-               let msgType = payload["type"] as? String,
-               let msg = payload["message"] as? String, !msg.isEmpty {
-                if msgType == "user_message" {
-                    userMessages.append((index, msg))
-                }
-            }
-
-            if let assistantText = JSONLTailer.codexPublicAssistantText(from: json),
-               assistantMessages.last?.1 != assistantText {
-                assistantMessages.append((index, assistantText))
-            }
-
-            // response_item user entries often include injected system/tool
-            // context, so only use them when no cleaner event_msg was found.
-            if type == "response_item", userMessages.isEmpty,
-               let payload = json["payload"] as? [String: Any],
-               payload["type"] as? String == "message",
-               payload["role"] as? String == "user",
-               let content = payload["content"] as? [[String: Any]],
-               let text = content.first(where: { $0["type"] as? String == "input_text" })?["text"] as? String,
-               !text.isEmpty {
-                userMessages.append((index, text))
-            }
-            index += 1
-        }
-
-        var combined: [(Int, ChatMessage)] = []
-        for (i, text) in userMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: true, text: text)))
-        }
-        for (i, text) in assistantMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: false, text: text)))
-        }
-        combined.sort { $0.0 < $1.0 }
-        let recent = Array(combined.suffix(3).map { $0.1 })
-
-        return (turnModel ?? model, recent)
-    }
-
-    /// Read model and last 3 user/assistant messages from a transcript file's tail
-    /// First text block of a transcript row worth showing, cleaned the way the
-    /// live tail cleans it (`JSONLTailer.extractText`): mcode's reasoning blobs
-    /// are skipped and leading injected wrappers removed, so a card rebuilt on
-    /// attach reads the same as one fed by the tailer.
-    nonisolated static func firstDisplayText(in blocks: [[String: Any]]) -> String? {
-        for block in blocks {
-            guard block["type"] as? String == "text",
-                  let raw = block["text"] as? String,
-                  !JSONLTailer.isThinkingBlob(raw) else { continue }
-            let text = JSONLTailer.stripDisplayWrappers(raw).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { return text }
-        }
-        return nil
-    }
-
-    nonisolated static func readRecentFromTranscript(path: String) -> (String?, [ChatMessage]) {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, []) }
-        defer { handle.closeFile() }
-
-        // Read last 64KB
-        let fileSize = handle.seekToEndOfFile()
-        let readSize: UInt64 = min(fileSize, 65536)
-        handle.seek(toFileOffset: fileSize - readSize)
-        let data = handle.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return (nil, []) }
-
-        var model: String?
-        var userMessages: [(Int, String)] = []
-        var assistantMessages: [(Int, String)] = []
-        var index = 0
-
-        for line in text.components(separatedBy: "\n") {
-            guard !line.isEmpty,
-                  let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
-            else { continue }
-
-            let type = json["type"] as? String
-            let message = (json["message"] as? [String: Any]) ?? json
-            let role = (message["role"] as? String) ?? type
-
-            guard let role else { continue }
-            let normalizedRole = role.lowercased()
-
-            if model == nil, let m = message["model"] as? String, !m.isEmpty {
-                model = m
-            }
-
-            // Extract text content
-            var textContent: String?
-            if normalizedRole == "user" || normalizedRole == "user_input" {
-                if let content = message["content"] as? String {
-                    textContent = JSONLTailer.stripDisplayWrappers(content)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                } else if let contentArray = message["content"] as? [[String: Any]] {
-                    textContent = firstDisplayText(in: contentArray)
-                }
-            } else if normalizedRole == "assistant" || normalizedRole == "planner_response" {
-                if let content = message["content"] as? String {
-                    textContent = JSONLTailer.isThinkingBlob(content)
-                        ? nil
-                        : content.trimmingCharacters(in: .whitespacesAndNewlines)
-                } else if let contentArray = message["content"] as? [[String: Any]] {
-                    textContent = firstDisplayText(in: contentArray)
-                } else if let thinking = message["thinking"] as? String {
-                    textContent = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-            }
-
-            if let text = textContent, !text.isEmpty {
-                if normalizedRole == "user" || normalizedRole == "user_input" {
-                    // Same rules as the live tail: injected (isMeta) rows and
-                    // local slash commands (/model) are not prompts; a prompt
-                    // command reads as typed ("/review foo").
-                    if json["isMeta"] as? Bool != true {
-                        switch JSONLTailer.claudeCommandEcho(text) {
-                        case .local?: break
-                        case .prompt(let command)?: userMessages.append((index, command))
-                        case nil: userMessages.append((index, text))
-                        }
-                    }
-                } else if normalizedRole == "assistant" || normalizedRole == "planner_response" {
-                    assistantMessages.append((index, text))
-                }
-            }
-            index += 1
-        }
-
-        // Build recent messages: take last few user+assistant, sorted by order, keep 3
-        var combined: [(Int, ChatMessage)] = []
-        for (i, text) in userMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: true, text: text)))
-        }
-        for (i, text) in assistantMessages.suffix(3) {
-            combined.append((i, ChatMessage(isUser: false, text: text)))
-        }
-        combined.sort { $0.0 < $1.0 }
-        let recent = Array(combined.suffix(3).map { $0.1 })
-
-        return (model, recent)
-    }
-}
-
-/// Encode a path the same way Claude Code does for project directory names:
-/// "/" → "-", non-ASCII → "-", spaces → "-"
-extension String {
-    func claudeProjectDirEncoded() -> String {
-        var result = ""
-        for c in self.unicodeScalars {
-            if c == "/" || c == " " || c.value > 127 {
-                result.append("-")
-            } else {
-                result.append(Character(c))
-            }
-        }
-        return result
-    }
-
-    func appProjectDirEncoded() -> String {
-        let encoded = claudeProjectDirEncoded()
-        if encoded.hasPrefix("-") {
-            return String(encoded.dropFirst())
-        }
-        return encoded
     }
 }

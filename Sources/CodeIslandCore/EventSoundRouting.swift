@@ -1,6 +1,7 @@
 import Foundation
 
-/// Which sound, if any, a hook event rings.
+/// Which sound, if any, a hook event rings — the cue `AttentionPolicy` reads
+/// for a hook event before its other rules and the user's settings apply.
 ///
 /// Sounds mark turn boundaries, not steps inside a turn. A failed tool call —
 /// a Bash command exiting non-zero, an Edit whose `old_string` did not match —
@@ -21,6 +22,9 @@ public enum EventSoundRouting {
     /// before that fold.
     public static func soundEvent(rawEventName: String, normalizedEventName: String) -> String? {
         if normalizedEventName == "PostToolUseFailure" { return nil }
+        // The launch chime's cue is the app's own: a hook event that happens
+        // to carry its name rings nothing.
+        if normalizedEventName == SoundCue.launch { return nil }
         if rawEventName == "StopFailure" || rawEventName == "stop_failure" { return turnFailed }
         return normalizedEventName
     }

@@ -134,6 +134,49 @@ final class ConfigInstallerTests: XCTestCase {
         XCTAssertTrue(command.contains("--event stop"))
     }
 
+    func testReinstallingUnchangedExternalHooksLeavesTheFileAlone() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let configPath = tempDir.appendingPathComponent("settings.json").path
+        let cli = CLIConfig(
+            name: "Qwen Code",
+            source: "qwen",
+            configPath: configPath,
+            configKey: "hooks",
+            format: .claude,
+            events: [("PreToolUse", 5, false), ("PostToolUse", 5, false), ("Stop", 5, false)]
+        )
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+
+        // What another launch wrote: the same document with its keys in
+        // another order (each process orders our dictionaries differently).
+        let installed = try XCTUnwrap(fm.contents(atPath: configPath))
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: installed) as? [String: Any])
+        let reordered = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try reordered.write(to: URL(fileURLWithPath: configPath))
+        let past = Date(timeIntervalSince1970: 1_000_000_000)
+        try fm.setAttributes([.modificationDate: past], ofItemAtPath: configPath)
+
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+        XCTAssertEqual(fm.contents(atPath: configPath), reordered)
+        XCTAssertEqual(try fm.attributesOfItem(atPath: configPath)[.modificationDate] as? Date, past)
+
+        // A file that is missing something still gets it back.
+        var hooks = try XCTUnwrap(root["hooks"] as? [String: Any])
+        hooks["Stop"] = nil
+        root["hooks"] = hooks
+        try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]).write(to: URL(fileURLWithPath: configPath))
+        try fm.setAttributes([.modificationDate: past], ofItemAtPath: configPath)
+
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+        let repaired = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(fm.contents(atPath: configPath))) as? [String: Any])
+        XCTAssertNotNil((repaired["hooks"] as? [String: Any])?["Stop"])
+        XCTAssertNotEqual(try fm.attributesOfItem(atPath: configPath)[.modificationDate] as? Date, past)
+    }
+
     func testCodexSessionEndTimeoutRespectsTeardownCapAndRepairsStaleConfig() throws {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1103,15 +1146,16 @@ hooks:
         // socket path so different OS users don't collide on /tmp/codeisland.sock.
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
 
-        let script = RemoteInstaller.configureRemoteHooksScript(host: host, remoteSocketPath: "/tmp/codeisland-1000.sock")
+        let script = RemoteInstaller.configureRemoteHooksScript(host: host, remoteSocketPath: "/tmp/codeisland-1000/island.sock")
 
-        XCTAssertTrue(script.contains(#"socket_path = "/tmp/codeisland-1000.sock""#))
-        XCTAssertTrue(script.contains("CODEISLAND_SOCKET_PATH={socket_path}"))
+        XCTAssertTrue(script.contains(#"socket_path = "/tmp/codeisland-1000/island.sock""#))
+        XCTAssertTrue(script.contains(#""CODEISLAND_SOCKET_PATH=" + shlex.quote(socket_path)"#))
         XCTAssertFalse(script.contains("CODEISLAND_SOCKET_PATH=/tmp/codeisland.sock"))
     }
 
     func testRemoteInstallerConfigureScriptFallsBackToLegacySocketPath() {
-        // When no per-user path is supplied (probe failed) the legacy shared path is used.
+        // A script made without a path names the shared one hooks used
+        // before #193; nothing is forwarded there any more.
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
 
         let script = RemoteInstaller.configureRemoteHooksScript(host: host)
@@ -1119,14 +1163,31 @@ hooks:
         XCTAssertTrue(script.contains(#"socket_path = "/tmp/codeisland.sock""#))
     }
 
+    func testRemoteOpencodePluginIsToldTheSocketOwnerWhereAgentsRunAsOtherUsers() throws {
+        let shipped = try XCTUnwrap(RemoteInstaller.remoteOpencodePluginSource())
+        let shared = RemoteHost(id: "host-1", name: "devbox", host: "example.com", agentsRunAsOtherUsers: true)
+        let socketPath = RemoteInstaller.remoteSocketPath(forUID: "1000")
+        let installed = RemoteInstaller.remoteOpencodePluginForInstall(source: shipped, host: shared, remoteSocketPath: socketPath)
+        XCTAssertTrue(installed.contains(#"const SOCKET_OWNER_UID = "1000";"#))
+        XCTAssertFalse(installed.contains("process.env.CODEISLAND_SOCKET_OWNER_UID"), "never the agent's environment's")
+
+        // Not where agents run as the SSH user, nor for a path that names no
+        // user: the plugin then uses only its own user's socket.
+        let own = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
+        XCTAssertTrue(RemoteInstaller.remoteOpencodePluginForInstall(source: shipped, host: own, remoteSocketPath: socketPath)
+            .contains(#"const SOCKET_OWNER_UID = "";"#))
+        XCTAssertTrue(RemoteInstaller.remoteOpencodePluginForInstall(source: shipped, host: shared, remoteSocketPath: "/tmp/codeisland.sock")
+            .contains(#"const SOCKET_OWNER_UID = "";"#))
+    }
+
     func testRemoteOpencodePluginInjectsPerUserSocketPath() {
         // #193
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
         let source = #"const SOCKET_PATH = process.env.CODEISLAND_SOCKET_PATH || "/tmp/codeisland.sock";"#
 
-        let plugin = RemoteInstaller.remoteOpencodePluginForInstall(source: source, host: host, remoteSocketPath: "/tmp/codeisland-1000.sock")
+        let plugin = RemoteInstaller.remoteOpencodePluginForInstall(source: source, host: host, remoteSocketPath: "/tmp/codeisland-1000/island.sock")
 
-        XCTAssertTrue(plugin.contains(#"const SOCKET_PATH = "/tmp/codeisland-1000.sock";"#))
+        XCTAssertTrue(plugin.contains(#"const SOCKET_PATH = "/tmp/codeisland-1000/island.sock";"#))
     }
 
     func testRemoteInstallerConfigureScriptInstallsCustomClaudeCLI() throws {
@@ -1479,7 +1540,7 @@ hooks:
 
         let contents = try String(contentsOf: piExtensionPath)
         XCTAssertTrue(contents.contains("CodeIsland pi extension"))
-        XCTAssertTrue(contents.contains("// version: v5"))
+        XCTAssertTrue(contents.contains("// version: v6"))
         XCTAssertTrue(contents.contains("__codeislandAllowedToolCalls"))
         XCTAssertTrue(contents.contains("@earendil-works/pi-coding-agent"))
         // pi-subagents children name their parent's card (#378).
@@ -1578,7 +1639,7 @@ hooks:
         try fm.createDirectory(at: ompExtensionDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tempDir) }
 
-        for version in ["v2", "v3", "v4", "v5", "v6", "v7", "v8"] {
+        for version in ["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9"] {
             try """
             // CodeIsland pi extension
             // version: \(version)
@@ -1602,7 +1663,7 @@ hooks:
             )
 
             let rewritten = try String(contentsOf: ompExtensionPath)
-            XCTAssertTrue(rewritten.contains("// version: v9"))
+            XCTAssertTrue(rewritten.contains("// version: v10"))
             XCTAssertTrue(
                 ConfigInstaller.isOmpExtensionInstalled(
                     ompExtensionPath: ompExtensionPath.path,
@@ -1630,7 +1691,7 @@ hooks:
 
         let contents = try String(contentsOf: ompExtensionPath)
         XCTAssertTrue(contents.contains("CodeIsland pi extension"))
-        XCTAssertTrue(contents.contains("// version: v9"))
+        XCTAssertTrue(contents.contains("// version: v10"))
         XCTAssertTrue(contents.contains("@oh-my-pi/pi-coding-agent"))
         XCTAssertFalse(contents.contains("@earendil-works/pi-coding-agent"))
         // OMP subagents name their parent's card (#378).

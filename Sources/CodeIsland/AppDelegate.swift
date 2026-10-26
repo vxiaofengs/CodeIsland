@@ -13,12 +13,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastHookCheck: Date = .distantPast
     private let hotKeyManager = GlobalHotKeyManager()
     private var localShortcutMonitor: Any?
+    /// Another island already serves this hook socket: this one quits at
+    /// launch, and touches nothing of the other's on the way out — its
+    /// socket, its hosts' sockets, its saved sessions.
+    private var standingAside = false
     let appState = AppState()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Read before anything else: the launch Apple Event that says "login
         // item" is only current during this synchronous call.
         let isLoginLaunch = LaunchContext.isCurrentLaunchAtLogin()
+        if let problem = RuntimeEnvironment.isolationProblem(ProcessInfo.processInfo.environment) {
+            Self.log.error("\(problem, privacy: .public): quitting")
+            standingAside = true
+            NSApp.terminate(nil)
+            return
+        }
+        let isolated = RuntimeEnvironment.isIsolated
+        // One island per hook socket. A second one — `open -n`, a second copy
+        // of the app — would take the socket from the first, which would go
+        // on unheard, and remove its hosts' sockets. An island on a
+        // CODEISLAND_SOCKET_PATH of its own is another socket's.
+        if let other = HookSocketListener.islandListening(at: HookServer.socketPath) {
+            Self.log.error("Another CodeIsland (pid \(other)) already serves \(HookServer.socketPath, privacy: .public): this one quits and leaves it alone")
+            standingAside = true
+            NSApp.terminate(nil)
+            return
+        }
         ProcessInfo.processInfo.disableAutomaticTermination("CodeIsland must stay running")
         ProcessInfo.processInfo.disableSuddenTermination()
         // Pre-set app icon so Dock/menu bar use the packaged bundle icon.
@@ -29,27 +50,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // If we write settings.json first, Claude Code picks up the new hooks
         // immediately but the socket isn't listening yet — PermissionRequest
         // hooks get no response and Claude Code denies them.
-        hookServer = HookServer(appState: appState)
-        hookServer?.start()
+        // launchd's 256 descriptors are few for an app holding a socket per
+        // waiting hook.
+        HookSocketListener.raiseDescriptorLimit()
+        // A path another user took first fails it: HookSocketHealth logs who
+        // holds it, shows it in Settings and tries again later.
+        let server = HookServer(appState: appState)
+        hookServer = server
+        HookSocketHealth.shared.start(server)
         RemoteManager.shared.onDisconnect = { [weak appState] hostId in
             appState?.removeRemoteSessions(hostId: hostId)
         }
+        // Each remote host's hooks arrive on a socket of its own, bound when
+        // the host connects: the socket, not the payload, names the host.
+        RemoteManager.shared.hookSockets = RemoteHookSockets(appState: appState)
 
         // Prewarm the usage footer off the launch path — first panel expansion
         // then shows data immediately instead of popping in a beat later.
-        Task { @MainActor [weak appState] in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            appState?.refreshClaudeUsageIfStale()
+        if !isolated {
+            Task { @MainActor [weak appState] in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                appState?.refreshClaudeUsageIfStale()
+            }
         }
 
         // Hook installation does subprocess version detection plus disk I/O —
         // keep it off the main thread so app launch isn't blocked even when a
         // CLI binary hangs. See #139.
-        Task.detached(priority: .userInitiated) {
-            if ConfigInstaller.install() {
-                Self.log.info("Hooks installed")
-            } else {
-                Self.log.warning("Failed to install hooks")
+        if isolated {
+            Self.log.notice("Isolated (CODEISLAND_ISOLATED=1): no hooks installed, no sessions discovered, no remote hosts connected")
+        } else {
+            Task.detached(priority: .userInitiated) {
+                if ConfigInstaller.install() {
+                    Self.log.info("Hooks installed")
+                } else {
+                    Self.log.warning("Failed to install hooks")
+                }
             }
         }
 
@@ -74,11 +110,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panelController = PanelWindowController(appState: appState)
         panelController?.showPanel()
 
-        appState.startSessionDiscovery()
-        appState.startCodexAppServerWatcher()
-        appState.startAiWorkWatcher()
-        appState.startCoworkWatcher()
-        RemoteManager.shared.startup()
+        if !isolated {
+            appState.startSessionDiscovery()
+            appState.startCodexAppServerWatcher()
+            appState.startAiWorkWatcher()
+            appState.startCoworkWatcher()
+            RemoteManager.shared.startup()
+        }
 
         // Buddy bridge (opt-in): mirrors the Dynamic Island onto the companion
         // device and routes its button press back to TerminalActivator.
@@ -126,17 +164,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         // Hooks auto-recovery: periodic + app activation trigger
-        hookRecoveryTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.checkAndRepairHooks()
+        if !isolated {
+            hookRecoveryTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    self?.checkAndRepairHooks()
+                }
             }
-        }
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.checkAndRepairHooks()
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    self?.checkAndRepairHooks()
+                }
             }
         }
 
@@ -162,7 +202,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Sparkle runs scheduled checks itself on the cadence declared in
         // Info.plist (SUScheduledCheckInterval). Start the updater once — it
         // no-ops for Homebrew-installed builds (brew owns those upgrades).
-        UpdateChecker.shared.start()
+        if !isolated {
+            UpdateChecker.shared.start()
+        }
 
         // The jingle confirms a launch the user just made; at login it is
         // noise on every boot for everyone with Launch at Login on.
@@ -197,6 +239,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Nothing was started; what is on disk is the other island's.
+        guard !standingAside else { return }
         hookRecoveryTimer?.invalidate()
         teardownGlobalShortcut()
         appState.saveSessions()
@@ -282,6 +326,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func checkAndRepairHooks() {
         guard Date().timeIntervalSince(lastHookCheck) > 60 else { return }
         lastHookCheck = Date()
+        // A socket that could not start (its path taken) may start now.
+        HookSocketHealth.shared.retryIfDown()
         // verifyAndRepair walks every enabled CLI and rewrites settings on
         // disk — keep it off the main thread so the activation observer (fires
         // on every app switch) can't stutter the UI. See #139.

@@ -22,19 +22,44 @@ struct AssistantReplyText: View {
     var isCompletionReply = false
 
     var body: some View {
-        if isCompletionReply {
-            CompletionReplyView(text: text, fontSize: fontSize)
-        } else if let lineLimit {
-            Text(IslandMarkdownInline.preview(text, singleLine: lineLimit == 1))
-                .font(IslandMarkdownStyle.font(fontSize))
-                .foregroundStyle(IslandMarkdownStyle.body)
-                .lineLimit(lineLimit)
-                .truncationMode(.tail)
-                .tint(IslandMarkdownStyle.link)
-        } else {
-            MarkdownBlocksView(blocks: ChatMessageTextFormatter.markdownBlocks(text), fontSize: fontSize)
-                .tint(IslandMarkdownStyle.link)
+        Group {
+            if isCompletionReply {
+                CompletionReplyView(text: text, fontSize: fontSize)
+            } else if let lineLimit {
+                Text(IslandMarkdownInline.preview(text, singleLine: lineLimit == 1))
+                    .font(IslandMarkdownStyle.font(fontSize))
+                    .foregroundStyle(IslandMarkdownStyle.body)
+                    .lineLimit(lineLimit)
+                    .truncationMode(.tail)
+                    .tint(IslandMarkdownStyle.link)
+            } else {
+                MarkdownBlocksView(blocks: ChatMessageTextFormatter.markdownBlocks(text), fontSize: fontSize)
+                    .tint(IslandMarkdownStyle.link)
+            }
         }
+        .modifier(ReplyLinks())
+    }
+}
+
+/// Where a link in a reply may go. A reply is the model's text, and what
+/// the model read can put a link in it, a local session's as much as a
+/// remote one's: a `file:` link to a `.command` or an app bundle launches
+/// it, an app's URL scheme drives that app. So only web and mail links
+/// open, in every session; any other link does nothing when clicked.
+struct ReplyLinks: ViewModifier {
+    func body(content: Content) -> some View {
+        content.environment(\.openURL, OpenURLAction { url in
+            guard Self.opens(url) else {
+                log.notice("reply link not opened: \(url.scheme ?? "no scheme", privacy: .public) is not a web or mail link")
+                return .discarded
+            }
+            return .systemAction
+        })
+    }
+
+    static func opens(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return scheme == "http" || scheme == "https" || scheme == "mailto"
     }
 }
 

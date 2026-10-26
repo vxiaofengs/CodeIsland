@@ -8,13 +8,13 @@ final class OpenCodeV2SupportTests: XCTestCase {
     /// orphan sweep once the client that spawned it quits, so the pid scan
     /// must be able to tell it apart from the TUI (same executable).
     func testSharedServiceIsRecognisedFromArgv() {
-        XCTAssertTrue(AppState.isOpenCodeSharedService(arguments: ["/Users/u/.opencode/bin/opencode", "serve", "--service"]))
-        XCTAssertFalse(AppState.isOpenCodeSharedService(arguments: ["/Users/u/.opencode/bin/opencode"]), "the TUI client")
+        XCTAssertTrue(AgentProcessFinder.isOpenCodeSharedService(arguments: ["/Users/u/.opencode/bin/opencode", "serve", "--service"]))
+        XCTAssertFalse(AgentProcessFinder.isOpenCodeSharedService(arguments: ["/Users/u/.opencode/bin/opencode"]), "the TUI client")
         XCTAssertFalse(
-            AppState.isOpenCodeSharedService(arguments: ["opencode", "serve", "--stdio", "--port", "0"]),
+            AgentProcessFinder.isOpenCodeSharedService(arguments: ["opencode", "serve", "--stdio", "--port", "0"]),
             "a standalone server is its client's child and dies with it"
         )
-        XCTAssertFalse(AppState.isOpenCodeSharedService(arguments: ["opencode", "run", "--service"]))
+        XCTAssertFalse(AgentProcessFinder.isOpenCodeSharedService(arguments: ["opencode", "run", "--service"]))
     }
 
     func testBundledPluginServesBothPluginAPIs() throws {
@@ -23,7 +23,7 @@ final class OpenCodeV2SupportTests: XCTestCase {
                 ?? Bundle.appModule.url(forResource: "codeisland-opencode", withExtension: "js")
         )
         let source = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(source.contains("// version: v9"), "bump ConfigInstaller.opencodePluginVersion with the plugin")
+        XCTAssertTrue(source.contains("// version: v11"), "bump ConfigInstaller.opencodePluginVersion with the plugin")
         XCTAssertTrue(source.contains("setup: setupV2"), "OpenCode 2 loads {id, setup}")
         XCTAssertTrue(source.contains("server: async"), "OpenCode 1.x loads {id, server}")
         XCTAssertTrue(source.contains("_untracked_process: true"), "the shared service must never become a session's pid")

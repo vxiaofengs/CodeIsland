@@ -1,9 +1,10 @@
 import Foundation
 import CodeIslandCore
 
-/// Push notifications, fed from the same places that drive the island:
-/// the permission / question queues and the completion effect. Content is
-/// built from what those queues hold, never re-guessed from raw hook JSON.
+/// Push notifications: the moments `AttentionPolicy` decides to push (a
+/// queued approval or question, a turn's end, a display-only wait) and the
+/// follow-up reminders that come due. Content is built from what the queues
+/// and the sessions hold, never re-guessed from raw hook JSON.
 extension AppState {
     /// Who a session's pushes are about — the labels its card shows.
     func pushSubject(for sessionId: String) -> PushSubject {
@@ -16,27 +17,26 @@ extension AppState {
         )
     }
 
-    /// A permission request was just queued. `smartSuppressed` is evaluated
-    /// only when a push is actually on the table.
-    func pushPermissionQueued(_ event: HookEvent, sessionId: String, smartSuppressed: @autoclosure () -> Bool) {
-        let notifier = PushNotifier.shared
-        guard notifier.isEnabled else { return }
-        notifier.notify(
+    /// A permission request was just queued, and `AttentionPolicy` decided
+    /// it is pushed.
+    func pushPermissionQueued(_ event: HookEvent, sessionId: String, push: AttentionDecision.Push?) {
+        guard let push else { return }
+        PushNotifier.shared.notify(
             Self.pushContent(forPermission: event, cwd: sessions[sessionId]?.cwd),
             subject: pushSubject(for: sessionId),
-            smartSuppressed: smartSuppressed(),
+            smartSuppressed: push.smartSuppressed,
             request: pushRequest(forPermission: event, sessionId: sessionId)
         )
     }
 
-    /// A question (hook Notification, AskUserQuestion, Codex app-server) was just queued.
-    func pushQuestionQueued(_ request: QuestionRequest, sessionId: String, smartSuppressed: @autoclosure () -> Bool) {
-        let notifier = PushNotifier.shared
-        guard notifier.isEnabled else { return }
-        notifier.notify(
+    /// A question (hook Notification, AskUserQuestion, Codex app-server) was
+    /// just queued, and `AttentionPolicy` decided it is pushed.
+    func pushQuestionQueued(_ request: QuestionRequest, sessionId: String, push: AttentionDecision.Push?) {
+        guard let push else { return }
+        PushNotifier.shared.notify(
             Self.pushContent(forQuestion: request),
             subject: pushSubject(for: sessionId),
-            smartSuppressed: smartSuppressed(),
+            smartSuppressed: push.smartSuppressed,
             request: pushRequest(forQuestion: request, sessionId: sessionId)
         )
     }
@@ -98,51 +98,45 @@ extension AppState {
         }
     }
 
-    /// Runs right after the reducer, before its side effects: a turn that
-    /// ended on an API error pushes the error; any other turn end the
-    /// reducer turned into a completion card pushes a completion.
-    func pushAfterReduce(_ event: HookEvent, sessionId: String, effects: [SideEffect]) {
+    /// A turn's end, pushed as `AttentionPolicy` decided it: the error it
+    /// stopped on, or its completion with this turn's reply as the summary
+    /// and the subagent / interrupted flags for the push gate. Hook turns and
+    /// those of the sources that bypass the hook reducer (AiWork, Claude
+    /// Desktop Cowork) alike.
+    ///
+    /// - `errorType` / `errorDetail`: what the failure itself said — a hook's
+    ///   StopFailure fields, the text an AiWork or Cowork failure carried.
+    ///   Never the session's last reply: that can be the previous turn's;
+    ///   with nothing better the push says only that it failed.
+    func pushTurnEnded(
+        _ push: AttentionDecision.Push,
+        sessionId: String,
+        errorType: String? = nil,
+        errorDetail: String? = nil
+    ) {
         let notifier = PushNotifier.shared
-        guard notifier.isEnabled else { return }
-        let session = sessions[sessionId]
-        // A child reports to the agent that spawned it, and that agent to the
-        // user: a child's turn ending or failing is not news on its own (#378).
-        // (Its completion never reaches here: the reducer drops it.)
-        guard session?.parentSessionId == nil else { return }
-        if let failure = PushEventClassifier.sessionError(eventName: event.eventName, raw: event.rawJSON) {
+        switch push.kind {
+        case .error:
             notifier.notify(
-                .error(type: failure.type, detail: failure.detail),
+                .error(type: errorType, detail: errorDetail),
                 subject: pushSubject(for: sessionId),
-                smartSuppressed: !self.shouldAutoOpenPendingSurface(for: sessionId)
+                smartSuppressed: push.smartSuppressed
             )
-            return
-        }
-        guard effects.contains(.enqueueCompletion(sessionId: sessionId)) else { return }
-        notifier.notify(
-            .completion(summary: Self.pushCompletionSummary(session)),
-            subject: pushSubject(for: sessionId),
-            smartSuppressed: !self.shouldAutoOpenPendingSurface(for: sessionId),
-            isSubagent: PushEventClassifier.isSubagentCompletion(
-                agentId: event.agentId,
-                raw: event.rawJSON,
-                sessionId: sessionId,
-                session: session
-            ),
-            interrupted: session?.interrupted == true
-        )
-    }
-
-    /// AiWork daemon turn boundary (its streams bypass the hook reducer).
-    func pushAiWorkTurnEnded(_ eventName: String, sessionId: String, data: [String: AnyCodableLike]? = nil) {
-        switch eventName {
-        case "stream.completed": pushTurnEnded(sessionId: sessionId, failed: false)
-        case "stream.failed":
-            pushTurnEnded(sessionId: sessionId, failed: true, errorDetail: Self.aiworkFailureText(data))
-        default: return  // stream.aborted: the user stopped it
+        case .completion(let isSubagent, let interrupted):
+            notifier.notify(
+                .completion(summary: Self.pushCompletionSummary(sessions[sessionId])),
+                subject: pushSubject(for: sessionId),
+                smartSuppressed: push.smartSuppressed,
+                isSubagent: isSubagent,
+                interrupted: interrupted
+            )
+        case .approval, .question, .displayOnlyWait:
+            // Requests and waits push from where they are queued or noticed.
+            assertionFailure("only a turn's end is pushed here, not \(push.kind)")
         }
     }
 
-    /// What a `stream.failed` event itself says went wrong, if anything.
+    /// What an AiWork `stream.failed` event itself says went wrong, if anything.
     nonisolated static func aiworkFailureText(_ data: [String: AnyCodableLike]?) -> String? {
         guard let data else { return nil }
         let candidates = [
@@ -155,26 +149,6 @@ extension AppState {
         return candidates.lazy
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
-    }
-
-    /// A turn ended in a source that bypasses the hook reducer (AiWork,
-    /// Claude Desktop Cowork): its completion, or its error when it failed.
-    ///
-    /// - `errorDetail`: the failure's own text, from the event that reported
-    ///   it. Never the session's last reply — that can be the previous
-    ///   turn's; with nothing better the push says only that it failed.
-    func pushTurnEnded(sessionId: String, failed: Bool, errorDetail: String? = nil) {
-        let notifier = PushNotifier.shared
-        guard notifier.isEnabled else { return }
-        let session = sessions[sessionId]
-        let content: PushContent = failed
-            ? .error(type: nil, detail: errorDetail)
-            : .completion(summary: Self.pushCompletionSummary(session))
-        notifier.notify(
-            content,
-            subject: pushSubject(for: sessionId),
-            smartSuppressed: !self.shouldAutoOpenPendingSurface(for: sessionId)
-        )
     }
 
     /// Subscribes the push channels to follow-up reminders. Called once at launch.

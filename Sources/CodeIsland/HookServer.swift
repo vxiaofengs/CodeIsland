@@ -1,5 +1,4 @@
 import Foundation
-import Network
 import os.log
 import CodeIslandCore
 
@@ -14,112 +13,150 @@ class HookServer {
     }
 
     private let appState: AppState
+    /// Where hooks connect (``SocketPath``).
     nonisolated static var socketPath: String { SocketPath.path }
-    private var listener: NWListener?
+    /// Where this server listens: ``socketPath``, a remote host's own socket
+    /// (``RemoteHookSockets``), or a test's.
+    let socketPath: String
+    /// Which machine the requests on this socket come from: this Mac, or the
+    /// remote host the socket was bound for (``HookOrigin``). Read on the
+    /// connection queue; the host's name may change while it is connected.
+    private let originBox: OriginBox
+    /// The cwd allow-list (#240) of a remote host, by id.
+    private let hostCwdFilter: @MainActor (String) -> String?
+    /// The tools a test approves without a card; nil reads the user's settings.
+    private let pinnedAutoApproveTools: Set<String>?
+    /// How often a held request's hook is checked for being gone: a backstop
+    /// to its watch, which sees that at once (``monitorPeerDisconnect``).
+    private let heldRequestCheckInterval: TimeInterval
+    /// How much of the island this socket's hooks may take: as much as they
+    /// like on this Mac's, a bounded share on a remote host's.
+    let limits: HookSocketLimits
+    private var listener: HookSocketListener?
+    /// Hook connections are accepted and read here, off the main thread; only
+    /// a complete request is handed to the main actor (``HookSocketListener``).
+    private let connectionQueue = DispatchQueue(label: "com.codeisland.hook-server", qos: .userInitiated)
 
-    init(appState: AppState) {
+    /// `origin` is the machine whose hooks reach `socketPath`: this Mac's
+    /// main socket, or a remote host's own (``RemoteHookSockets``).
+    /// `hostCwdFilter` gives a remote host's cwd allow-list; by default the
+    /// one in Settings.
+    ///
+    /// `limits` are those of `origin`'s socket unless given
+    /// (``HookSocketLimits/for(_:)``).
+    ///
+    /// `socketPath`, `autoApproveTools`, `heldRequestCheckInterval` and
+    /// `limits` are for tests: a socket of their own, the tools approved
+    /// without a card, not read from the settings, a shorter backstop and
+    /// smaller limits.
+    init(
+        appState: AppState,
+        socketPath: String = HookServer.socketPath,
+        origin: HookOrigin = .local,
+        hostCwdFilter: @escaping @MainActor (String) -> String? = { id in
+            RemoteManager.shared.hosts.first(where: { $0.id == id })?.cwdFilter
+        },
+        autoApproveTools: Set<String>? = nil,
+        heldRequestCheckInterval: TimeInterval = 300,
+        limits: HookSocketLimits? = nil
+    ) {
         self.appState = appState
+        self.socketPath = socketPath
+        self.originBox = OriginBox(origin)
+        self.hostCwdFilter = hostCwdFilter
+        self.pinnedAutoApproveTools = autoApproveTools
+        self.heldRequestCheckInterval = heldRequestCheckInterval
+        self.limits = limits ?? .for(origin)
     }
 
-    func start() {
-        // Clean up stale socket
-        unlink(HookServer.socketPath)
+    /// Which machine this socket's requests come from.
+    var origin: HookOrigin { originBox.value }
 
-        // Set umask to 0o077 BEFORE the listener creates the socket file,
-        // ensuring it is never world-readable even briefly (closes TOCTOU window).
-        let previousUmask = umask(0o077)
+    /// The remote host this socket is for was renamed: its requests carry
+    /// the new name from now on. Nothing changes on this Mac's socket.
+    func renameHost(to name: String) {
+        guard case .remoteHost(let id, _) = originBox.value else { return }
+        originBox.set(.remoteHost(id: id, name: name))
+    }
 
-        let params = NWParameters()
-        params.defaultProtocolStack.transportProtocol = NWProtocolTCP.Options()
-        params.requiredLocalEndpoint = NWEndpoint.unix(path: HookServer.socketPath)
-
-        do {
-            listener = try NWListener(using: params)
-        } catch {
-            umask(previousUmask)
-            log.error("Failed to create NWListener: \(error.localizedDescription)")
-            return
-        }
-
-        listener?.newConnectionHandler = { [weak self] connection in
-            Task { @MainActor in
-                self?.handleConnection(connection)
+    /// Starts listening. False, logged, when the socket cannot be created.
+    @discardableResult
+    func start() -> Bool {
+        let limits = limits
+        let originBox = originBox
+        let path = socketPath
+        // Shared by this socket's connections, on its queue.
+        let budget = limits.maxBufferedBytes.map(HookReadBudget.init(limit:))
+        let listener = HookSocketListener(
+            path: socketPath,
+            queue: connectionQueue,
+            maxConnections: limits.maxConnections
+        ) { [weak self] connection in
+            connection.readRequest(
+                limit: limits.maxRequestBytes,
+                idleTimeout: limits.readIdleTimeout,
+                deadline: limits.readDeadline,
+                budget: budget
+            ) { request in
+                switch request {
+                case .failed, .stalled:
+                    connection.cancel()
+                case .overBudget:
+                    log.warning("HookServer: \(path, privacy: .public) already holds \(limits.maxBufferedBytes ?? 0) bytes of unfinished requests; dropping a connection")
+                    connection.cancel()
+                case .tooLarge:
+                    log.warning("Payload too large (over \(limits.maxRequestBytes) bytes), dropping connection")
+                    // Nobody read it, so nobody decides: a large file an
+                    // agent writes is not refused, its agent asks in its own
+                    // way (it used to be told "deny" on this Mac's socket).
+                    connection.respond(Data())
+                case .received(let data):
+                    // The socket names the host, and an edge's facts are
+                    // parsed and interpreted, here too, off the main thread.
+                    let intake = Self.intake(data, origin: originBox.value)
+                    if case .answerNothing = intake {
+                        connection.respond(Data())
+                        return
+                    }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            self?.processRequest(intake, connection: connection)
+                        }
+                    }
+                }
             }
         }
-
-        listener?.stateUpdateHandler = { [previousUmask] state in
-            switch state {
-            case .ready:
-                // Restore previous umask now that the socket file exists with safe permissions
-                umask(previousUmask)
-                // Belt-and-suspenders: explicitly set 0o700 in case umask didn't take effect
-                chmod(HookServer.socketPath, 0o700)
-                log.info("HookServer listening on \(HookServer.socketPath)")
-            case .failed(let error):
-                umask(previousUmask)
-                log.error("HookServer failed: \(error.localizedDescription)")
-            default:
-                break
-            }
-        }
-
-        listener?.start(queue: .main)
+        guard listener.start() else { return false }
+        self.listener = listener
+        log.info("HookServer listening on \(self.socketPath)")
+        return true
     }
 
     func stop() {
-        listener?.cancel()
-        listener = nil
+        let listener = listener
+        listener?.stop()
+        self.listener = nil
+        guard case .local = origin else {
+            // A host's socket goes at once, and only the file this server
+            // made: the host's forward is gone, and the host may connect
+            // again and bind this path a moment later — a late removal
+            // would take that socket away.
+            listener?.removeSocketFile()
+            return
+        }
         // Delay socket removal so in-flight hooks can finish sending their payload
         // before the file disappears — prevents intermittent errors on session end (#45).
-        let path = HookServer.socketPath
+        let path = socketPath
         DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
             unlink(path)
         }
     }
 
-    private func handleConnection(_ connection: NWConnection) {
-        connection.start(queue: .main)
-        receiveAll(connection: connection, accumulated: Data())
-    }
-
-    private static let maxPayloadSize = 10_485_760  // 10MB safety limit
-
-    /// Recursively receive all data until EOF, then process
-    private func receiveAll(connection: NWConnection, accumulated: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, isComplete, error in
-            Task { @MainActor in
-                guard let self = self else { return }
-
-                // On error with no data, just drop the connection
-                if error != nil && accumulated.isEmpty && content == nil {
-                    connection.cancel()
-                    return
-                }
-
-                var data = accumulated
-                if let content { data.append(content) }
-
-                // Safety: reject oversized payloads
-                if data.count > Self.maxPayloadSize {
-                    log.warning("Payload too large (\(data.count) bytes), dropping connection")
-                    let denyResponse = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8)
-                    self.sendResponse(connection: connection, data: denyResponse)
-                    return
-                }
-
-                if isComplete || error != nil {
-                    self.processRequest(data: data, connection: connection)
-                } else {
-                    self.receiveAll(connection: connection, accumulated: data)
-                }
-            }
-        }
-    }
 
     /// Internal tools that are safe to auto-approve without user confirmation.
     /// Read from user settings; defaults to all known internal tools.
-    private static var autoApproveTools: Set<String> {
-        SettingsManager.shared.autoApproveTools
+    private var autoApproveTools: Set<String> {
+        pinnedAutoApproveTools ?? SettingsManager.shared.autoApproveTools
     }
 
     /// Whether this event's agent is on the user's always-proceed list (#283).
@@ -206,12 +243,12 @@ class HookServer {
         }
     }
 
-    /// Looks up the configured cwd filter for a remote host id. Nil when the
-    /// event is not remote or the host is no longer configured.
-    private static func remoteCwdFilter(for event: HookEvent) -> String? {
-        guard let hostId = event.rawJSON["_remote_host_id"] as? String,
-              !hostId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return RemoteManager.shared.hosts.first(where: { $0.id == hostId })?.cwdFilter
+    /// The cwd filter of the remote host whose socket this is: the socket
+    /// names the host, not the payload. Nil on this Mac's socket, or once
+    /// the host is no longer configured.
+    private var remoteCwdFilter: String? {
+        guard case .remoteHost(let hostId, _) = origin else { return nil }
+        return hostCwdFilter(hostId)
     }
 
     /// Fire-and-forget POST of the hook event to a user-configured webhook URL.
@@ -268,41 +305,7 @@ class HookServer {
         }.resume()
     }
 
-    private static func hiddenPluginResponse(for raw: [String: Any]) -> Data {
-        // Hidden PermissionRequest must allow so the plugin's tool execution
-        // doesn't block waiting on a UI prompt the user said to suppress.
-        let eventName = (raw["hook_event_name"] as? String
-            ?? raw["hookEventName"] as? String
-            ?? raw["event_name"] as? String
-            ?? "").lowercased()
-        if eventName.contains("permission") {
-            return Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#.utf8)
-        }
-        return Data("{}".utf8)
-    }
-
-    private static func pluginPpid(from raw: [String: Any]) -> Int? {
-        CursorSubsessionRouter.positivePpid(from: raw)
-    }
-
-    private static func nonEmptyString(_ value: Any?) -> String? {
-        guard let string = value as? String else { return nil }
-        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func rawSessionId(from raw: [String: Any]) -> String? {
-        CursorSubsessionRouter.sessionId(from: raw)
-    }
-
-    private static func rawEventName(from raw: [String: Any]) -> String? {
-        nonEmptyString(raw["hook_event_name"])
-            ?? nonEmptyString(raw["hookEventName"])
-            ?? nonEmptyString(raw["event_name"])
-            ?? nonEmptyString(raw["eventName"])
-    }
-
-    static func routeKind(for event: HookEvent) -> RouteKind {
+    nonisolated static func routeKind(for event: HookEvent) -> RouteKind {
         let normalizedEventName = EventNormalizer.normalize(event.eventName)
         // Google Antigravity's PreToolUse stays a plain activity event. Its hook
         // cannot approve a call (an `allow` is ignored and Antigravity prompts
@@ -376,382 +379,181 @@ class HookServer {
         return CursorSubsessionRouter.isCursorFamilySource(source)
     }
 
-    private static func codexSubagentMetadata(from raw: [String: Any]) -> CodexSubagentMetadata? {
-        guard let path = nonEmptyString(raw["transcript_path"]) else { return nil }
-        return AppState.codexSubagentMetadata(inTranscriptPath: path)
-    }
-
-    func codexNativeSubsessionParentId(from raw: [String: Any]) -> String? {
-        guard (raw["_via_plugin"] as? Bool) != true,
-              SessionSnapshot.normalizedSupportedSource(raw["_source"] as? String) == "codex",
-              let childSessionId = Self.rawSessionId(from: raw) else {
-            return nil
-        }
-
-        if let metadata = Self.codexSubagentMetadata(from: raw),
-           let parentSessionId = appState.findCodexParentSessionId(
-               providerSessionId: metadata.parentThreadId,
-               childTermBundleId: raw["_term_bundle"] as? String
-           ) {
-            return parentSessionId
-        }
-
-        // Every Codex Desktop thread runs in the one shared app-server, so a
-        // same-PID card says nothing about parentage there (it can even be the
-        // thread's own card). Desktop children are found by metadata above.
-        guard raw["_term_bundle"] as? String != AppState.codexAppBundleId,
-              let ppid = Self.pluginPpid(from: raw) else { return nil }
-
-        // Current Codex hook payloads do not expose parent session metadata for
-        // native subagents, but child sessions run inside the same Codex CLI
-        // process as their parent. Require an already-active same-PID Codex
-        // session so a normal follow-up thread in an idle process stays separate.
-        let hasExplicitSubagentMarker = Self.nonEmptyString(raw["agent_id"]) != nil
-        return appState.findSessionId(
-            forSource: "codex",
-            ppid: ppid,
-            excluding: childSessionId,
-            requireActive: !hasExplicitSubagentMarker
-        )
-    }
-
-    /// Resolve parent via `_ppid` after transcript fold failed. Only call when
-    /// ``CursorSubsessionRouter.shouldAttemptPpidParentFallback`` is true.
-    ///
-    /// Requires a **unique** active same-PID Cursor card for the preferred source
-    /// (then sibling). If two chats share the IDE process, guessing is unsafe —
-    /// leave the Task separate until `transcript_path` can fold it.
-    private func cursorSubsessionParentId(from raw: [String: Any]) -> String? {
-        guard let source = SessionSnapshot.normalizedSupportedSource(raw["_source"] as? String),
-              CursorSubsessionRouter.isCursorFamilySource(source),
-              let childSessionId = Self.rawSessionId(from: raw),
-              let ppid = Self.pluginPpid(from: raw) else {
-            return nil
-        }
-        let cutoff = Date().addingTimeInterval(-300)
-        for src in CursorSubsessionRouter.parentSourceSearchOrder(primarySource: source) {
-            if let match = uniqueActiveSamePidCursorSession(
-                source: src,
-                ppid: ppid,
-                excluding: childSessionId,
-                activeSince: cutoff
-            ) {
-                return match
-            }
-        }
-        return nil
-    }
-
-    /// Sole suitable same-PID session for `source`, or `nil` when zero / ambiguous.
-    /// Prefers main chats over orphan Task cards; idle mains remain eligible.
-    private func uniqueActiveSamePidCursorSession(
-        source: String,
-        ppid: Int,
-        excluding excludedSessionId: String,
-        activeSince cutoff: Date
-    ) -> String? {
-        let normalized = SessionSnapshot.normalizedSupportedSource(source)
-        let candidates: [(sessionId: String, status: AgentStatus, startTime: Date, isMain: Bool, isTask: Bool)] =
-            appState.sessions.compactMap { sessionId, snap in
-                let snapSource = SessionSnapshot.normalizedSupportedSource(snap.source)
-                guard snapSource == normalized,
-                      snap.cliPid == pid_t(ppid),
-                      sessionId != excludedSessionId else {
-                    return nil
-                }
-                // Recent activity, or idle with live IDE pid (main often idles while
-                // a Task keeps the process busy).
-                guard snap.lastActivity >= cutoff || snap.status == .idle else {
-                    return nil
-                }
-                let isTask = CursorSubsessionRouter.isLikelyCursorTaskCard(
-                    sessionId: sessionId,
-                    providerSessionId: snap.providerSessionId,
-                    transcriptPath: snap.transcriptPath
-                )
-                let isMain = CursorSubsessionRouter.isLikelyCursorMainCard(
-                    sessionId: sessionId,
-                    providerSessionId: snap.providerSessionId,
-                    transcriptPath: snap.transcriptPath,
-                    hasSubagents: !snap.subagents.isEmpty
-                )
-                return (sessionId, snap.status, snap.startTime, isMain, isTask)
-            }
-        return CursorSubsessionRouter.choosePpidFallbackParentId(candidates: candidates)
-    }
-
-    /// Rewrite `raw` onto the parent session and serialize.
-    /// On serialization failure, returns the original hook `data` unchanged.
-    private func applyCursorMerge(
-        data: Data,
-        raw: [String: Any],
-        parentSessionId: String,
-        childSessionId: String
-    ) -> (processedData: Data, responseData: Data?) {
-        var rewritten = raw
-        CursorSubsessionRouter.applyMerge(
-            to: &rewritten,
-            parentSessionId: parentSessionId,
-            childSessionId: childSessionId
-        )
-        guard let newData = try? JSONSerialization.data(withJSONObject: rewritten) else {
-            return (data, nil)
-        }
-        return (newData, nil)
-    }
-
-    /// merge/hide fallback when transcript fold returned `.leave`.
-    private func routeCursorLeaveFallback(
-        data: Data,
-        raw: [String: Any],
-        mode: String
-    ) -> (processedData: Data, responseData: Data?)? {
-        guard mode == "hide" || mode == "merge",
-              CursorSubsessionRouter.shouldAttemptPpidParentFallback(raw: raw),
-              let childId = Self.rawSessionId(from: raw) else {
-            return nil
-        }
-        // Established top-level card for this session_id = main chat continuing.
-        // Never `_ppid`-fold it onto a sibling Task (that freezes parent chat text).
-        if cursorSessionCardExists(for: childId) {
-            return nil
-        }
-        guard let parentId = cursorSubsessionParentId(from: raw) else {
-            return nil
-        }
-        if mode == "hide" {
-            return (data, Self.hiddenPluginResponse(for: raw))
-        }
-        return applyCursorMerge(
-            data: data,
-            raw: raw,
-            parentSessionId: parentId,
-            childSessionId: childId
-        )
-    }
-
-    /// True when `sessionId` already names a top-level AppState Cursor card
-    /// (exact key or `providerSessionId` match).
-    private func cursorSessionCardExists(for sessionId: String) -> Bool {
-        if let snap = appState.sessions[sessionId],
-           CursorSubsessionRouter.isCursorFamilySource(snap.source) {
+    /// Whether a hook may be a child session's, worth a JSON parse for Agent
+    /// Sub-Sessions. Cheap byte probes first; avoid JSONSerialization on every
+    /// PostToolUse.
+    internal static func mayNeedSubsessionRouting(data: Data, mode: SubsessionMode) -> Bool {
+        // A child that names its parent (#378), a plugin proxy (#123) or a
+        // Codex thread: in every mode. Show separately keeps such a child on a
+        // quiet card of its own, and a child folded before Agent Sub-Sessions
+        // changed must still end where it started.
+        if data.range(of: declaredParentMarkerBytes) != nil
+            || data.range(of: pluginMarkerBytes) != nil
+            || (data.range(of: sourceMarkerBytes) != nil && data.range(of: codexMarkerBytes) != nil) {
             return true
         }
-        if let key = appState.findSessionId(providerSessionId: sessionId),
-           let snap = appState.sessions[key],
-           CursorSubsessionRouter.isCursorFamilySource(snap.source) {
-            return true
-        }
-        return false
+        // A Cursor Task whose transcript path names its chat, in every mode.
+        if mayNeedCursorSubsessionRouting(data: data) { return true }
+        // One without: Merge and Hide fall back to its IDE process (`_ppid`).
+        // Show separately does not act on that guess, so it needs no parse.
+        return mode != .separate
+            && mayBeCursorHookSource(data: data)
+            && data.range(of: ppidKeyBytes) != nil
     }
 
-    /// Agent Sub-Sessions for a child that named its parent
-    /// (`_parent_session_id`, #378) — a pi-subagents child. Separate mode
-    /// leaves it on its own card, where the reducer keeps it quiet. nil when
-    /// the payload carries no usable declaration, so the other routers decide.
-    private func routeDeclaredSubsession(
-        data: Data,
-        raw: [String: Any],
-        mode: String
-    ) -> (processedData: Data, responseData: Data?)? {
-        guard let parentId = DeclaredSubsession.parentSessionId(in: raw),
-              let rawChildId = Self.rawSessionId(from: raw) else {
-            return nil
-        }
-        let childId = HookEvent.cardSessionId(forRawSessionId: rawChildId, in: raw)
-
-        // A child stays where it started until it ends. Folding or hiding it
-        // mid-flight — Agent Sub-Sessions changed under it, or its parent's
-        // card turned up late — would strand the card or row it already has.
-        if appState.sessions[childId] != nil {
-            return (data, nil)
-        }
-        if let hostId = appState.sessionId(hostingSubagent: childId) {
-            return mergeDeclaredSubsession(data: data, raw: raw, into: hostId, childId: childId)
-        }
-
-        switch mode {
-        case "hide":
-            // Hidden, but never answered on the user's behalf (#165): a request
-            // the child is blocked on surfaces on a card of its own, which then
-            // shows the child until it ends.
-            if let event = HookEvent(from: data), Self.routeKind(for: event) != .event {
-                return (data, nil)
-            }
-            return (data, Data("{}".utf8))
-        case "merge":
-            // Into the parent's card — or, for a grandchild, the card its parent
-            // is folded into. An unknown parent is not invented: the child keeps
-            // a card of its own, where it is still treated as a child.
-            let targetId = appState.sessions[parentId] != nil
-                ? parentId
-                : appState.sessionId(hostingSubagent: parentId)
-            guard let targetId else { return (data, nil) }
-            return mergeDeclaredSubsession(data: data, raw: raw, into: targetId, childId: childId)
-        default:
-            return (data, nil)
-        }
+    /// A hook after Agent Sub-Sessions: `json` is its parsed payload when
+    /// routing had to parse it (HookEvent is built from that, not reparsed).
+    private struct RoutedHook {
+        var data: Data
+        var json: [String: Any]?
+        var rewritten = false
+        var response: Data?
     }
 
-    /// Rewrite a declared child's event onto `cardId` as its subagent. Left on
-    /// its own card when the payload cannot address that card.
-    private func mergeDeclaredSubsession(
-        data: Data,
-        raw: [String: Any],
-        into cardId: String,
-        childId: String
-    ) -> (processedData: Data, responseData: Data?) {
-        var rewritten = raw
-        guard DeclaredSubsession.applyMerge(to: &rewritten, parentCardId: cardId, childCardId: childId),
-              let newData = try? JSONSerialization.data(withJSONObject: rewritten) else {
-            return (data, nil)
-        }
-        return (newData, nil)
-    }
-
-    /// Test seam for Agent Sub-Sessions pre-routing (Cursor / Codex / plugin).
+    /// Test seam for Agent Sub-Sessions pre-routing.
     internal func routeSubsessionPayloadIfNeededForTesting(
         data: Data
     ) -> (processedData: Data, responseData: Data?) {
-        routeSubsessionPayloadIfNeeded(data: data)
-    }
-
-    private func routeSubsessionPayloadIfNeeded(data: Data) -> (processedData: Data, responseData: Data?) {
-        let mayNeedPluginOrCodex = data.range(of: Self.pluginMarkerBytes) != nil
-            || (data.range(of: Self.sourceMarkerBytes) != nil && data.range(of: Self.codexMarkerBytes) != nil)
-        let mayNeedCursorTranscript = Self.mayNeedCursorSubsessionRouting(data: data)
-
-        let mode = UserDefaults.standard.string(forKey: SettingsKey.pluginSessionMode)
-            ?? SettingsDefaults.pluginSessionMode
-        let isMergeOrHide = mode == "hide" || mode == "merge"
-
-        // merge/hide: parse Cursor hooks that lack `agent-transcripts` only when
-        // `_ppid` is present — otherwise there is nothing for the fallback to use.
-        let mayNeedCursorPpidFallback = isMergeOrHide
-            && Self.mayBeCursorHookSource(data: data)
-            && data.range(of: Self.ppidKeyBytes) != nil
-        // A child that names its parent (#378). Parsed in every mode: one folded
-        // before Agent Sub-Sessions changed must still end where it started.
-        let mayHaveDeclaredParent = data.range(of: Self.declaredParentMarkerBytes) != nil
-
-        // Cursor Task routing is a no-op in separate mode; skip JSON parse when
-        // the payload is Cursor-only (Codex/plugin may still need it below).
-        if mayNeedCursorTranscript && !mayNeedPluginOrCodex && !mayHaveDeclaredParent && !isMergeOrHide {
-            return (data, nil)
-        }
-
-        guard mayNeedPluginOrCodex || mayNeedCursorTranscript || mayNeedCursorPpidFallback
-                || mayHaveDeclaredParent,
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return (data, nil)
-        }
-
-        // A declared parent is the child's own word; no heuristic below may
-        // second-guess it.
-        if mayHaveDeclaredParent,
-           let routed = routeDeclaredSubsession(data: data, raw: raw, mode: mode) {
-            return routed
-        }
-
-        // Cursor Task/subagent: apply Agent Sub-Sessions (separate / merge / hide).
-        switch CursorSubsessionRouter.decide(raw: raw, mode: mode) {
-        case .leave:
-            if let routed = routeCursorLeaveFallback(data: data, raw: raw, mode: mode) {
-                return routed
-            }
-        case .hide:
-            return (data, Self.hiddenPluginResponse(for: raw))
-        case .merge(let parentSessionId, let childSessionId):
-            // Transcript parent UUID may differ from the AppState session key.
-            let resolvedParent = appState.findSessionId(providerSessionId: parentSessionId)
-                ?? parentSessionId
-            return applyCursorMerge(
-                data: data,
-                raw: raw,
-                parentSessionId: resolvedParent,
-                childSessionId: childSessionId
-            )
-        }
-
-        guard isMergeOrHide else {
-            return (data, nil)
-        }
-
-        if (raw["_via_plugin"] as? Bool) == true {
-            switch mode {
-            case "hide":
-                return (data, Self.hiddenPluginResponse(for: raw))
-            case "merge":
-                if let source = raw["_source"] as? String,
-                   let ppid = Self.pluginPpid(from: raw),
-                   let mainSessionId = appState.findSessionId(forSource: source, ppid: ppid) {
-                    var rewritten = raw
-                    rewritten["session_id"] = mainSessionId
-                    if let newData = try? JSONSerialization.data(withJSONObject: rewritten) {
-                        return (newData, nil)
-                    }
-                }
-            default:
-                break
-            }
-            return (data, nil)
-        }
-
-        guard let childSessionId = Self.rawSessionId(from: raw) else {
-            return (data, nil)
-        }
-        let codexMetadata = Self.codexSubagentMetadata(from: raw)
-        let parentSessionId = codexNativeSubsessionParentId(from: raw)
-        guard codexMetadata != nil || parentSessionId != nil else {
-            return (data, nil)
-        }
-
-        switch mode {
-        case "hide":
-            // Hiding the card must not approve what Codex's auto reviewer
-            // would otherwise judge (#165): hand it back undecided instead.
-            if Self.rawEventName(from: raw).map(EventNormalizer.normalize) == "PermissionRequest",
-               let event = HookEvent(from: data),
-               Self.shouldDeferPermissionRequestToProvider(event) {
-                return (data, Data("{}".utf8))
-            }
-            return (data, Self.hiddenPluginResponse(for: raw))
-        case "merge":
-            guard let parentSessionId else { return (data, nil) }
-            var rewritten = raw
-            rewritten["session_id"] = parentSessionId
-            rewritten["agent_id"] = Self.nonEmptyString(raw["agent_id"]) ?? childSessionId
-            rewritten["agent_type"] = Self.nonEmptyString(raw["agent_type"])
-                ?? codexMetadata?.agentType
-                ?? "default"
-            rewritten["_codex_subagent"] = true
-            rewritten["_codex_subagent_session_id"] = childSessionId
-            if let eventName = Self.rawEventName(from: raw) {
-                rewritten["_codex_subagent_event"] = EventNormalizer.normalize(eventName)
-            }
-            if let newData = try? JSONSerialization.data(withJSONObject: rewritten) {
-                return (newData, nil)
-            }
-        default:
-            break
-        }
-        return (data, nil)
-    }
-
-    private func processRequest(data: Data, connection: NWConnection) {
-        // Sub-session pre-filter (#123, #151): plugin, Codex, or Cursor Task hooks
-        // (Cursor: transcript parent ≠ session_id) follow Agent Sub-Sessions —
-        // merge into the parent, hide, or keep separate.
-        //
-        // Cheap byte probes first; avoid JSONSerialization on every PostToolUse.
         let routed = routeSubsessionPayloadIfNeeded(data: data)
-        if let responseData = routed.responseData {
+        guard routed.rewritten,
+              let json = routed.json,
+              let rewritten = try? JSONSerialization.data(withJSONObject: json) else {
+            return (routed.data, routed.response)
+        }
+        return (rewritten, routed.response)
+    }
+
+    /// Agent Sub-Sessions (#123, #151, #262, #378): find whose child the hook
+    /// is (``SubsessionRouter/link(in:context:now:)``) and place it — on the
+    /// child's own card, linked to its parent; folded into the parent's card;
+    /// or hidden.
+    private func routeSubsessionPayloadIfNeeded(data: Data) -> RoutedHook {
+        let mode = AppState.currentPluginSessionMode()
+        guard Self.mayNeedSubsessionRouting(data: data, mode: mode),
+              var raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return RoutedHook(data: data)
+        }
+        let context = appState.subsessionContext
+        guard let link = SubsessionRouter.link(in: raw, context: context) else {
+            return RoutedHook(data: data, json: raw)
+        }
+        let original = raw
+        let outcome = SubsessionRouter.route(
+            &raw,
+            link: link,
+            mode: mode,
+            cards: context.cards,
+            isBlockingRequest: {
+                HookEvent(json: original).map { Self.routeKind(for: $0) != .event } ?? false
+            }
+        )
+        switch outcome {
+        case .unchanged:
+            return RoutedHook(data: data, json: raw)
+        case .rewritten:
+            return RoutedHook(data: data, json: raw, rewritten: true)
+        case .hidden:
+            return RoutedHook(data: data, json: raw, response: Data("{}".utf8))
+        }
+    }
+
+    /// The interpretation of each pending edge delivery that sent facts
+    /// (`_edge`), by connection: its answer goes back as its agent reads it.
+    private var edgeIntakes: [ObjectIdentifier: HookIntake] = [:]
+
+    /// A delivery before it is routed (``intake(_:origin:)``).
+    enum Intake {
+        /// Route `payload`. `edge` is HookIntake's reading of an edge that
+        /// sent facts, nil for a payload its edge interpreted itself.
+        case route(_ payload: Data, edge: HookIntake?)
+        /// Answer nothing, and stop.
+        case answerNothing
+    }
+
+    /// A request that arrived on `origin`'s socket, before it is routed.
+    ///
+    /// The socket names the host first (``HookOrigin/admit(_:)``): on a
+    /// remote host's socket the payload is stamped with that host, whatever
+    /// it claimed; on this Mac's, a payload that claims a remote host is
+    /// answered with nothing. So HookIntake and everything after it see the
+    /// host the socket names, and no other.
+    ///
+    /// An edge that cannot interpret its hook sends what it observed in
+    /// `_edge` instead (``HookEdgeFacts``); HookIntake reads it here, as
+    /// codeisland-bridge does on its own side. A payload without facts is its
+    /// edge's own interpretation and passes as it is. Runs on the connection
+    /// queue, off the main thread.
+    nonisolated static func intake(_ received: Data, origin: HookOrigin) -> Intake {
+        let data: Data
+        let parsed: [String: Any]?
+        switch origin.admit(received) {
+        case .admitted(let admitted, let payload):
+            data = admitted
+            parsed = payload
+        case .refusedRemoteClaim:
+            // Only a process on this Mac reaches this socket, and none of
+            // its hooks names a remote host: this one passes itself off as
+            // one, which would take it past every check that keeps a remote
+            // session from acting on this Mac.
+            log.warning("HookServer: refused a request on this Mac's socket that claims to come from a remote host")
+            return .answerNothing
+        case .refusedUnreadable:
+            log.warning("HookServer: refused a request on a remote host's socket that is not a JSON object")
+            return .answerNothing
+        case .refusedBlankHost:
+            log.error("HookServer: refused a request on the socket of a remote host without an id")
+            return .answerNothing
+        }
+        let payload = parsed ?? (HookEdgeFacts.mayCarryFacts(data)
+            ? try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            : nil)
+        guard let payload, let delivery = HookEdgeFacts.delivery(in: payload) else {
+            return .route(data, edge: nil)
+        }
+        // Slashes unescaped, as the remote hook used to send them: the byte
+        // probes below (`/.cursor/`) read paths as they are written.
+        guard case .interpreted(let intake) = delivery,
+              let interpreted = try? JSONSerialization.data(
+                  withJSONObject: intake.payload,
+                  options: [.withoutEscapingSlashes]
+              ) else {
+            return .answerNothing
+        }
+        // A hook nobody waits on is never held: one HookIntake does not hold
+        // (a hook Cursor runs, #377) or one its edge does not wait on is
+        // answered at once with nothing, as the bridge prints nothing for it,
+        // and gets no card — its agent takes no answer from the island.
+        if !intake.waitsForAnswer,
+           let event = HookEvent(json: intake.payload),
+           routeKind(for: event) != .event {
+            return .answerNothing
+        }
+        return .route(interpreted, edge: intake)
+    }
+
+    private func processRequest(_ intake: Intake, connection: HookConnection) {
+        let connectionId = ObjectIdentifier(connection)
+        edgeIntakes[connectionId] = nil
+        let data: Data
+        switch intake {
+        case .answerNothing:
+            sendResponse(connection: connection, data: Data())
+            return
+        case .route(let payload, let edge):
+            edgeIntakes[connectionId] = edge
+            data = payload
+        }
+
+        // Sub-session pre-filter: a child session's hook (a Codex thread, a
+        // Cursor Task, a declared child, a plugin proxy) follows Agent
+        // Sub-Sessions — its own linked card, its parent's card, or hidden.
+        let routed = routeSubsessionPayloadIfNeeded(data: data)
+        if let responseData = routed.response {
             sendResponse(connection: connection, data: responseData)
             return
         }
-        let processedData = routed.processedData
 
-        guard let event = HookEvent(from: processedData) else {
+        guard let event = routed.json.flatMap(HookEvent.init(json:)) ?? HookEvent(from: routed.data) else {
             sendResponse(connection: connection, data: Data("{\"error\":\"parse_failed\"}".utf8))
             return
         }
@@ -805,7 +607,7 @@ class HookServer {
         // Per-host cwd allow-list for remote sessions (#240): on a shared remote
         // account every user's hooks reach every connected client — scope this
         // panel to the configured working directories and drop the rest.
-        if let filterCSV = Self.remoteCwdFilter(for: event),
+        if let filterCSV = remoteCwdFilter,
            !Self.remoteEventPassesCwdFilter(
                cwd: event.rawJSON["cwd"] as? String,
                workspaceRoots: event.rawJSON["workspace_roots"] as? [String],
@@ -827,8 +629,6 @@ class HookServer {
 
         switch Self.routeKind(for: event) {
         case .permission:
-            let sessionId = event.sessionId ?? "default"
-
             // Claude's plan is reviewed on the island whatever the
             // auto-approve list or the session's trust says: waving it through
             // is exactly what reviewing it is meant to stop.
@@ -836,7 +636,7 @@ class HookServer {
                 && PlanReview.isPlanReview(toolName: event.toolName, toolInput: event.toolInput)
 
             // Auto-approve safe internal tools without showing UI
-            if !reviewsPlan, let toolName = event.toolName, Self.autoApproveTools.contains(toolName) {
+            if !reviewsPlan, let toolName = event.toolName, autoApproveTools.contains(toolName) {
                 let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
                 sendResponse(connection: connection, data: Data(response.utf8))
                 return
@@ -866,10 +666,10 @@ class HookServer {
 
             // AskUserQuestion is a question, not a permission — route to QuestionBar
             if event.toolName == "AskUserQuestion" {
-                monitorPeerDisconnect(connection: connection, sessionId: sessionId, agentId: event.agentId)
+                guard let hook = hold(connection) else { return }
                 Task {
                     let responseBody = await withCheckedContinuation { continuation in
-                        appState.handleAskUserQuestion(event, continuation: continuation)
+                        appState.handleAskUserQuestion(event, continuation: continuation, hookConnectionId: hook)
                     }
                     self.sendResponse(connection: connection, data: responseBody)
                 }
@@ -881,20 +681,19 @@ class HookServer {
                 return
             }
 
-            monitorPeerDisconnect(connection: connection, sessionId: sessionId, agentId: event.agentId)
+            guard let hook = hold(connection) else { return }
             Task {
                 let responseBody = await withCheckedContinuation { continuation in
-                    appState.handlePermissionRequest(event, continuation: continuation)
+                    appState.handlePermissionRequest(event, continuation: continuation, hookConnectionId: hook)
                 }
                 self.sendResponse(connection: connection, data: responseBody)
             }
 
         case .question:
-            let questionSessionId = event.sessionId ?? "default"
-            monitorPeerDisconnect(connection: connection, sessionId: questionSessionId, agentId: event.agentId)
+            guard let hook = hold(connection) else { return }
             Task {
                 let responseBody = await withCheckedContinuation { continuation in
-                    appState.handleQuestion(event, continuation: continuation)
+                    appState.handleQuestion(event, continuation: continuation, hookConnectionId: hook)
                 }
                 self.sendResponse(connection: connection, data: responseBody)
             }
@@ -907,64 +706,120 @@ class HookServer {
 
     /// Per-connection state used by the disconnect monitor.
     /// `responded` flips to true once we've sent the response, so our own
-    /// `connection.cancel()` inside `sendResponse` does not masquerade as a
-    /// peer disconnect.
+    /// closing of the connection after `sendResponse` does not masquerade as a
+    /// peer disconnect. `id` names the connection to AppState: the request it
+    /// holds goes with it (``AppState/handleHookGone(connectionId:)``).
     private final class ConnectionContext {
+        let id = UUID()
         var responded: Bool = false
     }
 
     private var connectionContexts: [ObjectIdentifier: ConnectionContext] = [:]
 
+    /// Requests held for an answer now.
+    private var heldRequests: Int {
+        connectionContexts.values.reduce(0) { $0 + ($1.responded ? 0 : 1) }
+    }
+
+    /// Holds `connection` until its request is answered
+    /// (``monitorPeerDisconnect(connection:)``) and returns its id — or,
+    /// when the socket already holds as many requests as it may
+    /// (``HookSocketLimits/maxHeldRequests``), answers it at once with
+    /// nothing and returns nil: no card, and its agent asks in its own way.
+    private func hold(_ connection: HookConnection) -> UUID? {
+        if let cap = limits.maxHeldRequests, heldRequests >= cap {
+            log.warning("HookServer: \(self.socketPath, privacy: .public) already holds \(cap) requests; answering one more with nothing")
+            sendResponse(connection: connection, data: Data())
+            return nil
+        }
+        return monitorPeerDisconnect(connection: connection)
+    }
+
     /// Watch for bridge process disconnect — indicates the bridge process actually died
     /// (e.g. user Ctrl-C'd Claude Code), NOT a normal half-close.
     ///
-    /// Previously this used `connection.receive(min:1, max:1)` which triggered on EOF.
-    /// But the bridge always does `shutdown(SHUT_WR)` after sending the request (see
-    /// CodeIslandBridge/main.swift), which produces an immediate EOF on the read side.
-    /// That caused every PermissionRequest to be auto-drained as `deny` before the UI
-    /// card was even visible. We now rely on `stateUpdateHandler` transitioning to
-    /// `cancelled`/`failed` — which only happens on real socket teardown, not half-close.
-    private func monitorPeerDisconnect(connection: NWConnection, sessionId: String, agentId: String?) {
+    /// The bridge always does `shutdown(SHUT_WR)` after sending the request (see
+    /// CodeIslandBridge/main.swift), which produces an immediate EOF on the read side:
+    /// taken for a disconnect, every PermissionRequest was auto-drained as `deny`
+    /// before its card was even visible. ``HookConnection/closeWhenPeerLeaves()``
+    /// closes the connection only on real teardown, and a connection that closes
+    /// without an answer — its hook gone, seen by that watch or by the safety
+    /// net below — drops its card, and no other: each held request has a hook
+    /// of its own.
+    ///
+    /// Returns the connection's id, for its request (`hookConnectionId`).
+    private func monitorPeerDisconnect(connection: HookConnection) -> UUID {
         let context = ConnectionContext()
         let connId = ObjectIdentifier(connection)
         connectionContexts[connId] = context
 
-        connection.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor in
-                guard let self = self else { return }
-                switch state {
-                case .cancelled, .failed:
+        // Holding `connection` until this runs keeps its identifier from being reused.
+        connection.onClose { [weak self, connection] in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
                     if !context.responded {
-                        self.appState.handlePeerDisconnect(sessionId: sessionId, agentId: agentId)
+                        self.appState.handleHookGone(connectionId: context.id)
                     }
-                    self.connectionContexts.removeValue(forKey: connId)
-                default:
-                    break
+                    if self.connectionContexts[ObjectIdentifier(connection)] === context {
+                        self.connectionContexts.removeValue(forKey: connId)
+                    }
                 }
             }
         }
+        connection.closeWhenPeerLeaves()
 
-        // Safety net: if the connection context is still around after 5 minutes
-        // (e.g. stuck continuation, NWConnection never transitions), clean it up.
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 300_000_000_000)  // 5 minutes
-            guard let self = self else { return }
-            if self.connectionContexts.removeValue(forKey: connId) != nil {
-                log.warning("Connection context for session \(sessionId) timed out — cleaning up")
-                if !context.responded {
-                    connection.cancel()
-                }
+        // Safety net, should the watch ever miss its hook leaving: now and
+        // then, a held request whose hook is gone is closed, and its card
+        // dropped. A hook still there is never cut off: it waits as long as
+        // its agent lets it (the bridge up to 86400 s), for someone who
+        // stepped away (#306), and its request stays answerable.
+        let interval = UInt64(heldRequestCheckInterval * 1_000_000_000)
+        Task { @MainActor [weak self, weak connection] in
+            while (try? await Task.sleep(nanoseconds: interval)) != nil {
+                guard let self, let connection,
+                      self.connectionContexts[connId] === context,
+                      !context.responded else { return }
+                connection.closeIfPeerGone()
             }
         }
+        return context.id
     }
 
-    private func sendResponse(connection: NWConnection, data: Data) {
-        // Mark as responded BEFORE cancel() so the disconnect monitor ignores our own teardown.
+    private func sendResponse(connection: HookConnection, data: Data) {
+        // Mark as responded BEFORE the connection closes so the disconnect monitor
+        // ignores our own teardown.
         if let context = connectionContexts[ObjectIdentifier(connection)] {
             context.responded = true
         }
-        connection.send(content: data, completion: .contentProcessed { _ in
-            connection.cancel()
-        })
+        // An edge that sent facts gets what the bridge would have printed.
+        var data = data
+        if let intake = edgeIntakes.removeValue(forKey: ObjectIdentifier(connection)) {
+            data = intake.stdout(forAnswer: data) ?? Data()
+        }
+        connection.respond(data)
+    }
+}
+
+/// The origin a server's connection queue reads, while the main actor may
+/// rename its host.
+private final class OriginBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: HookOrigin
+
+    init(_ origin: HookOrigin) {
+        current = origin
+    }
+
+    var value: HookOrigin {
+        lock.lock()
+        defer { lock.unlock() }
+        return current
+    }
+
+    func set(_ origin: HookOrigin) {
+        lock.lock()
+        current = origin
+        lock.unlock()
     }
 }

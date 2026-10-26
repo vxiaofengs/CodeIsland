@@ -12,6 +12,25 @@ struct CodexPermissionRules {
         SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) == "codex"
     }
 
+    /// A request from a remote host (`_remote_host_id`, whatever its value:
+    /// only this Mac's own hooks leave it out). That Codex reads its config
+    /// and rules on its own host, so nothing under this Mac's CODEX_HOME
+    /// describes it, and nothing written there reaches it.
+    static func isRemoteEvent(_ event: HookEvent) -> Bool {
+        event.rawJSON["_remote_host_id"] != nil
+    }
+
+    /// Whether "Always allow" saves a Codex rule (persistAlwaysAllowRule) —
+    /// what the approval card's link says it does: an MCP tool's approval, or
+    /// a command's prefix rule (``prefixPattern(for:)``). A remote Codex
+    /// request's "Always" holds for its session instead
+    /// (AppState.approvePermission), and so does a local one no rule can
+    /// describe — an apply_patch, a command that starts with a variable.
+    static func alwaysSavesRule(for event: HookEvent) -> Bool {
+        isCodexEvent(event) && !isRemoteEvent(event)
+            && (mcpToolApprovalTarget(for: event) != nil || prefixPattern(for: event) != nil)
+    }
+
     /// The Codex root the event's session runs under — its config.toml and
     /// rules are the ones that apply. A session started with CODEX_HOME set to
     /// an extra root registered in Settings is recognised by the transcript
@@ -35,6 +54,15 @@ struct CodexPermissionRules {
         if let reviewer = eventReviewerValue(event.rawJSON) {
             return isAutoReviewReviewer(reviewer)
         }
+
+        // A remote Codex reads its own host's config.toml and writes its
+        // rollout there; this Mac's say nothing about it (a remote rollout is
+        // never read here either). With no reviewer in the request itself,
+        // nothing tells the island that Codex would review it, so the request
+        // is not handed back: the user decides on the card. A wrong hand-back
+        // would leave it waiting in a terminal on the other machine, while a
+        // card can always be answered.
+        guard !isRemoteEvent(event) else { return false }
 
         // Desktop selections and per-turn overrides need not be written to
         // config.toml or included in PermissionRequest. The matching rollout
@@ -199,11 +227,19 @@ struct CodexPermissionRules {
         return false
     }
 
+    /// The prefix rule "Always" saves for a command: its first words, up to
+    /// three — what the card's link spells out, and nothing else.
+    ///
+    /// Only the command is read. Codex's PermissionRequest hook input carries
+    /// no rule of its own to save (codex-rs/hooks/schema/generated/
+    /// permission-request.command.input.schema.json has no such field, and
+    /// allows no other), and a command's `tool_input` is just `command` and
+    /// `description`. A `prefix_rule` anywhere in the payload was written by
+    /// the model — an MCP tool's arguments are its own — or by whoever sent
+    /// the hook; Codex itself screens the one its model suggests to it. Taken
+    /// from there, `["bash"]` was saved for a card that showed `ls -la`, and
+    /// allowed every command after it.
     static func prefixPattern(for event: HookEvent) -> [String]? {
-        if let suggested = findSuggestedPrefixRule(in: event.rawJSON) {
-            return suggested
-        }
-
         guard event.toolName == "Bash",
               let command = event.toolInput?["command"] as? String else {
             return nil
@@ -214,6 +250,8 @@ struct CodexPermissionRules {
 
     @discardableResult
     func persistAlwaysAllowRule(for event: HookEvent) -> Bool {
+        // A remote command or tool must never become a rule for this Mac's Codex.
+        guard !Self.isRemoteEvent(event) else { return false }
         let codexHome = Self.codexHome(for: event)
         if let mcpTool = Self.mcpToolApprovalTarget(for: event) {
             return persistMCPToolApproval(serverID: mcpTool.serverID, toolName: mcpTool.toolName, codexHome: codexHome)
@@ -636,41 +674,6 @@ struct CodexPermissionRules {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         return "\"\(escaped)\""
-    }
-
-    private static func findSuggestedPrefixRule(in value: Any) -> [String]? {
-        if let dictionary = value as? [String: Any] {
-            for key in ["prefix_rule", "prefixRule"] {
-                if let pattern = stringArray(from: dictionary[key]) {
-                    return pattern
-                }
-            }
-
-            for nested in dictionary.values {
-                if let pattern = findSuggestedPrefixRule(in: nested) {
-                    return pattern
-                }
-            }
-        } else if let array = value as? [Any] {
-            for nested in array {
-                if let pattern = findSuggestedPrefixRule(in: nested) {
-                    return pattern
-                }
-            }
-        }
-        return nil
-    }
-
-    private static func stringArray(from value: Any?) -> [String]? {
-        if let pattern = value as? [String], !pattern.isEmpty {
-            return pattern
-        }
-        if let dictionary = value as? [String: Any],
-           let pattern = dictionary["pattern"] as? [String],
-           !pattern.isEmpty {
-            return pattern
-        }
-        return nil
     }
 
     private static func shellPrefix(from command: String, maxTokens: Int) -> [String]? {

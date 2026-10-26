@@ -16,8 +16,13 @@ extension AppState {
     /// Start watching a session's transcript file for appended lines. Safe to call
     /// repeatedly with the same (session, path) pair — the tailer reattaches only
     /// when the path actually changed.
+    ///
+    /// Never for a remote session: its transcript path names a file on its own
+    /// host, and a file at the same path here would put this Mac's content on
+    /// its card.
     func attachTranscriptTailerIfNeeded(sessionId: String) {
-        guard let path = sessions[sessionId]?.transcriptPath, !path.isEmpty else { return }
+        guard let session = sessions[sessionId], !session.isRemote,
+              let path = session.transcriptPath, !path.isEmpty else { return }
         if attachedTranscriptPaths[sessionId] == path { return }
         attachedTranscriptPaths[sessionId] = path
 
@@ -25,11 +30,11 @@ extension AppState {
         let messages: [ChatMessage]
         if let source = sessions[sessionId]?.source,
            source == "cursor" || source == "cursor-cli" {
-            messages = Self.readRecentFromCursorTranscript(path: path).1
+            messages = CursorDiscovery.readRecentFromCursorTranscript(path: path).1
         } else if sessions[sessionId]?.source == "codex" {
-            messages = Self.readRecentFromCodexTranscript(path: path).1
+            messages = CodexDiscovery.readRecentFromCodexTranscript(path: path).1
         } else {
-            messages = Self.readRecentFromTranscript(path: path).1
+            messages = ClaudeDiscovery.readRecentFromTranscript(path: path).1
         }
         if !messages.isEmpty, var session = sessions[sessionId] {
             session.recentMessages = messages
@@ -56,7 +61,7 @@ extension AppState {
         }
 
         if sessions[sessionId]?.source == "codex",
-           let turnStatus = Self.latestCodexTurnStatus(path: path),
+           let turnStatus = CodexDiscovery.latestCodexTurnStatus(path: path),
            var session = sessions[sessionId] {
             switch turnStatus {
             case .processing:
@@ -322,7 +327,7 @@ extension AppState {
                 questionStateChanged = true
             }
             if application == .markedWaiting(fresh: true) {
-                SoundManager.shared.handleEvent("PermissionRequest")
+                attend(.requestRaisedElsewhere, sessionId: delta.sessionId)
             }
         }
 

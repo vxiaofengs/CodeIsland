@@ -113,9 +113,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
     func testMisbrandedClaudeCardWithoutTranscriptRebrandsFromIndexBuiltOffMainActor() async {
         let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
         UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
-        let previousScanner = AppState.cursorSubagentIndexScanner
         defer {
-            AppState.cursorSubagentIndexScanner = previousScanner
             if let previousMode {
                 UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
             } else {
@@ -128,12 +126,13 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         let childTranscript =
             "/Users/u/.cursor/projects/x/agent-transcripts/\(parentId)/subagents/\(childId).jsonl"
         let probe = CursorIndexScanProbe()
-        AppState.cursorSubagentIndexScanner = {
+        let cursorIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
             probe.record()
             return CursorSubagentTranscriptIndex(pathsBySessionId: [childId: [childTranscript]], builtAt: Date())
         }
 
         let appState = AppState()
+        appState.discovery.scanners.cursorSubagentIndex = cursorIndexScanner
         var parent = SessionSnapshot()
         parent.source = "cursor"
         parent.status = .running
@@ -161,9 +160,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
     func testRepeatedRebrandsOfRealClaudeCardsShareOneWalk() async {
         let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
         UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
-        let previousScanner = AppState.cursorSubagentIndexScanner
         defer {
-            AppState.cursorSubagentIndexScanner = previousScanner
             if let previousMode {
                 UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
             } else {
@@ -172,12 +169,13 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         }
 
         let probe = CursorIndexScanProbe()
-        AppState.cursorSubagentIndexScanner = {
+        let cursorIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
             probe.record()
             return CursorSubagentTranscriptIndex(pathsBySessionId: [:], builtAt: Date())
         }
 
         let appState = AppState()
+        appState.discovery.scanners.cursorSubagentIndex = cursorIndexScanner
         for n in 0..<8 {
             var claude = SessionSnapshot()
             claude.source = "claude"
@@ -199,11 +197,9 @@ final class AppStateCursorSubsessionTests: XCTestCase {
     func testStopSessionDiscoveryDropsAnIndexWalkStillInFlight() async {
         let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
         UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
-        let previousScanner = AppState.cursorSubagentIndexScanner
         let release = DispatchSemaphore(value: 0)
         defer {
             release.signal()
-            AppState.cursorSubagentIndexScanner = previousScanner
             if let previousMode {
                 UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
             } else {
@@ -216,13 +212,14 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         let childTranscript =
             "/Users/u/.cursor/projects/x/agent-transcripts/\(parentId)/subagents/\(childId).jsonl"
         let probe = CursorIndexScanProbe()
-        AppState.cursorSubagentIndexScanner = {
+        let cursorIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
             probe.record()
             _ = release.wait(timeout: .now() + asyncTestTimeout)
             return CursorSubagentTranscriptIndex(pathsBySessionId: [childId: [childTranscript]], builtAt: Date())
         }
 
         let appState = AppState()
+        appState.discovery.scanners.cursorSubagentIndex = cursorIndexScanner
         var child = SessionSnapshot()
         child.source = "claude"
         child.status = .running
@@ -244,9 +241,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
     func testRemoteClaudeCardsNeverStartAWalk() async {
         let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
         UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
-        let previousScanner = AppState.cursorSubagentIndexScanner
         defer {
-            AppState.cursorSubagentIndexScanner = previousScanner
             if let previousMode {
                 UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
             } else {
@@ -255,12 +250,13 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         }
 
         let probe = CursorIndexScanProbe()
-        AppState.cursorSubagentIndexScanner = {
+        let cursorIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
             probe.record()
             return CursorSubagentTranscriptIndex(pathsBySessionId: [:], builtAt: Date())
         }
 
         let appState = AppState()
+        appState.discovery.scanners.cursorSubagentIndex = cursorIndexScanner
         var remote = SessionSnapshot()
         remote.source = "claude"
         remote.status = .running
@@ -277,9 +273,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
     func testUnresolvedCardIsLookedUpOnItsScheduleThenLeftAlone() async {
         let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
         UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
-        let previousScanner = AppState.cursorSubagentIndexScanner
         defer {
-            AppState.cursorSubagentIndexScanner = previousScanner
             if let previousMode {
                 UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
             } else {
@@ -288,13 +282,14 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         }
 
         let probe = CursorIndexScanProbe()
-        AppState.cursorSubagentIndexScanner = {
+        let cursorIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
             probe.record()
             return CursorSubagentTranscriptIndex(pathsBySessionId: [:], builtAt: Date())
         }
 
         let childId = "2528cb91-6379-48f2-aff8-40f4b804dafa"
         let appState = AppState()
+        appState.discovery.scanners.cursorSubagentIndex = cursorIndexScanner
         appState.cursorSubagentLookupDelays = [0, 0.05, 0.1, 0.15, 0.2]
         var card = SessionSnapshot()
         card.source = "claude"
@@ -325,11 +320,9 @@ final class AppStateCursorSubsessionTests: XCTestCase {
     func testCardFirstSeenDuringAWalkKeepsItsImmediateLookup() async {
         let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
         UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
-        let previousScanner = AppState.cursorSubagentIndexScanner
         let release = DispatchSemaphore(value: 0)
         defer {
             release.signal()
-            AppState.cursorSubagentIndexScanner = previousScanner
             if let previousMode {
                 UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
             } else {
@@ -338,7 +331,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         }
 
         let probe = CursorIndexScanProbe()
-        AppState.cursorSubagentIndexScanner = {
+        let cursorIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
             let startedAt = Date()
             probe.record()
             if probe.calls == 1 { _ = release.wait(timeout: .now() + asyncTestTimeout) }
@@ -346,6 +339,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         }
 
         let appState = AppState()
+        appState.discovery.scanners.cursorSubagentIndex = cursorIndexScanner
         // Far enough apart that no later lookup can stand in for the immediate one.
         appState.cursorSubagentLookupDelays = [0, 30, 60, 90, 120]
         var first = SessionSnapshot()
@@ -370,9 +364,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
     func testRecheckTimerDoesNotWalkInSeparateMode() async {
         let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
         UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
-        let previousScanner = AppState.cursorSubagentIndexScanner
         defer {
-            AppState.cursorSubagentIndexScanner = previousScanner
             if let previousMode {
                 UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
             } else {
@@ -381,12 +373,13 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         }
 
         let probe = CursorIndexScanProbe()
-        AppState.cursorSubagentIndexScanner = {
+        let cursorIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
             probe.record()
             return CursorSubagentTranscriptIndex(pathsBySessionId: [:], builtAt: Date())
         }
 
         let appState = AppState()
+        appState.discovery.scanners.cursorSubagentIndex = cursorIndexScanner
         appState.cursorSubagentLookupDelays = [0, 0.05, 0.1, 0.15, 0.2]
         var card = SessionSnapshot()
         card.source = "claude"
@@ -405,9 +398,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
     func testLeavingSeparateModeLooksCardsUpAgain() async {
         let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
         UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
-        let previousScanner = AppState.cursorSubagentIndexScanner
         defer {
-            AppState.cursorSubagentIndexScanner = previousScanner
             if let previousMode {
                 UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
             } else {
@@ -420,7 +411,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         let childTranscript =
             "/Users/u/.cursor/projects/x/agent-transcripts/\(parentId)/subagents/\(childId).jsonl"
         let probe = CursorIndexScanProbe()
-        AppState.cursorSubagentIndexScanner = {
+        let cursorIndexScanner: @Sendable () -> CursorSubagentTranscriptIndex = {
             probe.record()
             // The Task's transcript lands only after the first walk.
             let paths = probe.calls > 1 ? [childId: [childTranscript]] : [:]
@@ -428,6 +419,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         }
 
         let appState = AppState()
+        appState.discovery.scanners.cursorSubagentIndex = cursorIndexScanner
         appState.cursorSubagentLookupDelays = [0]  // one lookup, then the card is left alone
         var parent = SessionSnapshot()
         parent.source = "cursor"
@@ -1034,7 +1026,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         )
     }
 
-    func testClosedSubagentPermissionRequestIsDeniedWithoutQueueing() async throws {
+    func testClosedSubagentPermissionRequestIsDroppedUndecidedWithoutQueueing() async throws {
         let parentId = "e1247fd5-d9a0-48ef-8457-0304606b1833"
         let childId = "2528cb91-6379-48f2-aff8-40f4b804dafa"
         let appState = AppState()
@@ -1056,10 +1048,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         let response = try await awaitValue(of: await startHookRequest { appState.handlePermissionRequest(event, continuation: $0) })
 
         XCTAssertTrue(appState.permissionQueue.isEmpty)
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
-        let hook = try XCTUnwrap(json["hookSpecificOutput"] as? [String: Any])
-        let decision = try XCTUnwrap(hook["decision"] as? [String: Any])
-        XCTAssertEqual(decision["behavior"] as? String, "deny")
+        XCTAssertEqual(response, AppState.noDecisionAnswer, "dropped, not decided")
         XCTAssertEqual(appState.sessions[parentId]?.status, .processing)
     }
 
@@ -1117,10 +1106,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         let response = try await awaitValue(of: await startHookRequest { appState.handleAskUserQuestion(event, continuation: $0) })
 
         XCTAssertTrue(appState.questionQueue.isEmpty)
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
-        let hook = try XCTUnwrap(json["hookSpecificOutput"] as? [String: Any])
-        let decision = try XCTUnwrap(hook["decision"] as? [String: Any])
-        XCTAssertEqual(decision["behavior"] as? String, "deny")
+        XCTAssertEqual(response, AppState.noDecisionAnswer, "dropped, not decided")
         XCTAssertEqual(appState.sessions[parentId]?.status, .processing)
     }
 
@@ -1264,7 +1250,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         XCTAssertEqual(appState.sessions[parentId]?.currentTool, "Agent")
     }
 
-    func testSeparateSelfTombstoneDeniesPermissionWithoutAgentId() async throws {
+    func testSeparateSelfTombstoneDropsPermissionWithoutAgentIdUndecided() async throws {
         let childId = "2528cb91-6379-48f2-aff8-40f4b804dafa"
         let appState = AppState()
         var child = SessionSnapshot()
@@ -1284,10 +1270,7 @@ final class AppStateCursorSubsessionTests: XCTestCase {
         let response = try await awaitValue(of: await startHookRequest { appState.handlePermissionRequest(event, continuation: $0) })
 
         XCTAssertTrue(appState.permissionQueue.isEmpty)
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
-        let hook = try XCTUnwrap(json["hookSpecificOutput"] as? [String: Any])
-        let decision = try XCTUnwrap(hook["decision"] as? [String: Any])
-        XCTAssertEqual(decision["behavior"] as? String, "deny")
+        XCTAssertEqual(response, AppState.noDecisionAnswer, "dropped, not decided")
     }
 }
 

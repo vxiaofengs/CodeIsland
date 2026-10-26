@@ -118,8 +118,8 @@ final class AppStatePermissionFlowTests: XCTestCase {
         let responseA = try await awaitValue(of: responseTaskA)
         let responseB = try await awaitValue(of: responseTaskB)
 
-        XCTAssertEqual(try extractPermissionBehavior(from: responseA), "deny")
-        XCTAssertEqual(try extractPermissionBehavior(from: responseB), "deny")
+        XCTAssertEqual(responseA, AppState.noDecisionAnswer)
+        XCTAssertEqual(responseB, AppState.noDecisionAnswer)
         XCTAssertEqual(appState.permissionQueue.count, 0)
     }
 
@@ -144,7 +144,7 @@ final class AppStatePermissionFlowTests: XCTestCase {
 
         appState.handlePeerDisconnect(sessionId: sessionId)
         let response = try await awaitValue(of: responseTask)
-        XCTAssertEqual(try extractPermissionBehavior(from: response), "deny")
+        XCTAssertEqual(response, AppState.noDecisionAnswer)
     }
 
     func testDismissedSessionGetsShownAgainWhenNewPermissionArrivesAfterDrain() async throws {
@@ -159,7 +159,7 @@ final class AppStatePermissionFlowTests: XCTestCase {
 
         appState.handlePeerDisconnect(sessionId: sessionId)
         let firstResponse = try await awaitValue(of: firstResponseTask)
-        XCTAssertEqual(try extractPermissionBehavior(from: firstResponse), "deny")
+        XCTAssertEqual(firstResponse, AppState.noDecisionAnswer)
         XCTAssertEqual(appState.permissionQueue.count, 0)
 
         let secondEvent = try makePermissionRequestEvent(sessionId: sessionId, toolName: "Write")
@@ -228,6 +228,19 @@ final class AppStatePermissionFlowTests: XCTestCase {
 
         appState.handlePeerDisconnect(sessionId: sessionId)
         _ = try await awaitValue(of: responseTask)
+    }
+
+    func testMessagePreviewStopsAtTheFramesTheBuddyCanNumber() {
+        let appState = AppState()
+        let limit = ESP32Protocol.maxMessagePreviewSegments
+        let long = String(repeating: "abcdefghijklmnop", count: 64 * 1024)  // 1 MB
+        let segments = appState.esp32MessagePreviewSegments(text: long)
+        XCTAssertEqual(segments.count, limit)
+        XCTAssertEqual(segments.joined(), String(long.prefix(limit * ESP32Protocol.maxMessagePreviewBytes)))
+
+        // Characters too wide for one frame add two segments at once.
+        let wide = String(repeating: "x👨‍👩‍👧‍👦", count: 400)
+        XCTAssertEqual(appState.esp32MessagePreviewSegments(text: wide).count, limit)
     }
 
     func testInteractiveDeliveryKeyChangesWhenApprovalDescriptionChanges() {
@@ -631,6 +644,131 @@ final class AppStatePermissionFlowTests: XCTestCase {
                      "a healthy file must never be rewritten")
     }
 
+    // MARK: - Remote Codex "Always"
+
+    /// A remote Codex runs under its own host's config and rules. "Always"
+    /// on its card used to write a rule built from the remote command (or an
+    /// MCP approval) into this Mac's CODEX_HOME — one this Mac's Codex then
+    /// honoured.
+    func testRemoteCodexAlwaysAllowWritesNothingUnderThisMacsCodexHome() async throws {
+        let codexHome = makeTemporaryCodexHome()
+        defer { try? FileManager.default.removeItem(at: codexHome) }
+        let config = try writeCodexConfig(
+            """
+            [mcp_servers.sh_wiki]
+            command = "sh-wiki-mcp"
+
+            """,
+            in: codexHome
+        )
+        let configBefore = try String(contentsOf: config, encoding: .utf8)
+        let appState = AppState()
+        let requests: [(tool: String, input: [String: Any])] = [
+            ("Bash", ["command": "git push --force origin main"]),
+            ("mcp__sh_wiki__fetch_page", ["page_id": "432458668"]),
+        ]
+
+        for request in requests {
+            let event = try makePermissionRequestEvent(
+                sessionId: "s-remote-\(request.tool)",
+                toolName: request.tool,
+                toolInput: request.input,
+                source: "codex",
+                remoteHostId: "devbox"
+            )
+            XCTAssertTrue(CodexPermissionRules.isCodexEvent(event))
+            XCTAssertFalse(CodexPermissionRules().persistAlwaysAllowRule(for: event), request.tool)
+
+            let responseTask = await startHookRequest { appState.handlePermissionRequest(event, continuation: $0) }
+            appState.approvePermission(always: true, expectedSessionId: event.sessionId)
+            let decision = try extractPermissionDecision(from: await awaitValue(of: responseTask))
+            XCTAssertEqual(decision["behavior"] as? String, "allow", request.tool)
+            XCTAssertNil(decision["updatedPermissions"], request.tool)
+        }
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: codeIslandRulesPath(in: codexHome).path),
+            "no rule for this Mac's Codex"
+        )
+        XCTAssertEqual(try String(contentsOf: config, encoding: .utf8), configBefore, "no MCP approval either")
+    }
+
+    /// What the card promised instead: this tool, for the rest of the
+    /// session — and nothing more.
+    func testRemoteCodexAlwaysAllowHoldsForTheRestOfItsSessionOnly() async throws {
+        let codexHome = makeTemporaryCodexHome()
+        defer { try? FileManager.default.removeItem(at: codexHome) }
+        let appState = AppState()
+        func remoteRequest(_ sessionId: String, _ tool: String, _ command: String = "make test") throws -> HookEvent {
+            try makePermissionRequestEvent(
+                sessionId: sessionId,
+                toolName: tool,
+                toolInput: ["command": command],
+                source: "codex",
+                remoteHostId: "devbox"
+            )
+        }
+
+        let first = try remoteRequest("s-remote", "Bash")
+        let firstTask = await startHookRequest { appState.handlePermissionRequest(first, continuation: $0) }
+        appState.approvePermission(always: true, expectedSessionId: first.sessionId)
+        try await assertBehavior(of: firstTask, "allow")
+
+        let again = try remoteRequest("s-remote", "Bash", "make lint")
+        let againTask = await startHookRequest { appState.handlePermissionRequest(again, continuation: $0) }
+        XCTAssertTrue(appState.permissionQueue.isEmpty, "the session's Always answers it, no card")
+        try await assertBehavior(of: againTask, "allow")
+
+        let otherTool = try remoteRequest("s-remote", "mcp__docs__search")
+        let otherSession = try remoteRequest("s-remote-2", "Bash")
+        let otherToolTask = await startHookRequest { appState.handlePermissionRequest(otherTool, continuation: $0) }
+        let otherSessionTask = await startHookRequest { appState.handlePermissionRequest(otherSession, continuation: $0) }
+        XCTAssertEqual(appState.permissionQueue.count, 2, "another tool, or another session, still asks")
+        appState.denyPermission(expectedSessionId: otherSession.sessionId)
+        appState.denyPermission(expectedSessionId: otherTool.sessionId)
+        try await assertBehavior(of: otherToolTask, "deny")
+        try await assertBehavior(of: otherSessionTask, "deny")
+
+        // A new session under the same id starts asking again.
+        appState.handleEvent(try XCTUnwrap(HookEvent(from: JSONSerialization.data(withJSONObject: [
+            "hook_event_name": "SessionStart", "session_id": "s-remote", "cwd": "/home/me/project",
+            "transcript_path": "/home/me/.codex/sessions/rollout.jsonl",
+            "_source": "codex", "_remote_host_id": "devbox",
+        ]))))
+        let afterRestart = try remoteRequest("s-remote", "Bash")
+        let afterRestartTask = await startHookRequest { appState.handlePermissionRequest(afterRestart, continuation: $0) }
+        XCTAssertEqual(appState.permissionQueue.count, 1)
+        appState.denyPermission(expectedSessionId: afterRestart.sessionId)
+        try await assertBehavior(of: afterRestartTask, "deny")
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: codexHome.path), "nothing written under CODEX_HOME")
+    }
+
+    func testLocalCodexAlwaysAllowStillSavesARuleAndAsksAgainThroughCodex() async throws {
+        let codexHome = makeTemporaryCodexHome()
+        defer { try? FileManager.default.removeItem(at: codexHome) }
+        let appState = AppState()
+        let event = try makePermissionRequestEvent(
+            sessionId: "s-local-codex",
+            toolName: "Bash",
+            toolInput: ["command": "make test"],
+            source: "codex"
+        )
+        XCTAssertTrue(CodexPermissionRules.alwaysSavesRule(for: event))
+
+        let task = await startHookRequest { appState.handlePermissionRequest(event, continuation: $0) }
+        appState.approvePermission(always: true, expectedSessionId: "s-local-codex")
+        try await assertBehavior(of: task, "allow")
+        XCTAssertTrue(try readCodeIslandRules(in: codexHome).contains(#"pattern = ["make", "test"]"#))
+
+        // Codex itself applies the saved rule; a request that still reaches
+        // the island is one Codex wants asked.
+        let again = await startHookRequest { appState.handlePermissionRequest(event, continuation: $0) }
+        XCTAssertEqual(appState.permissionQueue.count, 1)
+        appState.denyPermission(expectedSessionId: "s-local-codex")
+        try await assertBehavior(of: again, "deny")
+    }
+
     func testCodexAutoReviewConfigDefersPermissionRequestToCodex() throws {
         let codexHome = makeTemporaryCodexHome()
         defer { try? FileManager.default.removeItem(at: codexHome) }
@@ -966,7 +1104,8 @@ final class AppStatePermissionFlowTests: XCTestCase {
         sessionId: String,
         toolName: String,
         toolInput: [String: Any] = ["command": "echo test"],
-        source: String? = nil
+        source: String? = nil,
+        remoteHostId: String? = nil
     ) throws -> HookEvent {
         var payload: [String: Any] = [
             "hook_event_name": "PermissionRequest",
@@ -976,6 +1115,9 @@ final class AppStatePermissionFlowTests: XCTestCase {
         ]
         if let source {
             payload["_source"] = source
+        }
+        if let remoteHostId {
+            payload["_remote_host_id"] = remoteHostId
         }
         let data = try JSONSerialization.data(withJSONObject: payload)
         guard let event = HookEvent(from: data) else {
@@ -988,6 +1130,16 @@ final class AppStatePermissionFlowTests: XCTestCase {
     private func extractPermissionBehavior(from responseData: Data) throws -> String {
         let decision = try extractPermissionDecision(from: responseData)
         return try XCTUnwrap(decision["behavior"] as? String)
+    }
+
+    private func assertBehavior(
+        of task: Task<Data, Never>,
+        _ expected: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let behavior = try extractPermissionBehavior(from: await awaitValue(of: task, file: file, line: line))
+        XCTAssertEqual(behavior, expected, file: file, line: line)
     }
 
     private func extractPermissionDecision(from responseData: Data) throws -> [String: Any] {

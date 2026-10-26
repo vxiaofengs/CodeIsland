@@ -82,14 +82,14 @@ final class MinimaxSupportTests: XCTestCase {
         // The CWD fallback binds the card to whatever it finds; a helper that
         // mcode spawns in the same folder exits in moments and would take the
         // card with it.
-        XCTAssertTrue(AppState.isMinimaxProcessArgs(["minimax-code"]))  // renamed title
-        XCTAssertTrue(AppState.isMinimaxProcessArgs(["node", "/opt/homebrew/bin/mcode"]))
-        XCTAssertTrue(AppState.isMinimaxProcessArgs(["node", "/opt/homebrew/lib/node_modules/@minimax-ai/code/cli.js"]))
-        XCTAssertFalse(AppState.isMinimaxProcessArgs([
+        XCTAssertTrue(AgentProcessFinder.isMinimaxProcessArgs(["minimax-code"]))  // renamed title
+        XCTAssertTrue(AgentProcessFinder.isMinimaxProcessArgs(["node", "/opt/homebrew/bin/mcode"]))
+        XCTAssertTrue(AgentProcessFinder.isMinimaxProcessArgs(["node", "/opt/homebrew/lib/node_modules/@minimax-ai/code/cli.js"]))
+        XCTAssertFalse(AgentProcessFinder.isMinimaxProcessArgs([
             "/opt/homebrew/lib/node_modules/@minimax-ai/code/node_modules/@vscode/ripgrep/bin/rg", "--json", "TODO",
         ]))
-        XCTAssertFalse(AppState.isMinimaxProcessArgs(["node", "/opt/homebrew/bin/mcode-tools", "read"]))
-        XCTAssertFalse(AppState.isMinimaxProcessArgs(["vim", "/Users/me/src/minimax-code-notes.md"]))
+        XCTAssertFalse(AgentProcessFinder.isMinimaxProcessArgs(["node", "/opt/homebrew/bin/mcode-tools", "read"]))
+        XCTAssertFalse(AgentProcessFinder.isMinimaxProcessArgs(["vim", "/Users/me/src/minimax-code-notes.md"]))
     }
 
     // MARK: - ConfigInstaller — CLIConfig + hook events
@@ -381,7 +381,7 @@ final class MinimaxSupportTests: XCTestCase {
         try (lines.joined(separator: "\n") + "\n").write(toFile: path, atomically: true, encoding: .utf8)
         addTeardownBlock { try? FileManager.default.removeItem(atPath: path) }
 
-        let messages = AppState.readRecentFromTranscript(path: path).1
+        let messages = ClaudeDiscovery.readRecentFromTranscript(path: path).1
         XCTAssertEqual(messages.map(\.isUser), [true, false])
         XCTAssertEqual(messages.map(\.text), ["你好", "你好！有什么我可以帮你的吗？"])
     }

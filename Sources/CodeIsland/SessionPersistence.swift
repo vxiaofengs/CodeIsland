@@ -64,13 +64,18 @@ struct PersistedSession: Codable {
 enum SessionPersistence {
     static let dirPath = directory(
         environment: ProcessInfo.processInfo.environment,
-        isRunningTests: RuntimeEnvironment.isRunningTests
+        isRunningTests: RuntimeEnvironment.isRunningTests || RuntimeEnvironment.isIsolated
     )
-    private static let filePath = dirPath + "/sessions.json"
+    static let filePath = filePath(in: dirPath)
+
+    private static func filePath(in directory: String) -> String {
+        directory + "/sessions.json"
+    }
 
     /// Where sessions.json lives: `~/.codeisland`, unless `CODEISLAND_SESSIONS_DIR`
     /// names another folder (as `CODEISLAND_SOCKET_PATH` does for the socket).
-    /// A test process defaults to a folder of its own under the temp dir: a
+    /// A test process, and an isolated run (`RuntimeEnvironment.isIsolated`),
+    /// defaults to a folder of its own under the temp dir: a
     /// test's AppState used to overwrite the user's real session list from its
     /// 2 s save timer, and `startSessionDiscovery` restored it into the test and
     /// then deleted it.
@@ -84,7 +89,7 @@ enum SessionPersistence {
         }
         if isRunningTests {
             return (NSTemporaryDirectory() as NSString)
-                .appendingPathComponent("codeisland-tests-\(getpid())")
+                .appendingPathComponent("codeisland-sessions-\(getpid())")
         }
         return home + "/.codeisland"
     }
@@ -98,7 +103,21 @@ enum SessionPersistence {
         !session.isRemote && !sessionId.hasPrefix(AppState.coworkSessionPrefix)
     }
 
-    static func save(_ sessions: [String: SessionSnapshot]) {
+    /// The most of a prompt or reply the file keeps: plenty for the card it
+    /// brings back, where keeping all of a pasted 9 MB log made every save
+    /// (on the main thread, every couple of seconds) encode it again.
+    static let maxPersistedTextLength = 64 * 1024
+
+    /// Writes the session list for the next launch. The file holds every
+    /// local session's last prompt and reply, so it and its folder are this
+    /// user's alone (PrivateFiles): 0600 in a 0700 folder, whichever save
+    /// wrote it. `directory` is for tests.
+    static func save(_ sessions: [String: SessionSnapshot], directory: String = dirPath) {
+        func kept(_ text: String?) -> String? {
+            // utf8.count is O(1); no more bytes than that means no more characters.
+            guard let text, text.utf8.count > maxPersistedTextLength else { return text }
+            return String(text.prefix(maxPersistedTextLength))
+        }
         let persisted: [PersistedSession] = sessions.compactMap { (id, s) in
             guard isPersisted(sessionId: id, session: s) else { return nil }
             return PersistedSession(
@@ -109,8 +128,8 @@ enum SessionPersistence {
                 sessionTitle: s.sessionTitle,
                 sessionTitleSource: s.sessionTitleSource,
                 providerSessionId: s.providerSessionId,
-                lastUserPrompt: s.lastUserPrompt,
-                lastAssistantMessage: s.lastAssistantMessage,
+                lastUserPrompt: kept(s.lastUserPrompt),
+                lastAssistantMessage: kept(s.lastAssistantMessage),
                 termApp: s.termApp,
                 itermSessionId: s.itermSessionId,
                 ttyPath: s.ttyPath,
@@ -142,16 +161,24 @@ enum SessionPersistence {
             )
         }
         do {
-            try FileManager.default.createDirectory(atPath: dirPath, withIntermediateDirectories: true)
+            // Narrowed if an older build left it open; written into all the
+            // same when it cannot be (a symlink to a folder elsewhere): the
+            // file itself is 0600 either way.
+            PrivateFiles.prepareFolder(directory)
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             let data = try encoder.encode(persisted)
-            try data.write(to: URL(fileURLWithPath: filePath), options: Data.WritingOptions.atomic)
+            try PrivateFiles.write(data, to: filePath(in: directory))
         } catch {}
     }
 
-    static func load() -> [PersistedSession] {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)) else { return [] }
+    /// The saved session list, read once at launch. That is also when what
+    /// an older build left open to other accounts (a 0755 folder, a 0644
+    /// file) is narrowed to this user's alone.
+    static func load(directory: String = dirPath) -> [PersistedSession] {
+        PrivateFiles.closeToOthers(directory)
+        PrivateFiles.closeToOthers(filePath(in: directory))
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath(in: directory))) else { return [] }
         return decode(data)
     }
 

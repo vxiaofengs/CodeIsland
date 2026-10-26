@@ -67,7 +67,8 @@ final class NotchCardRedesignTests: XCTestCase {
         XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "Bash", scope: .session), "Always allow Bash this session")
         XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "mcp__github__create_pull_request", scope: .session),
                        "Always allow create_pull_request this session")
-        XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "Bash", scope: .codexRules), "Always allow — saved to ~/.codex/rules")
+        XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "Bash", scope: .codexRules(pattern: ["git", "push", "--force"])),
+                       "Always allow commands starting with git push --force — saved to ~/.codex/rules")
         XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "mcp__docs__search", scope: .codexMCPConfig),
                        "Always allow — saved to ~/.codex/config.toml")
         L10n.shared.language = "zh"
@@ -79,28 +80,71 @@ final class NotchCardRedesignTests: XCTestCase {
     /// both places that draw the link — the approval card and the session
     /// card's inline row each used to build their own text, and the inline
     /// row kept promising "Bash" after the card was fixed.
-    func testSessionWideScopeDropsTheToolFromTheLink() {
-        let scope = ApprovalAlwaysScope(savesRule: false, tool: "Bash", trustsWholeSession: true)
+    func testSessionWideScopeDropsTheToolFromTheLink() throws {
+        let claude = try XCTUnwrap(HookEvent(json: [
+            "hook_event_name": "PermissionRequest", "session_id": "s1", "tool_name": "Bash",
+            "tool_input": ["command": "make test"],
+        ]))
+        let scope = ApprovalAlwaysScope(for: claude, trustsWholeSession: true)
         XCTAssertEqual(scope, .wholeSession)
         XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "Bash", scope: scope), "Always allow this session")
+        XCTAssertEqual(ApprovalCopy.inlineAlwaysTitle(tool: "Bash", scope: scope), "Always allow this session")
         L10n.shared.language = "zh"
         XCTAssertEqual(ApprovalCopy.alwaysLink(tool: "Bash", scope: scope), "本会话始终允许")
         L10n.shared.language = "en"
+        XCTAssertEqual(ApprovalAlwaysScope(for: claude, trustsWholeSession: false), .session)
         // A rule Codex saves to disk is still named by where it goes — the
         // session-wide answer never applies to a rule that outlives the session.
-        XCTAssertEqual(ApprovalAlwaysScope(savesRule: true, tool: "Bash", trustsWholeSession: true), .codexRules)
-        XCTAssertEqual(ApprovalAlwaysScope(savesRule: false, tool: "Bash", trustsWholeSession: false), .session)
+        let codex = try XCTUnwrap(HookEvent(json: [
+            "hook_event_name": "PermissionRequest", "session_id": "s1", "tool_name": "Bash",
+            "tool_input": ["command": "make test"], "_source": "codex",
+        ]))
+        XCTAssertEqual(ApprovalAlwaysScope(for: codex, trustsWholeSession: true), .codexRules(pattern: ["make", "test"]))
     }
 
-    func testAlwaysScopeFollowsWhereTheRuleIsSaved() {
-        XCTAssertEqual(ApprovalAlwaysScope(savesRule: false, tool: "mcp__github__create_pull_request"), .session)
-        XCTAssertEqual(ApprovalAlwaysScope(savesRule: true, tool: "Bash"), .codexRules)
+    func testAlwaysScopeFollowsWhereTheRuleIsSaved() throws {
+        func request(_ tool: String, source: String? = "codex", input: [String: Any] = ["command": "make test"]) throws -> HookEvent {
+            var payload: [String: Any] = [
+                "hook_event_name": "PermissionRequest", "session_id": "s1", "tool_name": tool, "tool_input": input,
+            ]
+            payload["_source"] = source
+            return try XCTUnwrap(HookEvent(json: payload))
+        }
+        XCTAssertEqual(ApprovalAlwaysScope(for: try request("mcp__github__create_pull_request", source: nil)), .session)
+        XCTAssertEqual(ApprovalAlwaysScope(for: try request("Bash")), .codexRules(pattern: ["make", "test"]))
         // CodexPermissionRules writes an MCP tool's approval to config.toml.
-        XCTAssertEqual(ApprovalAlwaysScope(savesRule: true, tool: "mcp__docs__search"), .codexMCPConfig)
-        XCTAssertEqual(ApprovalAlwaysScope(savesRule: true, tool: "mcp__malformed"), .codexRules)
-        XCTAssertTrue(ApprovalHints.always(scope: .codexRules).contains("~/.codex/rules"))
+        XCTAssertEqual(ApprovalAlwaysScope(for: try request("mcp__docs__search")), .codexMCPConfig)
+        // Nothing a rule can say: "Always" holds for the session.
+        XCTAssertEqual(ApprovalAlwaysScope(for: try request("mcp__malformed")), .session)
+        XCTAssertEqual(ApprovalAlwaysScope(for: try request("apply_patch", input: ["command": "*** Begin Patch"])), .session)
+        XCTAssertEqual(ApprovalAlwaysScope(for: try request("Bash", input: ["command": "FOO=1 make"])), .session)
+        XCTAssertTrue(ApprovalHints.always(scope: .codexRules(pattern: ["make"])).contains("~/.codex/rules"))
         XCTAssertTrue(ApprovalHints.always(scope: .codexMCPConfig).contains("~/.codex/config.toml"))
         XCTAssertTrue(ApprovalHints.always(scope: .session).contains("session"))
+    }
+
+    /// A remote Codex's "Always" saves nothing on this Mac and holds for the
+    /// session, so its card must not claim a rule saved under ~/.codex.
+    func testRemoteCodexAlwaysLinkClaimsNoSavedRule() throws {
+        func codexRequest(_ tool: String, remoteHost: String?) throws -> HookEvent {
+            var payload: [String: Any] = [
+                "hook_event_name": "PermissionRequest", "session_id": "s1",
+                "_source": "codex", "tool_name": tool, "tool_input": ["command": "make"],
+            ]
+            payload["_remote_host_id"] = remoteHost
+            return try XCTUnwrap(HookEvent(from: JSONSerialization.data(withJSONObject: payload)))
+        }
+        for tool in ["Bash", "mcp__docs__search"] {
+            let remote = try codexRequest(tool, remoteHost: "devbox")
+            // The card and the session list's inline row both read this scope.
+            let scope = ApprovalAlwaysScope(for: remote)
+            XCTAssertEqual(scope, .session, tool)
+            XCTAssertFalse(ApprovalCopy.alwaysLink(tool: tool, scope: scope).contains("~/.codex"), tool)
+            XCTAssertFalse(ApprovalHints.always(scope: scope).contains("~/.codex"), tool)
+
+            let local = try codexRequest(tool, remoteHost: nil)
+            XCTAssertNotEqual(ApprovalAlwaysScope(for: local), .session, "a local Codex still saves its rule, \(tool)")
+        }
     }
 
     func testQueuePositionOnlyWithMoreThanOneWaiting() {
@@ -114,7 +158,8 @@ final class NotchCardRedesignTests: XCTestCase {
         let keys = [
             "always_hint_saved_mcp", "card_permission_tag", "card_queue_position", "card_allow_once", "card_deny",
             "card_hide", "card_skip", "card_back", "card_confirm", "card_submit", "card_always_session",
-            "card_always_saved", "card_jump_hint", "approval_title_command", "approval_title_change_file",
+            "card_always_saved", "card_always_saved_prefix", "always_hint_saved", "session_inline_always_prefix",
+            "card_jump_hint", "approval_title_command", "approval_title_change_file",
             "approval_title_change", "approval_title_read_file", "approval_title_read", "approval_title_search",
             "approval_title_web", "approval_title_mcp", "approval_title_agent", "approval_title_generic",
         ]
